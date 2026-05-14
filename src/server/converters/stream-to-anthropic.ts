@@ -37,6 +37,7 @@ export async function streamOpenAIToAnthropic(
   const toolCallMap = new Map<number, ToolCallState>()
   let outputTokens = 0
   let started = false
+  let finished = false
 
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
@@ -64,10 +65,21 @@ export async function streamOpenAIToAnthropic(
     })
   }
 
+  /** 当前打开的 block 类型，用于判断是否需要切换 */
+  let currentBlockType: "text" | "tool_use" | null = null
+
   function openTextBlock() {
-    if (hasOpenBlock) return
+    if (hasOpenBlock && currentBlockType === "text") {
+      /** 已经是 text block，直接复用 */
+      return
+    }
+    if (hasOpenBlock) {
+      /** 当前是 tool_use block，先关闭 */
+      closeCurrentBlock()
+    }
     currentContentIndex++
     hasOpenBlock = true
+    currentBlockType = "text"
     writeEvent("content_block_start", {
       type: "content_block_start",
       index: currentContentIndex,
@@ -82,6 +94,7 @@ export async function streamOpenAIToAnthropic(
       index: currentContentIndex,
     })
     hasOpenBlock = false
+    currentBlockType = null
   }
 
   function openToolBlock(toolIndex: number, id: string, name: string) {
@@ -90,6 +103,7 @@ export async function streamOpenAIToAnthropic(
     currentContentIndex = claudeIndex
     toolCallMap.set(toolIndex, { id, name, claudeIndex, started: true, args: "" })
     hasOpenBlock = true
+    currentBlockType = "tool_use"
     writeEvent("content_block_start", {
       type: "content_block_start",
       index: claudeIndex,
@@ -98,6 +112,13 @@ export async function streamOpenAIToAnthropic(
   }
 
   function finish(stopReason: AnthropicStopReason) {
+    if (finished) return
+    finished = true
+    closeCurrentBlock()
+    /** 如果没有任何 content block，补一个空 text block */
+    if (currentContentIndex === -1) {
+      openTextBlock()
+    }
     closeCurrentBlock()
     /** 刷出所有工具调用摘要 */
     if (onToolCall) {
