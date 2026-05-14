@@ -23,6 +23,8 @@ interface LiveRequest {
   statusCode: number
   error: string | null
   startedAt: number
+  /** 命中的路由规则 pattern */
+  rulePattern: string | null
 }
 
 const liveRequests = ref<Map<string, LiveRequest>>(new Map())
@@ -338,6 +340,7 @@ function connectSSE() {
         statusCode: 0,
         error: null,
         startedAt: Date.now(),
+        rulePattern: event.rulePattern ?? null,
       })
     } else if (event.type === "request_stream") {
       const req = liveRequests.value.get(event.requestId)
@@ -459,6 +462,7 @@ function truncate(s: string, len: number): string {
             <div class="log-header">
               <span class="log-id">#{{ req.requestId }}</span>
               <span class="log-route">{{ req.model }} → {{ req.targetModel }}</span>
+              <span v-if="req.rulePattern" class="log-rule">{{ req.rulePattern }}</span>
               <span class="log-provider">{{ req.provider }}</span>
               <span class="log-status running">{{ t('dashboard.running') }}</span>
             </div>
@@ -469,6 +473,7 @@ function truncate(s: string, len: number): string {
             <div class="log-header">
               <span class="log-id">#{{ req.requestId }}</span>
               <span class="log-route">{{ req.model }} → {{ req.targetModel }}</span>
+              <span v-if="req.rulePattern" class="log-rule">{{ req.rulePattern }}</span>
               <span class="log-provider">{{ req.provider }}</span>
               <span :class="['log-status', req.status]">
                 <template v-if="req.status === 'done'">{{ req.durationMs }}ms</template>
@@ -704,6 +709,15 @@ export OPENAI_API_KEY=your-key</pre>
   font-family: var(--mono);
   font-weight: 600;
   font-size: 12px;
+}
+
+.log-rule {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--mono);
 }
 
 .log-provider {

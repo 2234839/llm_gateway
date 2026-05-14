@@ -48,12 +48,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       const messageText = extractAnthropicText(body)
       fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
-      const { provider, targetModel: tm, providerConfig } = fastify.registry.resolve(model, { messageText, contentTypes })
+      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes })
       providerId = providerConfig.id
       targetModel = tm
       providerName = providerConfig.name
 
-      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary })
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern })
 
       const semaphore = fastify.registry.getSemaphore(providerConfig.id)
       await semaphore?.acquire()

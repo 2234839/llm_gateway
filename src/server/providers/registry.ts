@@ -81,6 +81,7 @@ export class ProviderRegistry {
         provider,
         targetModel,
         providerConfig: providerConfig!,
+        rulePattern: rule.pattern || null,
       }
     }
 

@@ -8,6 +8,8 @@ export interface RequestStartEvent {
   targetModel: string
   provider: string
   input: string
+  /** 命中的路由规则 pattern */
+  rulePattern: string | null
 }
 
 export interface RequestStreamEvent {

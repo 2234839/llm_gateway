@@ -369,6 +369,8 @@ export interface RouteResult {
   provider: Provider
   targetModel: string
   providerConfig: ProviderConfig
+  /** 命中的路由规则 pattern，兜底规则时为 null */
+  rulePattern: string | null
 }
 
 // ========== Anthropic 错误响应格式 ==========
