@@ -21,6 +21,7 @@ export default {
     concurrencyOutputRate: "Concurrency / Output Rate",
     concurrency: "Concurrent",
     outputRateLabel: "Output Rate (tokens/s)",
+    totalConcurrency: "Total Concurrency",
     noProvider: "No providers",
     tokenTrend: "Token Usage Trend (24h)",
     liveRequests: "Live Requests",

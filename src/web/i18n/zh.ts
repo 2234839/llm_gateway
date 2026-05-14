@@ -21,6 +21,7 @@ export default {
     concurrencyOutputRate: "并发 / 输出速率",
     concurrency: "并发",
     outputRateLabel: "输出速率 (tokens/s)",
+    totalConcurrency: "总并发",
     noProvider: "无服务商",
     tokenTrend: "Token 用量趋势（24小时）",
     liveRequests: "实时请求",

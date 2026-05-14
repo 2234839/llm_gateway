@@ -208,7 +208,18 @@ function renderConcurrencyChart() {
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
 
-  const concurrencyDatasets = [...concurrencyHistory.entries()].map(([_, entry], i) => ({
+  const entries = [...concurrencyHistory.entries()]
+
+  /** 总并发：各 provider 并发数按时间点求和 */
+  const totalLength = entries.length > 0 ? Math.max(...entries.map(([_, e]) => e.points.length)) : 0
+  const totalPoints: number[] = []
+  for (let i = 0; i < totalLength; i++) {
+    let sum = 0
+    for (const [_, e] of entries) sum += e.points[i] ?? 0
+    totalPoints.push(sum)
+  }
+
+  const concurrencyDatasets = entries.map(([_, entry], i) => ({
     label: entry.name,
     data: [...entry.points],
     borderColor: colors[i % colors.length],
@@ -218,6 +229,18 @@ function renderConcurrencyChart() {
     borderWidth: 2,
     yAxisID: "y",
   }))
+
+  const totalDataset = {
+    label: t("dashboard.totalConcurrency"),
+    data: totalPoints,
+    borderColor: "#e2e8f0",
+    backgroundColor: "transparent",
+    tension: 0.3,
+    pointRadius: 0,
+    borderWidth: 2,
+    borderDash: [6, 3],
+    yAxisID: "y",
+  }
 
   const rateDataset = {
     label: t("dashboard.outputRateLabel"),
@@ -232,7 +255,7 @@ function renderConcurrencyChart() {
   }
 
   chartInstance.data.labels = historyLabels
-  chartInstance.data.datasets = [...concurrencyDatasets, rateDataset]
+  chartInstance.data.datasets = [...concurrencyDatasets, totalDataset, rateDataset]
   chartInstance.options.plugins!.legend!.labels!.color = textDim
   chartInstance.options.scales!.x!.ticks!.color = textDim
   chartInstance.options.scales!.x!.grid!.color = border
