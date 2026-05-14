@@ -30,6 +30,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      - run: bun --version
+
       - run: bun install
 
       - run: bun run scripts/build.ts ${{ matrix.target }}

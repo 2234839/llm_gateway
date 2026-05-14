@@ -34,10 +34,18 @@ function scanDir(dir: string, base: string = dir): string[] {
 }
 
 console.log("=== LLM Gateway Build ===\n")
+console.log(`Bun version: ${Bun.version}`)
+console.log(`Target: ${target || "(local)"}`)
+console.log(`Root: ${ROOT}`)
 
 /** Step 1: 构建前端 */
-console.log("[1/3] Building frontend...")
-execSync("bun run build:web", { cwd: ROOT, stdio: "inherit" })
+console.log("\n[1/3] Building frontend...")
+try {
+  execSync("bun run build:web", { cwd: ROOT, stdio: "inherit" })
+} catch (e) {
+  console.error("Frontend build failed!")
+  throw e
+}
 
 if (!existsSync(DIST_WEB)) {
   console.error("Error: dist/web not found after vite build")
@@ -82,10 +90,14 @@ console.log(`  Embedded ${files.length} files`)
 /** Step 3: 编译单文件可执行文件 */
 console.log("\n[3/3] Compiling executable...")
 const targetFlag = target ? ` --target=${target}` : ""
-execSync(
-  `bun build --compile${targetFlag} --asset-naming="[name].[ext]" src/server/index.ts --outfile "${OUTFILE}"`,
-  { cwd: ROOT, stdio: "inherit" },
-)
+const buildCmd = `bun build --compile${targetFlag} --asset-naming="[name].[ext]" src/server/index.ts --outfile "${OUTFILE}"`
+console.log(`  Command: ${buildCmd}`)
+try {
+  execSync(buildCmd, { cwd: ROOT, stdio: "inherit" })
+} catch (e) {
+  console.error("Compile failed!")
+  throw e
+}
 
 console.log(`\n=== Build complete: ${OUTFILE} ===`)
 console.log(`Run: ./llm-gateway`)
