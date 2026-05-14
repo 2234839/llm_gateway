@@ -93,7 +93,7 @@ function formatUptime(seconds: number): string {
 
 function formatTokenCount(stats: TokenStats | undefined): string {
   if (!stats) return "0"
-  const total = stats.inputTokens + stats.outputTokens
+  const total = stats.inputTokens + stats.outputTokens + (stats.cacheCreationTokens ?? 0) + (stats.cacheReadTokens ?? 0)
   if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(1)}M`
   if (total >= 1_000) return `${(total / 1_000).toFixed(1)}K`
   return String(total)
