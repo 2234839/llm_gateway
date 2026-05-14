@@ -1,0 +1,174 @@
+import type {
+  AnthropicMessagesRequest,
+  OpenAIChatCompletionRequest,
+  OpenAIChatMessage,
+  OpenAITool,
+  AnthropicMessage,
+  AnthropicContentBlock,
+  AnthropicToolResultBlock,
+  AnthropicToolUseBlock,
+  OpenAIUserMessage,
+} from "../types.ts"
+
+/**
+ * Anthropic Messages 请求体 → OpenAI Chat Completions 请求体
+ */
+export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetModel: string): OpenAIChatCompletionRequest {
+  const messages: OpenAIChatMessage[] = []
+
+  /** system 顶层字段 → messages 中的 system message */
+  if (body.system) {
+    const systemText = typeof body.system === "string"
+      ? body.system
+      : body.system.map(b => b.text).join("\n")
+    messages.push({ role: "system", content: systemText })
+  }
+
+  /** 转换消息列表 */
+  for (const msg of body.messages) {
+    const converted = convertMessage(msg)
+    messages.push(...converted)
+  }
+
+  const result: OpenAIChatCompletionRequest = {
+    model: targetModel,
+    messages,
+    max_tokens: body.max_tokens,
+    stream: body.stream,
+  }
+
+  if (body.temperature !== undefined) result.temperature = body.temperature
+  if (body.top_p !== undefined) result.top_p = body.top_p
+  if (body.stop_sequences) result.stop = body.stop_sequences
+
+  /** 转换工具定义 */
+  if (body.tools && body.tools.length > 0) {
+    result.tools = body.tools.map(convertTool)
+  }
+
+  /** 转换 tool_choice */
+  if (body.tool_choice) {
+    result.tool_choice = convertToolChoice(body.tool_choice)
+  }
+
+  /** 流式时请求 usage */
+  if (body.stream) {
+    result.stream_options = { include_usage: true }
+  }
+
+  return result
+}
+
+function convertMessage(msg: AnthropicMessage): OpenAIChatMessage[] {
+  const results: OpenAIChatMessage[] = []
+
+  if (typeof msg.content === "string") {
+    results.push({ role: msg.role, content: msg.content } as OpenAIChatMessage)
+    return results
+  }
+
+  /** content block 数组需要拆分处理 */
+  if (msg.role === "user") {
+    results.push(...convertUserContentBlocks(msg.content))
+  } else {
+    results.push(...convertAssistantContentBlocks(msg.content))
+  }
+
+  return results
+}
+
+function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMessage[] {
+  const results: OpenAIChatMessage[] = []
+  const userParts: Exclude<OpenAIUserMessage["content"], string> = []
+  const toolResults: AnthropicToolResultBlock[] = []
+
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        userParts.push({ type: "text", text: block.text })
+        break
+      case "image":
+        userParts.push({
+          type: "image_url",
+          image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+        })
+        break
+      case "tool_result":
+        toolResults.push(block)
+        break
+      /** thinking, redacted_thinking, tool_use 不应出现在 user 消息中，跳过 */
+    }
+  }
+
+  /** 保留非 tool_result 的 user 内容 */
+  if (userParts.length > 0) {
+    results.push({ role: "user", content: userParts })
+  }
+
+  /** tool_result 拆分为独立的 role: "tool" 消息 */
+  for (const tr of toolResults) {
+    const content = typeof tr.content === "string" ? tr.content : tr.content.map(b => b.text).join("")
+    results.push({ role: "tool", tool_call_id: tr.tool_use_id, content })
+  }
+
+  return results
+}
+
+function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMessage[] {
+  const textParts: string[] = []
+  const toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = []
+
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        textParts.push(block.text)
+        break
+      case "tool_use": {
+        const tb = block as AnthropicToolUseBlock
+        toolCalls.push({
+          id: tb.id,
+          type: "function",
+          function: { name: tb.name, arguments: JSON.stringify(tb.input) },
+        })
+        break
+      }
+      /** thinking, redacted_thinking 在 OpenAI 格式中无对应，跳过 */
+    }
+  }
+
+  const msg: OpenAIChatMessage = {
+    role: "assistant",
+    content: textParts.length > 0 ? textParts.join("") : null,
+  }
+
+  if (toolCalls.length > 0) {
+    (msg as { tool_calls: typeof toolCalls }).tool_calls = toolCalls
+  }
+
+  return [msg]
+}
+
+function convertTool(tool: { name: string; description?: string; input_schema: Record<string, unknown> }): OpenAITool {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.input_schema,
+    },
+  }
+}
+
+function convertToolChoice(choice: AnthropicMessagesRequest["tool_choice"]): OpenAIChatCompletionRequest["tool_choice"] {
+  if (!choice) return undefined
+  switch (choice.type) {
+    case "auto":
+      return "auto"
+    case "any":
+      return "required"
+    case "none":
+      return "none"
+    case "tool":
+      return { type: "function", function: { name: choice.name } }
+  }
+}
