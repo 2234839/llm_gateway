@@ -314,6 +314,8 @@ export interface GatewayConfig {
   port: number
   logLevel: "debug" | "info" | "warn" | "error"
   enableRequestLog: boolean
+  /** 保留带内容的日志条数（提示词+响应），超出后清理旧记录的 content 字段，默认 1000 */
+  logContentRetention: number
 }
 
 // ========== 请求日志类型 ==========
@@ -331,7 +333,19 @@ export interface RequestLogEntry {
   durationMs: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
   error: string | null
+  inputContent: string | null
+  outputContent: string | null
+}
+
+/** Token 用量统计快照 */
+export interface TokenStats {
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
 }
 
 // ========== Provider 接口 ==========

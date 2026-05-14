@@ -13,6 +13,32 @@ const tabs = [
   { key: "routes", label: "路由规则" },
   { key: "logs", label: "请求日志" },
 ]
+
+const isDark = ref(true)
+
+function initTheme() {
+  const saved = localStorage.getItem("theme")
+  if (saved === "light") {
+    isDark.value = false
+  } else if (saved === "dark") {
+    isDark.value = true
+  } else {
+    isDark.value = !window.matchMedia("(prefers-color-scheme: light)").matches
+  }
+  applyTheme()
+}
+
+function toggleTheme() {
+  isDark.value = !isDark.value
+  localStorage.setItem("theme", isDark.value ? "dark" : "light")
+  applyTheme()
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = isDark.value ? "dark" : "light"
+}
+
+onMounted(initTheme)
 </script>
 
 <template>
@@ -29,6 +55,11 @@ const tabs = [
           {{ tab.label }}
         </button>
       </nav>
+      <div class="header-actions">
+        <button class="theme-btn" @click="toggleTheme" :title="isDark ? '切换到亮色模式' : '切换到暗色模式'">
+          {{ isDark ? "&#9788;" : "&#9790;" }}
+        </button>
+      </div>
     </header>
 
     <main class="main">

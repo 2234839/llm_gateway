@@ -87,6 +87,23 @@ export class ProviderRegistry {
     return this.semaphores.get(providerId)
   }
 
+  /** 获取所有 provider 的实时并发状态 */
+  getConcurrencyStatus(): { id: string; name: string; current: number; max: number }[] {
+    const configs = this.db.getProviders()
+    const result: { id: string; name: string; current: number; max: number }[] = []
+    for (const config of configs) {
+      if (!config.enabled) continue
+      const sem = this.semaphores.get(config.id)
+      result.push({
+        id: config.id,
+        name: config.name,
+        current: sem?.current ?? 0,
+        max: sem ? sem.max : config.maxConcurrency ?? 0,
+      })
+    }
+    return result
+  }
+
   /** 获取所有可用模型列表 */
   getAvailableModels(): { id: string; owned_by: string }[] {
     const models: { id: string; owned_by: string }[] = []

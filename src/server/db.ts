@@ -1,10 +1,11 @@
 import { Database, Statement } from "bun:sqlite"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats } from "./types.ts"
 
 const DEFAULT_CONFIG: GatewayConfig = {
   port: 3827,
   logLevel: "info",
   enableRequestLog: true,
+  logContentRetention: 1000,
 }
 
 export class GatewayDB {
@@ -98,6 +99,26 @@ export class GatewayDB {
     }
     try {
       this.db.exec("ALTER TABLE providers ADD COLUMN max_concurrency INTEGER DEFAULT 0")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN input_content TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN output_content TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0")
     } catch {
       // 列已存在
     }
@@ -231,7 +252,7 @@ export class GatewayDB {
 
   addLog(log: Omit<RequestLogEntry, "id" | "timestamp">) {
     this.stmt(
-      "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       log.method,
       log.path,
@@ -243,7 +264,20 @@ export class GatewayDB {
       log.durationMs,
       log.inputTokens,
       log.outputTokens,
+      log.cacheCreationTokens,
+      log.cacheReadTokens,
       log.error,
+      log.inputContent ?? null,
+      log.outputContent ?? null,
+    )
+    this.pruneLogContent()
+  }
+
+  /** 清理超出保留数量的旧日志 content 字段 */
+  private pruneLogContent() {
+    const retention = this.getConfig().logContentRetention ?? 1000
+    this.db.exec(
+      `UPDATE request_logs SET input_content = NULL, output_content = NULL WHERE id IN (SELECT id FROM request_logs WHERE input_content IS NOT NULL ORDER BY id DESC LIMIT -1 OFFSET ${retention})`
     )
   }
 
@@ -272,7 +306,7 @@ export class GatewayDB {
 
   getLogStats(): { total: number; today: number } {
     const total = (this.stmt("SELECT COUNT(*) as count FROM request_logs").get() as { count: number }).count
-    const today = (this.stmt("SELECT COUNT(*) as count FROM request_logs WHERE date(timestamp) = date('now')").get() as { count: number }).count
+    const today = (this.stmt("SELECT COUNT(*) as count FROM request_logs WHERE date(timestamp, 'localtime') = date('now', 'localtime')").get() as { count: number }).count
     return { total, today }
   }
 
@@ -281,7 +315,7 @@ export class GatewayDB {
     const sql = `
       SELECT p.id AS provider_id, COALESCE(p.name, l.provider_id) AS provider_name,
              COUNT(*) AS total,
-             SUM(CASE WHEN date(l.timestamp) = date('now') THEN 1 ELSE 0 END) AS today
+             SUM(CASE WHEN date(l.timestamp, 'localtime') = date('now', 'localtime') THEN 1 ELSE 0 END) AS today
       FROM request_logs l
       LEFT JOIN providers p ON l.provider_id = p.id
       GROUP BY l.provider_id
@@ -300,7 +334,7 @@ export class GatewayDB {
     const sql = `
       SELECT model, target_model AS targetModel,
              COUNT(*) AS total,
-             SUM(CASE WHEN date(timestamp) = date('now') THEN 1 ELSE 0 END) AS today
+             SUM(CASE WHEN date(timestamp, 'localtime') = date('now', 'localtime') THEN 1 ELSE 0 END) AS today
       FROM request_logs
       GROUP BY model, target_model
       ORDER BY total DESC
@@ -327,8 +361,74 @@ export class GatewayDB {
       durationMs: row.duration_ms as number,
       inputTokens: row.input_tokens as number,
       outputTokens: row.output_tokens as number,
+      cacheCreationTokens: (row.cache_creation_tokens as number) || 0,
+      cacheReadTokens: (row.cache_read_tokens as number) || 0,
       error: row.error as string | null,
+      inputContent: (row.input_content as string) || null,
+      outputContent: (row.output_content as string) || null,
     }
+  }
+
+  // ========== Token 统计 ==========
+
+  /** Token 用量汇总（总量 + 今日） */
+  getTokenStats(): { total: TokenStats; today: TokenStats } {
+    const querySum = (where: string): TokenStats => {
+      const sql = `SELECT
+        COALESCE(SUM(input_tokens), 0) as inputTokens,
+        COALESCE(SUM(output_tokens), 0) as outputTokens,
+        COALESCE(SUM(cache_creation_tokens), 0) as cacheCreationTokens,
+        COALESCE(SUM(cache_read_tokens), 0) as cacheReadTokens
+      FROM request_logs WHERE ${where}`
+      return this.stmt(sql).get() as TokenStats
+    }
+    return { total: querySum("1=1"), today: querySum("date(timestamp, 'localtime') = date('now', 'localtime')") }
+  }
+
+  /** 按服务商统计 token 用量 */
+  getTokenStatsByProvider(): ({ providerId: string; providerName: string } & TokenStats)[] {
+    const sql = `
+      SELECT p.id AS providerId, COALESCE(p.name, l.provider_id) AS providerName,
+             COALESCE(SUM(l.input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(l.output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(l.cache_creation_tokens), 0) AS cacheCreationTokens,
+             COALESCE(SUM(l.cache_read_tokens), 0) AS cacheReadTokens
+      FROM request_logs l
+      LEFT JOIN providers p ON l.provider_id = p.id
+      GROUP BY l.provider_id
+      ORDER BY inputTokens + outputTokens DESC
+    `
+    return this.db.prepare(sql).all() as ({ providerId: string; providerName: string } & TokenStats)[]
+  }
+
+  /** 按模型统计 token 用量 */
+  getTokenStatsByModel(): ({ model: string; targetModel: string } & TokenStats)[] {
+    const sql = `
+      SELECT model, target_model AS targetModel,
+             COALESCE(SUM(input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(cache_creation_tokens), 0) AS cacheCreationTokens,
+             COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens
+      FROM request_logs
+      GROUP BY model, target_model
+      ORDER BY inputTokens + outputTokens DESC
+    `
+    return this.db.prepare(sql).all() as ({ model: string; targetModel: string } & TokenStats)[]
+  }
+
+  /** 按小时统计 token 用量（用于图表） */
+  getTokenStatsByHour(hours: number = 24): ({ hour: string } & TokenStats)[] {
+    const clamped = Math.min(Math.max(hours, 1), 168)
+    const sql = `SELECT strftime('%Y-%m-%d %H:00', timestamp, 'localtime') AS hour,
+             COALESCE(SUM(input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(cache_creation_tokens), 0) AS cacheCreationTokens,
+             COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens
+      FROM request_logs
+      WHERE timestamp >= datetime('now', '-${clamped} hours')
+      GROUP BY hour
+      ORDER BY hour ASC`
+    return this.db.prepare(sql).all() as ({ hour: string } & TokenStats)[]
   }
 
   close() {

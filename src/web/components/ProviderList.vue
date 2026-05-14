@@ -270,14 +270,14 @@ const typeOptions = [
 }
 
 .test-result.success {
-  background: #e6f9e6;
-  color: #1a7a1a;
-  border: 1px solid #b2dfb2;
+  background: var(--test-ok-bg);
+  color: var(--test-ok);
+  border: 1px solid var(--test-ok-border);
 }
 
 .test-result.fail {
-  background: #fde8e8;
-  color: #c41e1e;
-  border: 1px solid #f5b3b3;
+  background: var(--test-fail-bg);
+  color: var(--test-fail);
+  border: 1px solid var(--test-fail-border);
 }
 </style>

@@ -5,6 +5,7 @@ import { convertResponseToOpenAI } from "../converters/resp-to-openai.ts"
 import { streamAnthropicToOpenAI } from "../converters/stream-to-openai.ts"
 import { extractOpenAIText, extractOpenAIResponseSummary, extractOpenAIContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
+import { emitEvent } from "../utils/event-bus.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -12,20 +13,29 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     const body = request.body as OpenAIChatCompletionRequest
     const model = body.model
     const startTime = Date.now()
+    console.log(`[openai] Received request for model: ${model}`)
 
     let providerId = ""
     let targetModel = ""
     let providerName = ""
     let statusCode = 200
     let errorMsg: string | null = null
+    let inputTokens = 0
+    let outputTokens = 0
+    let cacheCreationTokens = 0
+    let cacheReadTokens = 0
     let outputText = ""
+    let fullMessageText = ""
     const isStream = body.stream ?? false
     const reqId = nextReqId()
 
     /** 提取输入摘要：最后一条 user 消息 */
     const inputSummary = extractLastUserMessage(body) ?? model
 
-    const collectStreamText = (text: string) => { outputText += text }
+    const collectStreamText = (text: string) => {
+      outputText += text
+      if (isStream) emitEvent({ type: "request_stream", requestId: reqId, text })
+    }
     /** 流式工具调用累积器：key 为 tool call index */
     const toolCallAccumulator = new Map<number, { name: string; args: string }>()
     const collectStreamToolCall = (idx: number, name: string | undefined, args: string | undefined) => {
@@ -44,11 +54,14 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 
     try {
       const messageText = extractOpenAIText(body)
+      fullMessageText = messageText
       const contentTypes = extractOpenAIContentTypes(body)
       const { provider, targetModel: tm, providerConfig } = fastify.registry.resolve(model, { messageText, contentTypes })
       providerId = providerConfig.id
       targetModel = tm
       providerName = providerConfig.name
+
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary })
 
       const semaphore = fastify.registry.getSemaphore(providerConfig.id)
       await semaphore?.acquire()
@@ -56,7 +69,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
           /** OpenAI 兼容提供商 — 透传 */
           if (isStream) {
-            const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, {})
+            const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, {})
             if (!upstream.ok) {
               const errBody = await upstream.text()
               statusCode = upstream.status
@@ -65,7 +78,10 @@ export async function openaiRoutes(fastify: FastifyInstance) {
               return reply.send({ error: { message: errBody, type: "server_error" } })
             }
             reply.hijack()
-            return await streamPassthroughOpenAI(upstream.body!, reply.raw, collectStreamText, collectStreamToolCall, flushToolCalls)
+            return await streamPassthroughOpenAI(upstream.body!, reply.raw, collectStreamText, collectStreamToolCall, flushToolCalls, (i, o) => {
+              inputTokens += i
+              outputTokens += o
+            })
           }
 
           const upstream = await provider.sendRequest({ ...body, model: targetModel }, {})
@@ -77,6 +93,9 @@ export async function openaiRoutes(fastify: FastifyInstance) {
             return reply.send({ error: { message: errBody, type: "server_error" } })
           }
           const resp = await upstream.json() as Record<string, unknown>
+          const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage
+          inputTokens = respUsage?.prompt_tokens ?? 0
+          outputTokens = respUsage?.completion_tokens ?? 0
           outputText = extractOpenAIResponseSummary(resp)
           return reply.send(resp)
         }
@@ -100,7 +119,12 @@ export async function openaiRoutes(fastify: FastifyInstance) {
             return reply.send({ error: { message: errBody, type: "server_error" } })
           }
           reply.hijack()
-          await streamAnthropicToOpenAI(upstream.body!, reply.raw, model, collectStreamText, flushToolCalls)
+          await streamAnthropicToOpenAI(upstream.body!, reply.raw, model, collectStreamText, flushToolCalls, (i, o, cc, cr) => {
+            inputTokens = i
+            outputTokens = o
+            cacheCreationTokens = cc
+            cacheReadTokens = cr
+          })
           return
         }
 
@@ -117,6 +141,11 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
 
         const anthropicResp = await upstream.json() as Record<string, unknown>
+        const anthroUsage = (anthropicResp as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
+        inputTokens = anthroUsage?.input_tokens ?? 0
+        outputTokens = anthroUsage?.output_tokens ?? 0
+        cacheCreationTokens = anthroUsage?.cache_creation_input_tokens ?? 0
+        cacheReadTokens = anthroUsage?.cache_read_input_tokens ?? 0
         const converted = convertResponseToOpenAI(
           anthropicResp as unknown as import("../types.ts").AnthropicMessagesResponse,
         )
@@ -136,6 +165,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       })
     } finally {
       const durationMs = Date.now() - startTime
+      emitEvent({ type: "request_end", requestId: reqId, durationMs, statusCode, error: errorMsg, tokenUsage: { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens } })
       fastify.db.addLog({
         method: "POST",
         path: "/v1/chat/completions",
@@ -145,9 +175,13 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         stream: isStream,
         statusCode,
         durationMs,
-        inputTokens: 0,
-        outputTokens: 0,
+        inputTokens,
+        outputTokens,
+        cacheCreationTokens,
+        cacheReadTokens,
         error: errorMsg,
+        inputContent: fullMessageText,
+        outputContent: outputText || null,
       })
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
@@ -163,6 +197,7 @@ function streamPassthroughOpenAI(
   onText?: (text: string) => void,
   onToolCall?: (idx: number, name: string | undefined, args: string | undefined) => void,
   onEnd?: () => void,
+  onTokenUsage?: (inputTokens: number, outputTokens: number) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -184,8 +219,8 @@ function streamPassthroughOpenAI(
         return
       }
       raw.write(value)
-      /** 从 SSE chunk 中提取文本内容和工具调用 */
-      if (onText || onToolCall) {
+      /** 从 SSE chunk 中提取文本内容、工具调用和 token 用量 */
+      if (onText || onToolCall || onTokenUsage) {
         const chunk = decoder.decode(value, { stream: true })
         for (const line of chunk.split("\n")) {
           if (!line.startsWith("data: ") || line === "data: [DONE]") continue
@@ -197,6 +232,9 @@ function streamPassthroughOpenAI(
               for (const tc of delta.tool_calls) {
                 onToolCall?.(tc.index, tc.function?.name, tc.function?.arguments)
               }
+            }
+            if (obj.usage) {
+              onTokenUsage?.(obj.usage.prompt_tokens ?? 0, obj.usage.completion_tokens ?? 0)
             }
           } catch { /* skip */ }
         }

@@ -1,12 +1,14 @@
 import Fastify from "fastify"
 import cors from "@fastify/cors"
 import { existsSync } from "node:fs"
+import { extname } from "node:path"
 import { GatewayDB } from "./db.ts"
 import { ProviderRegistry } from "./providers/registry.ts"
 import { anthropicRoutes } from "./routes/anthropic.ts"
 import { openaiRoutes } from "./routes/openai.ts"
 import { adminRoutes } from "./routes/admin.ts"
 import { healthRoutes } from "./routes/health.ts"
+import { embeddedAssets } from "./embed-assets.ts"
 
 /** ANSI 颜色 */
 const C = {
@@ -76,24 +78,72 @@ async function main() {
 
   await fastify.register(cors, { origin: true })
 
-  await fastify.register(anthropicRoutes)
-  await fastify.register(openaiRoutes)
+  /** 请求日志中间件 */
+  fastify.addHook("onRequest", async (request) => {
+    console.log(`[REQ] ${request.method} ${request.url} from ${request.ip}`)
+  })
+
+  await fastify.register(anthropicRoutes, { prefix: "/anthropic" })
+  await fastify.register(openaiRoutes, { prefix: "/openai" })
   await fastify.register(adminRoutes)
   await fastify.register(healthRoutes)
 
-  /** 静态文件服务（前端产物，仅生产模式） */
-  const staticDir = new URL("../../dist/web", import.meta.url).pathname
-  if (existsSync(staticDir)) {
-    const staticModule = await import("@fastify/static")
-    await fastify.register(staticModule.default, {
-      root: staticDir,
-      prefix: "/",
-      wildcard: false,
-    })
+  /** MIME 类型推断 */
+  const MIME_TYPES: Record<string, string> = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+  }
 
-    fastify.setNotFoundHandler(async (_request, reply) => {
-      return reply.status(200).send(await Bun.file(`${staticDir}/index.html`).text())
+  function getContentType(path: string): string {
+    const ext = extname(path)
+    return MIME_TYPES[ext] ?? "application/octet-stream"
+  }
+
+  /** 静态文件服务 */
+  const hasEmbeddedAssets = Object.keys(embeddedAssets).length > 0
+  if (hasEmbeddedAssets) {
+    /** 生产模式：从编译嵌入的资源中提供服务 */
+    for (const [urlPath, filePath] of Object.entries(embeddedAssets)) {
+      if (urlPath === "/") continue
+      fastify.get(urlPath, async (_req, reply) => {
+        const content = await Bun.file(filePath).bytes()
+        return reply.type(getContentType(urlPath)).send(content)
+      })
+    }
+
+    fastify.setNotFoundHandler(async (_req, reply) => {
+      const indexPath = embeddedAssets["/"]
+      if (indexPath) {
+        const content = await Bun.file(indexPath).bytes()
+        return reply.type("text/html").send(content)
+      }
+      return reply.status(404).send({ error: "Not found" })
     })
+  } else {
+    /** 开发模式：从文件系统读取（如果 dist/web 存在） */
+    const staticDir = new URL("../../dist/web", import.meta.url).pathname
+    if (existsSync(staticDir)) {
+      const staticModule = await import("@fastify/static")
+      await fastify.register(staticModule.default, {
+        root: staticDir,
+        prefix: "/",
+        wildcard: false,
+      })
+
+      fastify.setNotFoundHandler(async (_request, reply) => {
+        return reply.status(200).send(await Bun.file(`${staticDir}/index.html`).text())
+      })
+    }
   }
 
   const port = parseInt(process.env.PORT ?? "") || config.port || 3827

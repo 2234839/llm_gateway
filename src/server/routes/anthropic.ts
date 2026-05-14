@@ -5,6 +5,7 @@ import { convertResponseToAnthropic } from "../converters/resp-to-anthropic.ts"
 import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
 import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropicContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
+import { emitEvent } from "../utils/event-bus.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -12,6 +13,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     const body = request.body as AnthropicMessagesRequest
     const model = body.model
     const startTime = Date.now()
+    console.log(`[anthropic] Received request for model: ${model}`)
 
     /** 提取上游 headers（需要透传的） */
     const upstreamHeaders: Record<string, string> = {}
@@ -26,23 +28,32 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let errorMsg: string | null = null
     let inputTokens = 0
     let outputTokens = 0
+    let cacheCreationTokens = 0
+    let cacheReadTokens = 0
     let outputText = ""
+    let fullMessageText = ""
     const isStream = body.stream ?? false
     const reqId = nextReqId()
 
     /** 提取输入摘要：最后一条 user 消息 */
     const inputSummary = extractLastAnthropicUserMessage(body) ?? model
 
-    const collectStreamText = (text: string) => { outputText += text }
+    const collectStreamText = (text: string) => {
+      outputText += text
+      if (isStream) emitEvent({ type: "request_stream", requestId: reqId, text })
+    }
     const collectStreamToolCall = (name: string, input: string) => { outputText += (outputText ? "\n" : "") + `[tool_call: ${name}(${input})]` }
 
     try {
       const messageText = extractAnthropicText(body)
+      fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
       const { provider, targetModel: tm, providerConfig } = fastify.registry.resolve(model, { messageText, contentTypes })
       providerId = providerConfig.id
       targetModel = tm
       providerName = providerConfig.name
+
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary })
 
       const semaphore = fastify.registry.getSemaphore(providerConfig.id)
       await semaphore?.acquire()
@@ -64,7 +75,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
             }
 
             reply.hijack()
-            return await streamPassthrough(upstream.body!, reply.raw, collectStreamText, collectStreamToolCall)
+            return await streamPassthrough(upstream.body!, reply.raw, collectStreamText, collectStreamToolCall, (tu) => {
+              inputTokens = tu.inputTokens
+              outputTokens = tu.outputTokens
+              cacheCreationTokens = tu.cacheCreationTokens
+              cacheReadTokens = tu.cacheReadTokens
+            })
           }
 
           const upstream = await provider.sendRequest(
@@ -81,8 +97,11 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           }
 
           const respBody = await upstream.json()
-          inputTokens = (respBody as { usage?: { input_tokens?: number } }).usage?.input_tokens ?? 0
-          outputTokens = (respBody as { usage?: { output_tokens?: number } }).usage?.output_tokens ?? 0
+          const respUsage = (respBody as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
+          inputTokens = respUsage?.input_tokens ?? 0
+          outputTokens = respUsage?.output_tokens ?? 0
+          cacheCreationTokens = respUsage?.cache_creation_input_tokens ?? 0
+          cacheReadTokens = respUsage?.cache_read_input_tokens ?? 0
           outputText = extractAnthropicResponseSummary(respBody as import("../types.ts").AnthropicMessagesResponse)
           return reply.send(respBody)
         }
@@ -103,7 +122,10 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
           inputTokens = estimateInputTokens(body)
           reply.hijack()
-          await streamOpenAIToAnthropic(upstream.body!, reply.raw, model, inputTokens, collectStreamText, collectStreamToolCall)
+          await streamOpenAIToAnthropic(upstream.body!, reply.raw, model, inputTokens, collectStreamText, collectStreamToolCall, (finalInput, finalOutput) => {
+            inputTokens = finalInput
+            outputTokens = finalOutput
+          })
           return
         }
 
@@ -145,6 +167,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       } satisfies AnthropicErrorResponse)
     } finally {
       const durationMs = Date.now() - startTime
+      emitEvent({ type: "request_end", requestId: reqId, durationMs, statusCode, error: errorMsg, tokenUsage: { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens } })
       fastify.db.addLog({
         method: "POST",
         path: "/v1/messages",
@@ -156,7 +179,11 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         durationMs,
         inputTokens,
         outputTokens,
+        cacheCreationTokens,
+        cacheReadTokens,
         error: errorMsg,
+        inputContent: fullMessageText,
+        outputContent: outputText || null,
       })
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
@@ -190,12 +217,13 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
   })
 }
 
-/** SSE 透传（Anthropic 直连时使用），同时收集文本摘要 */
+/** SSE 透传（Anthropic 直连时使用），同时收集文本摘要和 token 用量 */
 function streamPassthrough(
   upstream: ReadableStream<Uint8Array>,
   raw: import("node:http").ServerResponse,
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
+  onTokenUsage?: (usage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -211,22 +239,42 @@ function streamPassthrough(
   /** 工具调用累积状态 */
   let currentToolName = ""
   let currentToolArgs = ""
+  /** SSE 行缓冲区，处理跨 chunk 的行分割 */
+  let sseBuffer = ""
+  /** token 用量累积：message_start 提供 input+cache，message_delta 覆盖为最终值 */
+  let collectedUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
 
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
+        onTokenUsage?.(collectedUsage)
         raw.end()
         return
       }
       raw.write(value)
-      /** 从 SSE 中提取 text_delta 和工具调用 */
-      if (onText || onToolCall) {
-        const chunk = decoder.decode(value, { stream: true })
-        for (const line of chunk.split("\n")) {
+      /** 从 SSE 中提取 text_delta、工具调用和 token 用量 */
+      if (onText || onToolCall || onTokenUsage) {
+        sseBuffer += decoder.decode(value, { stream: true })
+        const lines = sseBuffer.split("\n")
+        sseBuffer = lines.pop()!
+        for (const line of lines) {
           if (!line.startsWith("data: ")) continue
           try {
             const obj = JSON.parse(line.slice(6))
-            if (obj.type === "content_block_start" && obj.content_block?.type === "tool_use") {
+            if (obj.type === "message_start") {
+              const usage = obj.message?.usage
+              if (usage) {
+                collectedUsage.inputTokens = usage.input_tokens ?? 0
+                collectedUsage.cacheCreationTokens = usage.cache_creation_input_tokens ?? 0
+                collectedUsage.cacheReadTokens = usage.cache_read_input_tokens ?? 0
+              }
+            } else if (obj.type === "message_delta" && obj.usage) {
+              /** message_delta 包含最终的完整 usage，覆盖所有字段 */
+              collectedUsage.inputTokens = obj.usage.input_tokens ?? collectedUsage.inputTokens
+              collectedUsage.outputTokens = obj.usage.output_tokens ?? 0
+              collectedUsage.cacheCreationTokens = obj.usage.cache_creation_input_tokens ?? collectedUsage.cacheCreationTokens
+              collectedUsage.cacheReadTokens = obj.usage.cache_read_input_tokens ?? collectedUsage.cacheReadTokens
+            } else if (obj.type === "content_block_start" && obj.content_block?.type === "tool_use") {
               currentToolName = obj.content_block.name
               currentToolArgs = ""
             } else if (obj.type === "content_block_delta" && obj.delta?.type === "text_delta") {

@@ -33,3 +33,6 @@ data/
 
 # Pilot
 .pilot/
+
+# Auto-generated embed assets
+src/server/embed-assets.ts

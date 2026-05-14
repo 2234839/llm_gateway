@@ -17,6 +17,9 @@ export async function healthRoutes(fastify: FastifyInstance) {
       requests: stats,
       requestsByProvider: fastify.db.getLogStatsByProvider(),
       requestsByModel: fastify.db.getLogStatsByModel(),
+      tokenStats: fastify.db.getTokenStats(),
+      tokensByProvider: fastify.db.getTokenStatsByProvider(),
+      tokensByModel: fastify.db.getTokenStatsByModel(),
     }
   })
 }

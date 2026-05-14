@@ -45,6 +45,14 @@ export interface RouteRuleInfo {
   contentMatch?: ContentMatchCondition[]
 }
 
+/** Token 用量统计 */
+export interface TokenStats {
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+}
+
 export interface LogEntry {
   id: number
   timestamp: string
@@ -58,7 +66,11 @@ export interface LogEntry {
   durationMs: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
   error: string | null
+  inputContent: string | null
+  outputContent: string | null
 }
 
 export interface HealthInfo {
@@ -70,6 +82,9 @@ export interface HealthInfo {
   requests: { total: number; today: number }
   requestsByProvider: { providerId: string; providerName: string; total: number; today: number }[]
   requestsByModel: { model: string; targetModel: string; total: number; today: number }[]
+  tokenStats?: { total: TokenStats; today: TokenStats }
+  tokensByProvider?: ({ providerId: string; providerName: string } & TokenStats)[]
+  tokensByModel?: ({ model: string; targetModel: string } & TokenStats)[]
 }
 
 export interface ProviderTestResult {
@@ -108,4 +123,13 @@ export const logApi = {
 
 export const healthApi = {
   get: () => api<HealthInfo>("/health"),
+}
+
+export const tokenApi = {
+  stats: () => api<{
+    summary: { total: TokenStats; today: TokenStats }
+    byProvider: ({ providerId: string; providerName: string } & TokenStats)[]
+    byModel: ({ model: string; targetModel: string } & TokenStats)[]
+  }>("/admin/token-stats"),
+  hourly: (hours: number = 24) => api<({ hour: string } & TokenStats)[]>(`/admin/token-stats/hourly?hours=${hours}`),
 }

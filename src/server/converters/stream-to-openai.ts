@@ -11,6 +11,7 @@ export async function streamAnthropicToOpenAI(
   originalModel: string,
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
+  onTokenUsage?: (inputTokens: number, outputTokens: number, cacheCreationTokens: number, cacheReadTokens: number) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -24,6 +25,9 @@ export async function streamAnthropicToOpenAI(
   const chatId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
   const created = Math.floor(Date.now() / 1000)
   let outputTokens = 0
+  let cachedInputTokens = 0
+  let cachedCacheCreation = 0
+  let cachedCacheRead = 0
   let started = false
   let currentToolCallIndex = 0
   /** 当前工具调用累积器：name -> 累积的 arguments JSON */
@@ -81,7 +85,10 @@ export async function streamAnthropicToOpenAI(
         switch (anthropicEvent.type) {
           case "message_start": {
             /** 第一个 chunk 包含 role */
-            const inputTokens = anthropicEvent.message.usage?.input_tokens ?? 0
+            const usage = anthropicEvent.message.usage
+            cachedInputTokens = usage?.input_tokens ?? 0
+            cachedCacheCreation = usage?.cache_creation_input_tokens ?? 0
+            cachedCacheRead = usage?.cache_read_input_tokens ?? 0
             writeChunk({ role: "assistant", content: "" })
             started = true
             break
@@ -166,6 +173,7 @@ export async function streamAnthropicToOpenAI(
       raw.write(formatSSEDone())
     }
   } finally {
+    onTokenUsage?.(cachedInputTokens, outputTokens, cachedCacheCreation, cachedCacheRead)
     raw.end()
   }
 }

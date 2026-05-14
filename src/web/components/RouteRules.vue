@@ -255,16 +255,16 @@ function syncOperator() {
 .match-section {
   margin-top: 16px;
   padding: 12px;
-  background: var(--bg-card, #f9f9f9);
+  background: var(--surface);
   border-radius: 6px;
-  border: 1px solid var(--border, #eee);
+  border: 1px solid var(--border);
 }
 
 .section-label {
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 12px;
-  color: var(--text-dim, #666);
+  color: var(--text-dim);
 }
 
 .condition-row {
@@ -320,18 +320,18 @@ function syncOperator() {
 }
 
 .match-tag.model {
-  background: #e3f2fd;
-  color: #1565c0;
+  background: var(--tag-blue-bg);
+  color: var(--tag-blue);
 }
 
 .match-tag.content {
-  background: #f3e5f5;
-  color: #7b1fa2;
+  background: var(--tag-purple-bg);
+  color: var(--tag-purple);
 }
 
 .match-tag.media {
-  background: #e8f5e9;
-  color: #2e7d32;
+  background: var(--tag-green-bg);
+  color: var(--tag-green);
 }
 
 .priority-cell {
@@ -352,12 +352,12 @@ function syncOperator() {
   cursor: pointer;
   padding: 2px 4px;
   font-size: 10px;
-  color: var(--text-dim, #888);
+  color: var(--text-dim);
   border-radius: 3px;
 }
 
 .btn-icon:hover:not(:disabled) {
-  background: var(--bg-hover, #eee);
+  background: var(--surface2);
   color: inherit;
 }
 

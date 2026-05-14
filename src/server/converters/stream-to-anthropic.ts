@@ -20,6 +20,7 @@ export async function streamOpenAIToAnthropic(
   inputTokens: number,
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
+  onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -189,6 +190,7 @@ export async function streamOpenAIToAnthropic(
       finish("end_turn")
     }
   } finally {
+    onTokenUsage?.(inputTokens, outputTokens)
     raw.end()
   }
 }
