@@ -9,6 +9,8 @@ import { openaiRoutes } from "./routes/openai.ts"
 import { adminRoutes } from "./routes/admin.ts"
 import { healthRoutes } from "./routes/health.ts"
 import { embeddedAssets } from "./embed-assets.ts"
+import { ConfigManager } from "./config.ts"
+import { createApiAuthHook, createAdminAuthHook } from "./auth.ts"
 
 /** ANSI 颜色 */
 const C = {
@@ -61,11 +63,16 @@ declare module "fastify" {
   interface FastifyInstance {
     db: GatewayDB
     registry: ProviderRegistry
+    configManager: ConfigManager
+  }
+  interface FastifyRequest {
+    authContext: import("./types.ts").AuthContext | null
   }
 }
 
 async function main() {
   const db = new GatewayDB("data/gateway.db")
+  const configManager = new ConfigManager()
   const config = db.getConfig()
 
   const fastify = Fastify({
@@ -75,6 +82,7 @@ async function main() {
 
   fastify.decorate("db", db)
   fastify.decorate("registry", new ProviderRegistry(db))
+  fastify.decorate("configManager", configManager)
 
   await fastify.register(cors, { origin: true })
 
@@ -83,8 +91,20 @@ async function main() {
     console.log(`[REQ] ${request.method} ${request.url} from ${request.ip}`)
   })
 
-  await fastify.register(anthropicRoutes, { prefix: "/anthropic" })
-  await fastify.register(openaiRoutes, { prefix: "/openai" })
+  /** Admin 认证钩子 */
+  fastify.addHook("onRequest", createAdminAuthHook(configManager))
+
+  /** API 路由带认证 */
+  const apiAuthHook = createApiAuthHook(db, configManager)
+  await fastify.register(async (instance) => {
+    instance.addHook("onRequest", apiAuthHook)
+    instance.register(anthropicRoutes)
+  }, { prefix: "/anthropic" })
+  await fastify.register(async (instance) => {
+    instance.addHook("onRequest", apiAuthHook)
+    instance.register(openaiRoutes)
+  }, { prefix: "/openai" })
+
   await fastify.register(adminRoutes)
   await fastify.register(healthRoutes)
 
@@ -150,6 +170,16 @@ async function main() {
   try {
     await fastify.listen({ port, host: "0.0.0.0" })
     console.log(`LLM Gateway running on http://localhost:${port}`)
+    if (configManager.isAdminInitialized()) {
+      console.log(`  Admin panel: protected (username: ${configManager.get().admin!.username})`)
+    } else {
+      console.log("  Admin panel: open (no admin account configured)")
+    }
+    if (configManager.get().authRequired) {
+      console.log("  API auth: required")
+    } else {
+      console.log("  API auth: optional (requests without key are allowed)")
+    }
   } catch (err) {
     fastify.log.error(err)
     process.exit(1)

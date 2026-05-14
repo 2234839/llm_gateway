@@ -312,6 +312,8 @@ export interface RouteRule {
   excludeMatch?: ContentMatchCondition[]
   /** 是否启用，默认 true */
   enabled?: boolean
+  /** 限定匹配的密钥分组 ID 列表，空/缺省=匹配所有 */
+  keyGroups?: string[]
 }
 
 export interface GatewayConfig {
@@ -320,6 +322,8 @@ export interface GatewayConfig {
   enableRequestLog: boolean
   /** 保留带内容的日志条数（提示词+响应），超出后清理旧记录的 content 字段，默认 1000 */
   logContentRetention: number
+  /** 是否要求 API 请求必须携带有效 Key */
+  authRequired: boolean
 }
 
 // ========== 请求日志类型 ==========
@@ -339,6 +343,10 @@ export interface RequestLogEntry {
   outputTokens: number
   cacheCreationTokens: number
   cacheReadTokens: number
+  /** 发起请求的 API Key ID */
+  apiKeyId: string | null
+  /** API Key 所属分组 ID */
+  groupId: string | null
   error: string | null
   inputContent: string | null
   outputContent: string | null
@@ -381,4 +389,55 @@ export interface AnthropicErrorResponse {
     type: "invalid_request_error" | "authentication_error" | "permission_error" | "not_found_error" | "request_too_large" | "rate_limit_error" | "api_error" | "overloaded_error"
     message: string
   }
+}
+
+// ========== API Key 分组与密钥管理 ==========
+
+/** 密钥分组 */
+export interface KeyGroup {
+  id: string
+  name: string
+  description: string
+  /** 每日 Token 限额，0 = 不限 */
+  dailyTokenLimit: number
+  /** 每月 Token 限额，0 = 不限 */
+  monthlyTokenLimit: number
+  /** 每分钟请求数限额，0 = 不限 */
+  rpmLimit: number
+  createdAt: string
+}
+
+/** 网关级 API Key */
+export interface ApiKey {
+  id: string
+  name: string
+  /** SHA-256(rawKey)，用于查找 */
+  keyHash: string
+  /** 前 8 字符，用于展示：sk-a1b2c... */
+  keyPrefix: string
+  groupId: string
+  enabled: boolean
+  /** 每日 Token 限额，0 = 不限 */
+  dailyTokenLimit: number
+  /** 每月 Token 限额，0 = 不限 */
+  monthlyTokenLimit: number
+  /** 每分钟请求数限额，0 = 不限 */
+  rpmLimit: number
+  createdAt: string
+  lastUsedAt: string | null
+  description: string
+}
+
+/** 创建 Key 时一次性返回完整密钥 */
+export interface ApiKeyWithSecret extends ApiKey {
+  /** 完整原始密钥，仅在创建时返回一次 */
+  rawKey: string
+}
+
+/** 请求上的认证上下文 */
+export interface AuthContext {
+  keyId: string
+  groupId: string
+  groupName: string
+  keyName: string
 }

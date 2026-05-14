@@ -1,11 +1,12 @@
 import type { FastifyInstance } from "fastify"
-import type { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "../types.ts"
+import type { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse, AuthContext } from "../types.ts"
 import { convertRequestToAnthropic } from "../converters/to-anthropic.ts"
 import { convertResponseToOpenAI } from "../converters/resp-to-openai.ts"
 import { streamAnthropicToOpenAI } from "../converters/stream-to-openai.ts"
 import { extractOpenAIText, extractOpenAIResponseSummary, extractOpenAIContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
+import { checkQuota } from "../quota.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -28,6 +29,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     let fullMessageText = ""
     const isStream = body.stream ?? false
     const reqId = nextReqId()
+    const auth = (request as any).authContext as AuthContext | null
 
     /** 提取输入摘要：最后一条 user 消息 */
     const inputSummary = extractLastUserMessage(body) ?? model
@@ -52,19 +54,30 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       }
     }
 
+    /** 配额检查 */
+    if (auth) {
+      const quotaResult = checkQuota(fastify.db, auth)
+      if (!quotaResult.allowed) {
+        return reply.status(429).send({
+          error: { message: quotaResult.reason!, type: "rate_limit_error", code: "rate_limit_exceeded" },
+        })
+      }
+    }
+
     try {
       const messageText = extractOpenAIText(body)
       fullMessageText = messageText
       const contentTypes = extractOpenAIContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes })
+      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
       providerId = providerConfig.id
       targetModel = tm
       providerName = providerConfig.name
 
-      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern })
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
 
       const semaphore = fastify.registry.getSemaphore(providerConfig.id)
       await semaphore?.acquire()
+      emitEvent({ type: "upstream_start", requestId: reqId, providerId })
       try {
         if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
           /** OpenAI 兼容提供商 — 透传 */
@@ -152,6 +165,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         outputText = converted.choices?.[0]?.message?.content ?? ""
         return reply.send(converted)
       } finally {
+        emitEvent({ type: "upstream_end", requestId: reqId, providerId })
         semaphore?.release()
       }
     } catch (err) {
@@ -179,6 +193,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         outputTokens,
         cacheCreationTokens,
         cacheReadTokens,
+        apiKeyId: auth?.keyId ?? null,
+        groupId: auth?.groupId ?? null,
         error: errorMsg,
         inputContent: fullMessageText,
         outputContent: outputText || null,

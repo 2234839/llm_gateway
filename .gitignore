@@ -37,4 +37,4 @@ data/
 # Auto-generated embed assets
 src/server/embed-assets.ts
 llm-gateway
-llm-gateway-linux-x64
+llm-gateway-*

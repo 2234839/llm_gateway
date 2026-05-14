@@ -10,6 +10,10 @@ export interface RequestStartEvent {
   input: string
   /** 命中的路由规则 pattern */
   rulePattern: string | null
+  /** 认证 key 名称 */
+  keyName?: string | null
+  /** 认证分组名称 */
+  groupName?: string | null
 }
 
 export interface RequestStreamEvent {
@@ -39,7 +43,21 @@ export interface RequestStatsEvent {
   tokenStats?: { total: TokenStats; today: TokenStats }
 }
 
-export type BusEvent = RequestStartEvent | RequestStreamEvent | RequestEndEvent | RequestStatsEvent
+/** 上游 API 调用开始（信号量 acquire 之后） */
+export interface UpstreamStartEvent {
+  type: "upstream_start"
+  requestId: string
+  providerId: string
+}
+
+/** 上游 API 调用结束（信号量 release 之前） */
+export interface UpstreamEndEvent {
+  type: "upstream_end"
+  requestId: string
+  providerId: string
+}
+
+export type BusEvent = RequestStartEvent | RequestStreamEvent | RequestEndEvent | RequestStatsEvent | UpstreamStartEvent | UpstreamEndEvent
 
 type Listener = (event: BusEvent) => void
 

@@ -1,30 +1,53 @@
 # LLM Gateway
 
-A unified LLM API gateway that aggregates OpenAI, Anthropic, Azure OpenAI and other providers behind a single endpoint. Supports cross-protocol format conversion (Anthropic ↔ OpenAI), intelligent routing, concurrency control, real-time monitoring and request logging.
+A unified LLM API proxy gateway with **content-aware routing** and **bidirectional protocol conversion** (Anthropic ↔ OpenAI). Built for teams who want fine-grained control over how LLM requests are routed — not just round-robin load balancing, but intelligent routing based on what's actually in the request.
 
 [**中文文档**](docs/README.zh-CN.md)
 
-## Why
+## Why LLM Gateway
 
-When using multiple LLM providers, you'll run into these problems:
+Other gateways do account rotation and billing. LLM Gateway does something different — it understands **what you're asking** and routes accordingly.
 
-- **Client compatibility**: Claude Code only speaks Anthropic API, Cursor only speaks OpenAI API — you want to freely switch backends without changing client config
-- **Protocol isolation**: Route Anthropic-protocol clients to OpenAI models, or vice versa
-- **Concurrency management**: Each provider has its own rate limits that need centralized control
-- **Observability**: Know which provider handled each request, which model was used, and how long it took
-- **Routing policies**: Automatically route to different providers/models based on model name or request content
+**Content-aware routing that no other gateway provides:**
+- Route code review to a cheap model, architecture design to a premium model — based on **message content**
+- Route image-containing requests to vision-capable models — based on **content type detection**
+- Route Claude Code sessions to a dedicated provider — based on **API key group**
+- Use Claude Code with OpenAI models, or Cursor with Anthropic models — via **protocol conversion**
 
-LLM Gateway solves all of these.
+When your team has 10 people sharing LLM access, you need to answer:
+- Who used what? → Per-key usage tracking
+- Can we limit the junior devs? → Per-group token quotas
+- Can different roles use different models? → Group-based routing
+- Can we use any SDK with any provider? → Bidirectional protocol conversion
 
 ## Features
 
-- **Protocol-agnostic proxy**: Clients send requests in Anthropic or OpenAI format, the gateway auto-converts to the target provider's protocol
-- **Bidirectional format conversion**: Anthropic ↔ OpenAI conversion across request body, non-streaming response, and SSE streaming
-- **Intelligent routing**: Model name glob matching + message content matching (keyword/regex/multimodal detection), with AND/OR logic composition
-- **Concurrency control**: Per-provider max concurrency via Semaphore
-- **Real-time monitoring**: SSE event stream + concurrency trend charts + live request log stream
-- **Request logging**: SQLite persistence with pagination and content expansion
-- **Admin dashboard**: Vue 3 SPA for provider management, route rule configuration, and log viewing
+### Routing Engine (The Killer Feature)
+
+- **Model name matching**: glob patterns like `claude-*`, `gpt-4*`
+- **Content-aware routing**: keyword inclusion, regex matching, multimodal content type detection
+- **Group-based routing**: different API key groups can match different route rules
+- **Exclusion rules**: skip certain patterns with negative matching
+- **Priority ordering**: rules evaluated top-down, first match wins
+
+### Protocol Conversion
+
+- **Bidirectional**: Anthropic ↔ OpenAI, including request body, non-streaming response, and SSE streaming
+- **Transparent**: same-protocol requests pass through with zero overhead (raw byte passthrough)
+- **SDK-compatible**: works with any client using standard Anthropic or OpenAI SDKs
+
+### Team Management
+
+- **API Key authentication**: gateway-level keys (not provider keys), compatible with both SDK conventions
+- **Key groups**: organize keys by team/role, route rules can target specific groups
+- **Token quotas**: daily/monthly per-key or per-group limits, RPM rate limiting (all default to unlimited)
+- **Usage tracking**: token usage by provider, model, key, and group
+
+### Observability
+
+- **Real-time dashboard**: concurrency trend charts, live request stream, token usage by hour
+- **Request logging**: SQLite persistence with full request/response content (pruned automatically)
+- **Per-request details**: model mapping, matched route rule, provider, duration, token counts
 
 ## Quick Start
 
@@ -50,7 +73,7 @@ bun run build:web
 bun run start
 ```
 
-Visit `http://localhost:3827` for the admin dashboard.
+Visit `http://localhost:3827` for the admin dashboard. On first visit, you'll be guided to set up an admin account.
 
 ### Configure Providers
 
@@ -70,12 +93,14 @@ Add providers in the **Providers** page of the admin dashboard:
 Add rules in the **Route Rules** page to define model name matching conditions and target providers. Supports:
 
 - **Model name matching**: glob patterns like `claude-*`, `gpt-4*`
-- **Content matching**:
-  - Keyword inclusion
-  - Regular expressions
-  - Multimodal content type detection (image / file / tool_use)
-  - Multi-condition AND/OR composition
-- **Target model mapping**: Fixed target model name, or source-to-target model name mapping
+- **Content matching**: keyword inclusion, regex, multimodal content type detection, multi-condition AND/OR
+- **Group-based routing**: route different API key groups to different providers
+- **Exclusion rules**: negative matching to skip certain patterns
+- **Target model mapping**: fixed name or source-to-target mapping
+
+### Create API Keys (Optional)
+
+In the **API Keys** page, create key groups and API keys for your team members. Each key belongs to a group, and you can set per-key or per-group token quotas (default: unlimited).
 
 ### Usage
 
@@ -84,14 +109,14 @@ Point your client's API base URL to the gateway:
 ```bash
 # Anthropic protocol clients (e.g. Claude Code)
 export ANTHROPIC_BASE_URL=http://localhost:3827/anthropic
-export ANTHROPIC_API_KEY=your-key
+export ANTHROPIC_API_KEY=sk-your-gateway-key
 
 # OpenAI protocol clients (e.g. Cursor)
 export OPENAI_BASE_URL=http://localhost:3827/openai/v1
-export OPENAI_API_KEY=your-key
+export OPENAI_API_KEY=sk-your-gateway-key
 ```
 
-The gateway will route requests to the appropriate provider based on route rules, performing protocol conversion when necessary.
+When API key auth is disabled (default), any key value works. Enable it in Settings to require valid gateway keys.
 
 ## API Endpoints
 
@@ -108,12 +133,18 @@ The gateway will route requests to the appropriate provider based on route rules
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/admin/init-check` | Check if admin is initialized |
+| POST | `/admin/init` | Initialize admin account |
+| GET/PUT | `/admin/config` | Gateway config & auth settings |
 | GET/POST/PUT/DELETE | `/admin/providers/*` | Provider CRUD |
-| GET/POST/PUT/DELETE | `/admin/routes/*` | Route rule CRUD |
 | GET/POST | `/admin/providers/test` | Provider connectivity test |
-| GET | `/admin/logs` | Request log query |
+| GET/POST/PUT/DELETE | `/admin/routes/*` | Route rule CRUD |
+| GET/POST/PUT/DELETE | `/admin/key-groups/*` | Key group CRUD |
+| GET/POST/PUT/DELETE | `/admin/keys/*` | API key CRUD |
+| GET | `/admin/token-stats/by-group` | Token usage by group |
+| GET | `/admin/token-stats/by-key` | Token usage by key |
+| GET | `/admin/logs` | Request log query (filterable by key/group) |
 | GET | `/admin/stats` | Request statistics |
-| GET/PUT | `/admin/config` | Gateway config |
 | GET | `/admin/events` | SSE real-time event stream |
 | GET | `/health` | Health check |
 
@@ -124,16 +155,20 @@ src/
 ├── server/
 │   ├── index.ts              # Backend entry point
 │   ├── types.ts              # TypeScript type definitions
+│   ├── config.ts             # Config manager (data/config.json)
 │   ├── db.ts                 # SQLite database layer
+│   ├── auth.ts               # API key auth + admin Basic Auth hooks
+│   ├── quota.ts              # Token quota & RPM rate limiting
 │   ├── converters/           # Anthropic ↔ OpenAI format converters (bidirectional)
 │   ├── providers/            # Provider adapters + registry
 │   ├── routes/               # Routes: proxy + admin + health check
-│   └── utils/                # Event bus, semaphore, logging utilities
+│   └── utils/                # Event bus, semaphore, logging, key generation
 └── web/
-    ├── App.vue               # Root component (navigation + theme toggle)
+    ├── App.vue               # Root component (navigation + init flow + settings)
     ├── api.ts                # Frontend API wrapper
+    ├── i18n/                 # Internationalization (Chinese / English)
     ├── styles/               # Global styles (dark/light theme)
-    └── components/           # Dashboard / ProviderList / RouteRules / RequestLog
+    └── components/           # Dashboard / ProviderList / RouteRules / ApiKeyList / RequestLog
 ```
 
 ## Tech Stack
@@ -141,6 +176,7 @@ src/
 - **Backend**: Bun + Fastify + SQLite (bun:sqlite)
 - **Frontend**: Vue 3 + Chart.js + Vanilla CSS
 - **Build**: Vite (frontend) + Bun (backend, runs natively)
+- **Single-binary deploy**: `bun build --compile` embeds frontend assets
 
 ## License
 

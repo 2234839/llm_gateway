@@ -75,6 +75,11 @@ git push origin v0.2.0
 #    - 使用 softprops/action-gh-release 创建 GitHub Release 并上传所有产物
 ```
 
+**发布后必须跟踪 CI 构建状态**: 推送 tag 后，使用 GitHub API 查询构建进度：
+- 查看 runs: `curl -s https://api.github.com/repos/2234839/llm_gateway/actions/runs?per_page=1`
+- 轮询状态直到 `status` 为 `completed`，检查 `conclusion` 为 `success`
+- 确认 Release 已创建: `curl -s https://api.github.com/repos/2234839/llm_gateway/releases/tags/<tag>`
+
 **build.ts 接受的 target 参数**: `bun-linux-x64`, `bun-linux-arm64`, `bun-windows-x64`, `bun-darwin-x64`, `bun-darwin-arm64`
 
 本地构建指定平台: `bun run scripts/build.ts bun-linux-x64`

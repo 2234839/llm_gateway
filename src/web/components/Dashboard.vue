@@ -29,7 +29,7 @@ interface LiveRequest {
 
 const liveRequests = ref<Map<string, LiveRequest>>(new Map())
 const completedRequests = ref<LiveRequest[]>([])
-const providerConcurrency = ref<{ id: string; name: string; current: number; max: number; models: { model: string; targetModel: string; count: number }[] }[]>([])
+const providerConcurrency = ref<{ id: string; name: string; gateway: number; upstream: number; max: number; models: { model: string; targetModel: string; count: number }[] }[]>([])
 
 let eventSource: EventSource | null = null
 let chartInstance: Chart | null = null
@@ -37,8 +37,8 @@ let tokenChartInstance: Chart | null = null
 let cleanupTimer: ReturnType<typeof setInterval> | null = null
 let themeObserver: MutationObserver | null = null
 
-/** 并发历史数据 */
-const concurrencyHistory = new Map<string, { name: string; points: number[] }>()
+/** 并发历史数据（两层：upstream + gateway） */
+const concurrencyHistory = new Map<string, { name: string; upstreamPoints: number[]; gatewayPoints: number[] }>()
 let historyLabels: string[] = []
 const maxHistoryPoints = 300
 
@@ -125,16 +125,17 @@ function initConcurrencyChart() {
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
   chartInstance = new Chart(ctx, {
-    type: "line",
+    type: "bar",
     data: { labels: [], datasets: [] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: { duration: 200 },
-      plugins: { legend: { display: true, labels: { color: textDim, font: { size: 11 } } } },
+      plugins: { legend: { display: true, labels: { color: textDim, font: { size: 11 }, filter: (item: { text: string }) => !item.text.includes(t("dashboard.queuedConcurrency")) }, onClick: () => {} } },
       scales: {
-        x: { ticks: { color: textDim, maxTicksLimit: 10, font: { size: 10 } }, grid: { color: border } },
+        x: { stacked: true, ticks: { color: textDim, maxTicksLimit: 10, font: { size: 10 } }, grid: { color: border } },
         y: {
+          stacked: true,
           position: "left",
           beginAtZero: true,
           title: { display: true, text: t("dashboard.concurrency"), color: textDim, font: { size: 11 } },
@@ -154,22 +155,25 @@ function initConcurrencyChart() {
 }
 
 /** 从后端历史快照恢复图表数据 */
-function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; current: number }[] }[]) {
+function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[] }[]) {
   for (const snap of snapshots) {
     historyLabels.push(snap.time)
     for (const p of snap.providers) {
       let entry = concurrencyHistory.get(p.id)
       if (!entry) {
-        entry = { name: p.name, points: [] }
+        entry = { name: p.name, upstreamPoints: [], gatewayPoints: [] }
         concurrencyHistory.set(p.id, entry)
       }
-      entry.points.push(p.current)
+      entry.name = p.name
+      entry.upstreamPoints.push(p.upstream)
+      entry.gatewayPoints.push(p.gateway)
     }
     outputRateHistory.push(0)
   }
   while (historyLabels.length > maxHistoryPoints) historyLabels.shift()
   for (const entry of concurrencyHistory.values()) {
-    while (entry.points.length > maxHistoryPoints) entry.points.shift()
+    while (entry.upstreamPoints.length > maxHistoryPoints) entry.upstreamPoints.shift()
+    while (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
   }
   while (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
   renderConcurrencyChart()
@@ -186,11 +190,14 @@ function appendChartPoint() {
   for (const p of providerConcurrency.value) {
     let entry = concurrencyHistory.get(p.id)
     if (!entry) {
-      entry = { name: p.name, points: [] }
+      entry = { name: p.name, upstreamPoints: [], gatewayPoints: [] }
       concurrencyHistory.set(p.id, entry)
     }
-    entry.points.push(p.current)
-    if (entry.points.length > maxHistoryPoints) entry.points.shift()
+    entry.name = p.name
+    entry.upstreamPoints.push(p.upstream)
+    entry.gatewayPoints.push(p.gateway)
+    if (entry.upstreamPoints.length > maxHistoryPoints) entry.upstreamPoints.shift()
+    if (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
   }
 
   /** 计算该时间窗口的输出速率 */
@@ -212,52 +219,74 @@ function renderConcurrencyChart() {
 
   const entries = [...concurrencyHistory.entries()]
 
-  /** 总并发：各 provider 并发数按时间点求和 */
-  const totalLength = entries.length > 0 ? Math.max(...entries.map(([_, e]) => e.points.length)) : 0
+  /** 过滤掉全部为 0 的 provider，避免空柱子占据宽度 */
+  const activeEntries = entries.filter(([_, e]) => e.gatewayPoints.some(v => v > 0))
+
+  /** 构建 datasets：每个 provider 两层 bar + 总并发折线 + 输出速率折线 */
+  const barDatasets: Record<string, unknown>[] = []
+
+  for (const [_, entry] of activeEntries) {
+    const i = barDatasets.length
+    const color = colors[i % colors.length]
+    /** 底层：LLM 并发（实色） */
+    barDatasets.push({
+      label: entry.name,
+      data: [...entry.upstreamPoints],
+      backgroundColor: color,
+      borderColor: color,
+      borderWidth: 0,
+      yAxisID: "y",
+      stack: entry.name,
+    })
+    /** 上层：排队中（半透明，gateway - upstream） */
+    barDatasets.push({
+      label: `${entry.name} (${t("dashboard.queuedConcurrency")})`,
+      data: entry.gatewayPoints.map((g, idx) => Math.max(0, g - (entry.upstreamPoints[idx] ?? 0))),
+      backgroundColor: color + "40",
+      borderColor: color + "80",
+      borderWidth: 1,
+      yAxisID: "y",
+      stack: entry.name,
+    })
+  }
+
+  /** 总并发折线 */
+  const totalLength = entries.length > 0 ? Math.max(...entries.map(([_, e]) => e.gatewayPoints.length)) : 0
   const totalPoints: number[] = []
   for (let i = 0; i < totalLength; i++) {
     let sum = 0
-    for (const [_, e] of entries) sum += e.points[i] ?? 0
+    for (const [_, e] of entries) sum += e.gatewayPoints[i] ?? 0
     totalPoints.push(sum)
   }
-
-  const concurrencyDatasets = entries.map(([_, entry], i) => ({
-    label: entry.name,
-    data: [...entry.points],
-    borderColor: colors[i % colors.length],
-    backgroundColor: "transparent",
-    tension: 0.3,
-    pointRadius: 0,
-    borderWidth: 2,
-    yAxisID: "y",
-  }))
-
-  const totalDataset = {
+  barDatasets.push({
     label: t("dashboard.totalConcurrency"),
     data: totalPoints,
     borderColor: "#e2e8f0",
     backgroundColor: "transparent",
+    type: "line",
     tension: 0.3,
     pointRadius: 0,
     borderWidth: 2,
     borderDash: [6, 3],
     yAxisID: "y",
-  }
+  } as never)
 
-  const rateDataset = {
+  /** 输出速率折线 */
+  barDatasets.push({
     label: t("dashboard.outputRateLabel"),
     data: [...outputRateHistory],
     borderColor: "#f472b6",
     backgroundColor: "transparent",
+    type: "line",
     tension: 0.3,
     pointRadius: 0,
     borderWidth: 2,
     borderDash: [4, 2],
     yAxisID: "y1",
-  }
+  } as never)
 
   chartInstance.data.labels = historyLabels
-  chartInstance.data.datasets = [...concurrencyDatasets, totalDataset, rateDataset]
+  chartInstance.data.datasets = barDatasets as never
   chartInstance.options.plugins!.legend!.labels!.color = textDim
   chartInstance.options.scales!.x!.ticks!.color = textDim
   chartInstance.options.scales!.x!.grid!.color = border
@@ -429,8 +458,11 @@ function truncate(s: string, len: number): string {
           <div v-for="p in providerConcurrency" :key="p.id" class="concurrency-block">
             <div class="concurrency-item">
               <span class="concurrency-name">{{ p.name }}</span>
-              <span :class="['concurrency-value', { active: p.current > 0 }]">
-                {{ p.current }}{{ p.max ? ` / ${p.max}` : "" }}
+              <span :class="['concurrency-value', { active: p.gateway > 0 }]">
+                <span class="concurrency-upstream">{{ p.upstream }}</span>
+                <span class="concurrency-sep">/</span>
+                <span class="concurrency-gateway">{{ p.gateway }}</span>
+                <template v-if="p.max">{{ ` / ${p.max}` }}</template>
               </span>
             </div>
             <div v-if="p.models?.length" class="concurrency-models">
@@ -661,6 +693,19 @@ export OPENAI_API_KEY=your-key</pre>
 
 .concurrency-value.active {
   color: var(--ok);
+}
+
+.concurrency-upstream {
+  color: var(--ok);
+}
+
+.concurrency-sep {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+
+.concurrency-gateway {
+  color: var(--primary);
 }
 
 .live-logs {

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun run scripts/dev.ts",
+    "perview": "pnpm build && ./llm-gateway",
     "dev:server": "bun run --watch src/server/index.ts",
     "dev:web": "vite",
     "build": "bun run scripts/build.ts",

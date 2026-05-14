@@ -1,11 +1,12 @@
 import type { FastifyInstance } from "fastify"
-import type { AnthropicMessagesRequest, AnthropicErrorResponse } from "../types.ts"
+import type { AnthropicMessagesRequest, AnthropicErrorResponse, AuthContext } from "../types.ts"
 import { convertRequestToOpenAI } from "../converters/to-openai.ts"
 import { convertResponseToAnthropic } from "../converters/resp-to-anthropic.ts"
 import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
 import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropicContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
+import { checkQuota } from "../quota.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -34,6 +35,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let fullMessageText = ""
     const isStream = body.stream ?? false
     const reqId = nextReqId()
+    const auth = (request as any).authContext as AuthContext | null
 
     /** 提取输入摘要：最后一条 user 消息 */
     const inputSummary = extractLastAnthropicUserMessage(body) ?? model
@@ -44,19 +46,31 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     }
     const collectStreamToolCall = (name: string, input: string) => { outputText += (outputText ? "\n" : "") + `[tool_call: ${name}(${input})]` }
 
+    /** 配额检查 */
+    if (auth) {
+      const quotaResult = checkQuota(fastify.db, auth)
+      if (!quotaResult.allowed) {
+        return reply.status(429).send({
+          type: "error",
+          error: { type: "rate_limit_error", message: quotaResult.reason! },
+        } satisfies AnthropicErrorResponse)
+      }
+    }
+
     try {
       const messageText = extractAnthropicText(body)
       fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes })
+      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
       providerId = providerConfig.id
       targetModel = tm
       providerName = providerConfig.name
 
-      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern })
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
 
       const semaphore = fastify.registry.getSemaphore(providerConfig.id)
       await semaphore?.acquire()
+      emitEvent({ type: "upstream_start", requestId: reqId, providerId })
       try {
         if (provider.type === "anthropic") {
           /** Anthropic 直连 — 透传 */
@@ -156,6 +170,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           .join("\n") ?? ""
         return reply.send(converted)
       } finally {
+        emitEvent({ type: "upstream_end", requestId: reqId, providerId })
         semaphore?.release()
       }
     } catch (err) {
@@ -181,6 +196,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         outputTokens,
         cacheCreationTokens,
         cacheReadTokens,
+        apiKeyId: auth?.keyId ?? null,
+        groupId: auth?.groupId ?? null,
         error: errorMsg,
         inputContent: fullMessageText,
         outputContent: outputText || null,

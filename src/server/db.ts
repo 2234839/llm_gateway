@@ -1,11 +1,12 @@
 import { Database, Statement } from "bun:sqlite"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey } from "./types.ts"
 
 const DEFAULT_CONFIG: GatewayConfig = {
   port: 3827,
   logLevel: "info",
   enableRequestLog: true,
   logContentRetention: 1000,
+  authRequired: false,
 }
 
 export class GatewayDB {
@@ -132,6 +133,54 @@ export class GatewayDB {
     } catch {
       // 列已存在
     }
+
+    /** API Key 分组表 */
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS key_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT DEFAULT '',
+        daily_token_limit INTEGER DEFAULT 0,
+        monthly_token_limit INTEGER DEFAULT 0,
+        rpm_limit INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `)
+
+    /** API Keys 表 */
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        key_prefix TEXT NOT NULL,
+        group_id TEXT NOT NULL REFERENCES key_groups(id) ON DELETE CASCADE,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        daily_token_limit INTEGER DEFAULT 0,
+        monthly_token_limit INTEGER DEFAULT 0,
+        rpm_limit INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        description TEXT DEFAULT ''
+      )
+    `)
+
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_group_id ON api_keys(group_id)`)
+
+    /** 兼容已有数据库：添加新列 */
+    try {
+      this.db.exec("ALTER TABLE route_rules ADD COLUMN key_groups TEXT DEFAULT NULL")
+    } catch { /* 列已存在 */ }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT DEFAULT NULL")
+    } catch { /* 列已存在 */ }
+    try {
+      this.db.exec("ALTER TABLE request_logs ADD COLUMN group_id TEXT DEFAULT NULL")
+    } catch { /* 列已存在 */ }
+
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id)`)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_group_id ON request_logs(group_id)`)
   }
 
   private prepareStatements() {
@@ -228,8 +277,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match, key_groups) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>) {
@@ -238,8 +287,8 @@ export class GatewayDB {
 
     const updated = { ...existing, ...rule, id }
     this.stmt(
-      "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=? WHERE id=?"
-    ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, id)
+      "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=?, key_groups=? WHERE id=?"
+    ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, id)
   }
 
   deleteRouteRule(id: string) {
@@ -257,6 +306,7 @@ export class GatewayDB {
       targetModel: (row.target_model as string) || undefined,
       excludeMatch: row.exclude_match ? JSON.parse(row.exclude_match as string) : undefined,
       enabled: row.enabled !== 0,
+      keyGroups: row.key_groups ? JSON.parse(row.key_groups as string) : undefined,
     }
   }
 
@@ -264,7 +314,7 @@ export class GatewayDB {
 
   addLog(log: Omit<RequestLogEntry, "id" | "timestamp">) {
     this.stmt(
-      "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       log.method,
       log.path,
@@ -281,6 +331,8 @@ export class GatewayDB {
       log.error,
       log.inputContent ?? null,
       log.outputContent ?? null,
+      log.apiKeyId ?? null,
+      log.groupId ?? null,
     )
     this.pruneLogContent()
   }
@@ -293,8 +345,8 @@ export class GatewayDB {
     )
   }
 
-  getLogs(options: { limit?: number; offset?: number; model?: string; providerId?: string } = {}): RequestLogEntry[] {
-    const { limit = 100, offset = 0, model, providerId } = options
+  getLogs(options: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string } = {}): RequestLogEntry[] {
+    const { limit = 100, offset = 0, model, providerId, apiKeyId, groupId } = options
 
     let sql = "SELECT * FROM request_logs WHERE 1=1"
     const params: (string | number)[] = []
@@ -306,6 +358,14 @@ export class GatewayDB {
     if (providerId) {
       sql += " AND provider_id = ?"
       params.push(providerId)
+    }
+    if (apiKeyId) {
+      sql += " AND api_key_id = ?"
+      params.push(apiKeyId)
+    }
+    if (groupId) {
+      sql += " AND group_id = ?"
+      params.push(groupId)
     }
 
     sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
@@ -378,6 +438,8 @@ export class GatewayDB {
       error: row.error as string | null,
       inputContent: (row.input_content as string) || null,
       outputContent: (row.output_content as string) || null,
+      apiKeyId: (row.api_key_id as string) || null,
+      groupId: (row.group_id as string) || null,
     }
   }
 
@@ -441,6 +503,177 @@ export class GatewayDB {
       GROUP BY hour
       ORDER BY hour ASC`
     return this.db.prepare(sql).all() as ({ hour: string } & TokenStats)[]
+  }
+
+  // ========== Key Groups ==========
+
+  getKeyGroups(): KeyGroup[] {
+    const rows = this.db.prepare("SELECT * FROM key_groups ORDER BY created_at").all() as Record<string, unknown>[]
+    return rows.map(this.rowToKeyGroup)
+  }
+
+  getKeyGroup(id: string): KeyGroup | null {
+    const row = this.stmt("SELECT * FROM key_groups WHERE id = ?").get(id) as Record<string, unknown> | null
+    return row ? this.rowToKeyGroup(row) : null
+  }
+
+  getKeyGroupByName(name: string): KeyGroup | null {
+    const row = this.stmt("SELECT * FROM key_groups WHERE name = ?").get(name) as Record<string, unknown> | null
+    return row ? this.rowToKeyGroup(row) : null
+  }
+
+  addKeyGroup(group: KeyGroup) {
+    this.stmt(
+      "INSERT INTO key_groups (id, name, description, daily_token_limit, monthly_token_limit, rpm_limit) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(group.id, group.name, group.description, group.dailyTokenLimit, group.monthlyTokenLimit, group.rpmLimit)
+  }
+
+  updateKeyGroup(id: string, group: Partial<KeyGroup>) {
+    const existing = this.getKeyGroup(id)
+    if (!existing) return
+    const updated = { ...existing, ...group, id }
+    this.stmt(
+      "UPDATE key_groups SET name=?, description=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=? WHERE id=?"
+    ).run(updated.name, updated.description, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, id)
+  }
+
+  deleteKeyGroup(id: string) {
+    this.stmt("DELETE FROM key_groups WHERE id = ?").run(id)
+  }
+
+  private rowToKeyGroup(row: Record<string, unknown>): KeyGroup {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      description: (row.description as string) || "",
+      dailyTokenLimit: (row.daily_token_limit as number) || 0,
+      monthlyTokenLimit: (row.monthly_token_limit as number) || 0,
+      rpmLimit: (row.rpm_limit as number) || 0,
+      createdAt: row.created_at as string,
+    }
+  }
+
+  // ========== API Keys ==========
+
+  getApiKeys(): ApiKey[] {
+    const rows = this.db.prepare("SELECT * FROM api_keys ORDER BY created_at").all() as Record<string, unknown>[]
+    return rows.map(this.rowToApiKey)
+  }
+
+  getApiKey(id: string): ApiKey | null {
+    const row = this.stmt("SELECT * FROM api_keys WHERE id = ?").get(id) as Record<string, unknown> | null
+    return row ? this.rowToApiKey(row) : null
+  }
+
+  getApiKeyByHash(hash: string): ApiKey | null {
+    const row = this.stmt("SELECT * FROM api_keys WHERE key_hash = ?").get(hash) as Record<string, unknown> | null
+    return row ? this.rowToApiKey(row) : null
+  }
+
+  addApiKey(key: ApiKey) {
+    this.stmt(
+      "INSERT INTO api_keys (id, name, key_hash, key_prefix, group_id, enabled, daily_token_limit, monthly_token_limit, rpm_limit, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(key.id, key.name, key.keyHash, key.keyPrefix, key.groupId, key.enabled ? 1 : 0, key.dailyTokenLimit, key.monthlyTokenLimit, key.rpmLimit, key.description)
+  }
+
+  updateApiKey(id: string, key: Partial<ApiKey>) {
+    const existing = this.getApiKey(id)
+    if (!existing) return
+    const updated = { ...existing, ...key, id }
+    this.stmt(
+      "UPDATE api_keys SET name=?, key_hash=?, key_prefix=?, group_id=?, enabled=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=?, description=? WHERE id=?"
+    ).run(updated.name, updated.keyHash, updated.keyPrefix, updated.groupId, updated.enabled ? 1 : 0, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, updated.description, id)
+  }
+
+  deleteApiKey(id: string) {
+    this.stmt("DELETE FROM api_keys WHERE id = ?").run(id)
+  }
+
+  updateKeyLastUsed(id: string) {
+    this.stmt("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?").run(id)
+  }
+
+  /** 该分组下的 Key 数量 */
+  getKeyCountByGroup(groupId: string): number {
+    return (this.stmt("SELECT COUNT(*) as count FROM api_keys WHERE group_id = ?").get(groupId) as { count: number }).count
+  }
+
+  private rowToApiKey(row: Record<string, unknown>): ApiKey {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      keyHash: row.key_hash as string,
+      keyPrefix: row.key_prefix as string,
+      groupId: row.group_id as string,
+      enabled: (row.enabled as number) === 1,
+      dailyTokenLimit: (row.daily_token_limit as number) || 0,
+      monthlyTokenLimit: (row.monthly_token_limit as number) || 0,
+      rpmLimit: (row.rpm_limit as number) || 0,
+      createdAt: row.created_at as string,
+      lastUsedAt: (row.last_used_at as string) || null,
+      description: (row.description as string) || "",
+    }
+  }
+
+  // ========== 按密钥/分组统计 ==========
+
+  /** 按密钥分组统计 Token 用量 */
+  getTokenStatsByGroup(): ({ groupId: string; groupName: string } & TokenStats)[] {
+    const sql = `
+      SELECT kg.id AS groupId, kg.name AS groupName,
+             COALESCE(SUM(l.input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(l.output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(l.cache_creation_tokens), 0) AS cacheCreationTokens,
+             COALESCE(SUM(l.cache_read_tokens), 0) AS cacheReadTokens
+      FROM request_logs l
+      JOIN api_keys ak ON l.api_key_id = ak.id
+      JOIN key_groups kg ON ak.group_id = kg.id
+      WHERE l.api_key_id IS NOT NULL
+      GROUP BY kg.id
+      ORDER BY inputTokens + outputTokens DESC
+    `
+    return this.db.prepare(sql).all() as ({ groupId: string; groupName: string } & TokenStats)[]
+  }
+
+  /** 按密钥统计 Token 用量 */
+  getTokenStatsByKey(): ({ keyId: string; keyName: string; groupId: string } & TokenStats)[] {
+    const sql = `
+      SELECT ak.id AS keyId, ak.name AS keyName, ak.group_id AS groupId,
+             COALESCE(SUM(l.input_tokens), 0) AS inputTokens,
+             COALESCE(SUM(l.output_tokens), 0) AS outputTokens,
+             COALESCE(SUM(l.cache_creation_tokens), 0) AS cacheCreationTokens,
+             COALESCE(SUM(l.cache_read_tokens), 0) AS cacheReadTokens
+      FROM request_logs l
+      JOIN api_keys ak ON l.api_key_id = ak.id
+      WHERE l.api_key_id IS NOT NULL
+      GROUP BY ak.id
+      ORDER BY inputTokens + outputTokens DESC
+    `
+    return this.db.prepare(sql).all() as ({ keyId: string; keyName: string; groupId: string } & TokenStats)[]
+  }
+
+  /** 获取指定 Key 今日已用 Token */
+  getDailyKeyUsage(keyId: string): number {
+    const row = this.stmt(
+      "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) as total FROM request_logs WHERE api_key_id = ? AND date(timestamp, 'localtime') = date('now', 'localtime')"
+    ).get(keyId) as { total: number }
+    return row.total
+  }
+
+  /** 获取指定 Key 本月已用 Token */
+  getMonthlyKeyUsage(keyId: string): number {
+    const row = this.stmt(
+      "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) as total FROM request_logs WHERE api_key_id = ? AND strftime('%Y-%m', timestamp, 'localtime') = strftime('%Y-%m', 'now', 'localtime')"
+    ).get(keyId) as { total: number }
+    return row.total
+  }
+
+  /** 获取指定 Key 最近 60 秒请求数 */
+  getKeyRpmCount(keyId: string): number {
+    const row = this.stmt(
+      "SELECT COUNT(*) as count FROM request_logs WHERE api_key_id = ? AND timestamp >= datetime('now', '-60 seconds', 'localtime')"
+    ).get(keyId) as { count: number }
+    return row.count
   }
 
   close() {

@@ -6,7 +6,20 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   if (hasBody) headers["Content-Type"] = "application/json"
   const resp = await fetch(`${BASE}${path}`, { ...options, headers })
   if (resp.status === 204) return null as T
+  if (resp.status === 401) throw new ApiAuthError()
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({ error: "Request failed" }))
+    throw new Error((body as { error?: string }).error ?? `HTTP ${resp.status}`)
+  }
   return resp.json()
+}
+
+/** 认证失效错误，前端据此跳转登录页 */
+export class ApiAuthError extends Error {
+  constructor() {
+    super("Authentication required")
+    this.name = "ApiAuthError"
+  }
 }
 
 export interface ProviderInfo {
@@ -47,6 +60,8 @@ export interface RouteRuleInfo {
   excludeMatch?: ContentMatchCondition[]
   /** 是否启用，默认 true */
   enabled?: boolean
+  /** 匹配的密钥分组 ID 列表 */
+  keyGroups?: string[]
 }
 
 /** Token 用量统计 */
@@ -75,6 +90,8 @@ export interface LogEntry {
   error: string | null
   inputContent: string | null
   outputContent: string | null
+  apiKeyId: string | null
+  groupId: string | null
 }
 
 export interface HealthInfo {
@@ -98,6 +115,41 @@ export interface ProviderTestResult {
   error?: string
 }
 
+export interface KeyGroupInfo {
+  id: string
+  name: string
+  description: string
+  dailyTokenLimit: number
+  monthlyTokenLimit: number
+  rpmLimit: number
+  createdAt: string
+  keyCount?: number
+}
+
+export interface ApiKeyInfo {
+  id: string
+  name: string
+  keyPrefix: string
+  groupId: string
+  enabled: boolean
+  dailyTokenLimit: number
+  monthlyTokenLimit: number
+  rpmLimit: number
+  createdAt: string
+  lastUsedAt: string | null
+  description: string
+}
+
+export interface InitCheckResult {
+  initialized: boolean
+}
+
+export interface GatewayConfigInfo {
+  authRequired: boolean
+  adminInitialized: boolean
+  adminUsername: string | null
+}
+
 export const providerApi = {
   list: () => api<ProviderInfo[]>("/admin/providers"),
   create: (data: Omit<ProviderInfo, "id">) => api<ProviderInfo>("/admin/providers", { method: "POST", body: JSON.stringify(data) }),
@@ -115,14 +167,22 @@ export const routeApi = {
 }
 
 export const logApi = {
-  list: (options?: { limit?: number; offset?: number; model?: string }) => {
+  list: (options?: { limit?: number; offset?: number; model?: string; apiKeyId?: string; groupId?: string }) => {
     const params = new URLSearchParams()
     if (options?.limit) params.set("limit", String(options.limit))
     if (options?.offset) params.set("offset", String(options.offset))
     if (options?.model) params.set("model", options.model)
+    if (options?.apiKeyId) params.set("apiKeyId", options.apiKeyId)
+    if (options?.groupId) params.set("groupId", options.groupId)
     return api<LogEntry[]>(`/admin/logs?${params}`)
   },
-  stats: () => api<{ total: number; today: number }>("/admin/stats"),
+  stats: (filters?: { apiKeyId?: string; groupId?: string }) => {
+    const params = new URLSearchParams()
+    if (filters?.apiKeyId) params.set("apiKeyId", filters.apiKeyId)
+    if (filters?.groupId) params.set("groupId", filters.groupId)
+    const qs = params.toString()
+    return api<{ total: number; today: number }>(`/admin/stats${qs ? '?' + qs : ''}`)
+  },
 }
 
 export const healthApi = {
@@ -136,4 +196,34 @@ export const tokenApi = {
     byModel: ({ model: string; targetModel: string } & TokenStats)[]
   }>("/admin/token-stats"),
   hourly: (hours: number = 24) => api<({ hour: string } & TokenStats)[]>(`/admin/token-stats/hourly?hours=${hours}`),
+}
+
+export const keyGroupApi = {
+  list: () => api<KeyGroupInfo[]>("/admin/key-groups"),
+  create: (data: Omit<KeyGroupInfo, "id" | "createdAt" | "keyCount">) => api<KeyGroupInfo>("/admin/key-groups", { method: "POST", body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<KeyGroupInfo>) => api<KeyGroupInfo>(`/admin/key-groups/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  delete: (id: string) => api<void>(`/admin/key-groups/${id}`, { method: "DELETE" }),
+}
+
+export const apiKeyApi = {
+  list: () => api<ApiKeyInfo[]>("/admin/keys"),
+  create: (data: { name: string; groupId: string; dailyTokenLimit?: number; monthlyTokenLimit?: number; rpmLimit?: number; description?: string }) =>
+    api<ApiKeyInfo & { rawKey: string }>("/admin/keys", { method: "POST", body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<ApiKeyInfo>) => api<ApiKeyInfo>(`/admin/keys/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  delete: (id: string) => api<void>(`/admin/keys/${id}`, { method: "DELETE" }),
+}
+
+export const initApi = {
+  check: () => api<InitCheckResult>("/admin/init-check"),
+  init: (data: { username: string; password: string }) => api<{ success: boolean }>("/admin/init", { method: "POST", body: JSON.stringify(data) }),
+}
+
+export const authApi = {
+  login: (data: { username: string; password: string }) => api<{ success: boolean }>("/admin/login", { method: "POST", body: JSON.stringify(data) }),
+  logout: () => api<{ success: boolean }>("/admin/logout", { method: "POST" }),
+}
+
+export const configApi = {
+  get: () => api<GatewayConfigInfo>("/admin/config"),
+  update: (data: { authRequired?: boolean; newPassword?: string }) => api<{ success: boolean }>("/admin/config", { method: "PUT", body: JSON.stringify(data) }),
 }

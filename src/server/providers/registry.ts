@@ -10,6 +10,8 @@ export interface ResolveContext {
   messageText: string
   /** 请求中包含的多模态内容类型 (image/file/tool_use) */
   contentTypes: Set<string>
+  /** 请求来源的密钥分组 ID */
+  groupId?: string
 }
 
 export class ProviderRegistry {
@@ -57,6 +59,12 @@ export class ProviderRegistry {
       /** 模型名匹配：pattern 为空或 * 时不过滤 */
       if (rule.pattern && rule.pattern !== "*") {
         if (!picomatch(rule.pattern)(model)) continue
+      }
+
+      /** 密钥分组匹配：规则指定了 keyGroups 时，请求的 groupId 必须在列表中 */
+      if (rule.keyGroups && rule.keyGroups.length > 0) {
+        if (!context?.groupId) continue
+        if (!rule.keyGroups.includes(context.groupId)) continue
       }
 
       /** 内容匹配 */
