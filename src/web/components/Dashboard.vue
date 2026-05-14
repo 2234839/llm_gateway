@@ -237,6 +237,7 @@ function renderConcurrencyChart() {
       borderWidth: 0,
       yAxisID: "y",
       stack: entry.name,
+      order: 2,
     })
     /** 上层：排队中（半透明，gateway - upstream） */
     barDatasets.push({
@@ -247,6 +248,7 @@ function renderConcurrencyChart() {
       borderWidth: 1,
       yAxisID: "y",
       stack: entry.name,
+      order: 2,
     })
   }
 
@@ -269,6 +271,7 @@ function renderConcurrencyChart() {
     borderWidth: 2,
     borderDash: [6, 3],
     yAxisID: "y",
+    order: 0,
   } as never)
 
   /** 输出速率折线 */
@@ -283,6 +286,7 @@ function renderConcurrencyChart() {
     borderWidth: 2,
     borderDash: [4, 2],
     yAxisID: "y1",
+    order: 0,
   } as never)
 
   chartInstance.data.labels = historyLabels
