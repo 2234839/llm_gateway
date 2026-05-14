@@ -308,6 +308,10 @@ export interface RouteRule {
   priority: number
   /** 内容匹配条件组，不存在则仅按模型名匹配 */
   contentMatch?: ContentMatchCondition[]
+  /** 排除条件组，匹配成功时跳过此规则，优先级高于匹配条件 */
+  excludeMatch?: ContentMatchCondition[]
+  /** 是否启用，默认 true */
+  enabled?: boolean
 }
 
 export interface GatewayConfig {

@@ -169,14 +169,24 @@ export async function adminRoutes(fastify: FastifyInstance) {
   const maxSnapshots = 300
   const concurrencySnapshots: ConcurrencySnapshot[] = []
 
+  /** 从 activeRequests 统计每个 provider 的实际活跃请求数 */
+  function countActiveByProvider(): Map<string, number> {
+    const counts = new Map<string, number>()
+    for (const [, req] of activeRequests) {
+      counts.set(req.providerId, (counts.get(req.providerId) ?? 0) + 1)
+    }
+    return counts
+  }
+
   /** 记录当前并发快照到环形缓冲区 */
   function recordSnapshot() {
     const now = new Date()
     const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
     const providers = fastify.registry.getConcurrencyStatus()
+    const activeCounts = countActiveByProvider()
     concurrencySnapshots.push({
       time,
-      providers: providers.map(p => ({ id: p.id, name: p.name, current: p.current })),
+      providers: providers.map(p => ({ id: p.id, name: p.name, current: activeCounts.get(p.id) ?? p.current })),
     })
     if (concurrencySnapshots.length > maxSnapshots) concurrencySnapshots.shift()
   }
@@ -184,6 +194,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   /** 聚合并发状态：按 provider 聚合，包含模型维度 */
   function buildConcurrencyPayload() {
     const providerStatus = fastify.registry.getConcurrencyStatus()
+    const activeCounts = countActiveByProvider()
     const modelMap = new Map<string, Map<string, { model: string; targetModel: string; count: number }>>()
     for (const [, req] of activeRequests) {
       if (!modelMap.has(req.providerId)) modelMap.set(req.providerId, new Map())
@@ -198,6 +209,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
     return providerStatus.map(p => ({
       ...p,
+      current: activeCounts.get(p.id) ?? p.current,
       models: [...(modelMap.get(p.id)?.values() ?? [])],
     }))
   }

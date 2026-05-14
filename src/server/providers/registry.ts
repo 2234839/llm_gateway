@@ -52,6 +52,8 @@ export class ProviderRegistry {
     const rules = this.db.getRouteRules()
 
     for (const rule of rules) {
+      if (rule.enabled === false) continue
+
       /** 模型名匹配：pattern 为空或 * 时不过滤 */
       if (rule.pattern && rule.pattern !== "*") {
         if (!picomatch(rule.pattern)(model)) continue
@@ -61,6 +63,13 @@ export class ProviderRegistry {
       if (rule.contentMatch && rule.contentMatch.length > 0) {
         if (!context?.messageText && !context?.contentTypes?.size) continue
         if (!matchContent(rule.contentMatch, context?.messageText ?? "", context?.contentTypes ?? new Set())) continue
+      }
+
+      /** 排除条件：命中则跳过此规则 */
+      if (rule.excludeMatch && rule.excludeMatch.length > 0) {
+        if (context?.messageText || context?.contentTypes?.size) {
+          if (matchContent(rule.excludeMatch, context?.messageText ?? "", context?.contentTypes ?? new Set())) continue
+        }
       }
 
       const provider = this.providers.get(rule.providerId)

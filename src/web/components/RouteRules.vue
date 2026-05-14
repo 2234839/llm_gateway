@@ -7,6 +7,7 @@ const rules = ref<RouteRuleInfo[]>([])
 const providers = ref<ProviderInfo[]>([])
 const loading = ref(true)
 const creating = ref(false)
+const editingId = ref<string | null>(null)
 
 const emptyRule: Omit<RouteRuleInfo, "id"> = {
   pattern: "",
@@ -15,6 +16,7 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   modelMapping: {},
   priority: 0,
   contentMatch: [],
+  excludeMatch: [],
 }
 
 const form = ref({ ...emptyRule })
@@ -36,26 +38,52 @@ async function load() {
 }
 
 function startCreate() {
+  editingId.value = null
   creating.value = true
-  form.value = { ...emptyRule, contentMatch: [] }
+  form.value = { ...emptyRule, contentMatch: [], excludeMatch: [] }
+}
+
+function startEdit(rule: RouteRuleInfo) {
+  editingId.value = rule.id
+  creating.value = true
+  form.value = {
+    pattern: rule.pattern,
+    providerId: rule.providerId,
+    targetModel: rule.targetModel ?? "",
+    modelMapping: rule.modelMapping ? { ...rule.modelMapping } : {},
+    priority: rule.priority,
+    contentMatch: rule.contentMatch ? rule.contentMatch.map(c => ({ ...c })) : [],
+    excludeMatch: rule.excludeMatch ? rule.excludeMatch.map(c => ({ ...c })) : [],
+  }
 }
 
 function cancel() {
+  editingId.value = null
   creating.value = false
 }
 
 async function save() {
   const data = { ...form.value }
   if (!data.contentMatch?.length) data.contentMatch = undefined
+  if (!data.excludeMatch?.length) data.excludeMatch = undefined
   if (!data.targetModel) data.targetModel = undefined
   if (!data.pattern) data.pattern = ""
-  await routeApi.create(data)
+  if (editingId.value) {
+    await routeApi.update(editingId.value, data)
+  } else {
+    await routeApi.create(data)
+  }
   cancel()
   await load()
 }
 
 async function remove(id: string) {
   await routeApi.delete(id)
+  await load()
+}
+
+async function toggleEnabled(rule: RouteRuleInfo) {
+  await routeApi.update(rule.id, { enabled: rule.enabled === false })
   await load()
 }
 
@@ -100,6 +128,21 @@ function syncOperator() {
   const op = form.value.contentMatch?.[0]?.operator ?? "and"
   form.value.contentMatch?.forEach(c => c.operator = op)
 }
+
+function addExcludeCondition() {
+  if (!form.value.excludeMatch) form.value.excludeMatch = []
+  form.value.excludeMatch.push({ type: "keyword", pattern: "", operator: form.value.excludeMatch[0]?.operator ?? "and" })
+}
+
+function removeExcludeCondition(index: number) {
+  form.value.excludeMatch?.splice(index, 1)
+  if (!form.value.excludeMatch?.length) form.value.excludeMatch = undefined
+}
+
+function syncExcludeOperator() {
+  const op = form.value.excludeMatch?.[0]?.operator ?? "and"
+  form.value.excludeMatch?.forEach(c => c.operator = op)
+}
 </script>
 
 <template>
@@ -123,7 +166,7 @@ function syncOperator() {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(rule, idx) in rules" :key="rule.id">
+          <tr v-for="(rule, idx) in rules" :key="rule.id" :class="{ disabled: rule.enabled === false }">
             <td>
               <div class="priority-cell">
                 <button class="btn-icon" :disabled="idx === 0" @click="moveUp(idx)" :title="t('route.moveUp')">&#9650;</button>
@@ -133,7 +176,16 @@ function syncOperator() {
             </td>
             <td>
               <span v-if="rule.pattern && rule.pattern !== '*'" class="match-tag model">{{ t('route.modelLabel') }} <code>{{ rule.pattern }}</code></span>
-              <span v-for="(cond, ci) in rule.contentMatch" :key="ci" class="match-tag" :class="cond.type === 'content_type' ? 'media' : 'content'">
+              <span v-for="(cond, ci) in rule.contentMatch" :key="'cm'+ci" class="match-tag" :class="cond.type === 'content_type' ? 'media' : 'content'">
+                <template v-if="cond.type === 'content_type'">
+                  {{ cond.pattern === 'image' ? t('route.containsImage') : cond.pattern === 'file' ? t('route.containsFile') : cond.pattern === 'tool_use' ? t('route.containsToolUse') : cond.pattern }}
+                </template>
+                <template v-else>
+                  {{ cond.type === 'keyword' ? t('route.contains') : t('route.match') }} "{{ cond.pattern }}"
+                </template>
+              </span>
+              <span v-if="rule.excludeMatch?.length" class="match-tag exclude-label">{{ t('route.excludes') }}</span>
+              <span v-for="(cond, ci) in rule.excludeMatch" :key="'ex'+ci" class="match-tag exclude">
                 <template v-if="cond.type === 'content_type'">
                   {{ cond.pattern === 'image' ? t('route.containsImage') : cond.pattern === 'file' ? t('route.containsFile') : cond.pattern === 'tool_use' ? t('route.containsToolUse') : cond.pattern }}
                 </template>
@@ -149,14 +201,21 @@ function syncOperator() {
               <span v-else class="muted">{{ t('route.originalModel') }}</span>
             </td>
             <td>
-              <button class="btn-sm btn-danger" @click="remove(rule.id)">{{ t('route.delete') }}</button>
+              <div class="actions-cell">
+                <label class="toggle" :title="rule.enabled !== false ? t('route.enabled') : t('route.disabled')">
+                  <input type="checkbox" :checked="rule.enabled !== false" @change="toggleEnabled(rule)" />
+                  <span class="toggle-slider"></span>
+                </label>
+                <button class="btn-sm" @click="startEdit(rule)">{{ t('route.edit') }}</button>
+                <button class="btn-sm btn-danger" @click="remove(rule.id)">{{ t('route.delete') }}</button>
+              </div>
             </td>
           </tr>
         </tbody>
       </table>
 
       <div v-if="creating" class="form-card">
-        <h3>{{ t('route.addTitle') }}</h3>
+        <h3>{{ editingId ? t('route.editTitle') : t('route.addTitle') }}</h3>
 
         <!-- 服务商 & 目标模型 -->
         <div class="form-grid">
@@ -240,6 +299,59 @@ function syncOperator() {
             </div>
 
             <button class="btn-sm" type="button" @click="addCondition" style="margin-left: 24px">{{ t('route.addCondition') }}</button>
+          </div>
+        </div>
+
+        <!-- 排除条件 -->
+        <div class="match-section">
+          <div class="section-label">{{ t('route.excludeConditionLabel') }}</div>
+
+          <div class="condition-row">
+            <label class="checkbox-label">
+              <input type="checkbox" :checked="!!form.excludeMatch?.length" @change="($event.target as HTMLInputElement).checked ? addExcludeCondition() : (form.excludeMatch = undefined)" />
+              {{ t('route.excludeByContent') }}
+            </label>
+          </div>
+
+          <div v-if="form.excludeMatch?.length" class="content-conditions">
+            <div v-if="form.excludeMatch.length > 1" class="operator-select">
+              <select :value="form.excludeMatch[0].operator ?? 'and'" @change="syncExcludeOperator()">
+                <option value="and">{{ t('route.matchAllAnd') }}</option>
+                <option value="or">{{ t('route.matchAnyOr') }}</option>
+              </select>
+            </div>
+
+            <div v-for="(cond, i) in form.excludeMatch" :key="i" class="condition-row indented">
+              <select v-model="cond.type" class="cond-type">
+                <option value="keyword">{{ t('route.keyword') }}</option>
+                <option value="regex">{{ t('route.regex') }}</option>
+                <option value="content_type">{{ t('route.contentType') }}</option>
+              </select>
+              <select
+                v-if="cond.type === 'content_type'"
+                v-model="cond.pattern"
+                class="cond-pattern"
+              >
+                <option value="image">{{ t('route.containsImage') }}</option>
+                <option value="file">{{ t('route.containsFile') }}</option>
+                <option value="tool_use">{{ t('route.containsToolUse') }}</option>
+              </select>
+              <input
+                v-else
+                v-model="cond.pattern"
+                :placeholder="cond.type === 'keyword' ? t('route.keywordPlaceholder') : t('route.regexPlaceholder')"
+                class="cond-pattern"
+              />
+              <input
+                v-if="cond.type === 'regex'"
+                v-model="cond.flags"
+                placeholder="flags"
+                class="cond-flags"
+              />
+              <button class="btn-sm btn-danger" type="button" @click="removeExcludeCondition(i)">&times;</button>
+            </div>
+
+            <button class="btn-sm" type="button" @click="addExcludeCondition" style="margin-left: 24px">{{ t('route.addExclude') }}</button>
           </div>
         </div>
 
@@ -335,6 +447,17 @@ function syncOperator() {
   color: var(--tag-green);
 }
 
+.match-tag.exclude {
+  background: var(--tag-red-bg);
+  color: var(--tag-red);
+}
+
+.match-tag.exclude-label {
+  background: var(--tag-red-bg);
+  color: var(--tag-red);
+  font-weight: 600;
+}
+
 .priority-cell {
   display: flex;
   align-items: center;
@@ -365,5 +488,59 @@ function syncOperator() {
 .btn-icon:disabled {
   opacity: 0.25;
   cursor: default;
+}
+
+.actions-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/** Toggle 开关 */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background: var(--text-dim);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle input:checked + .toggle-slider {
+  background: var(--primary);
+}
+
+.toggle input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+tr.disabled {
+  opacity: 0.45;
 }
 </style>

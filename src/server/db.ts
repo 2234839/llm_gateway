@@ -98,6 +98,16 @@ export class GatewayDB {
       // 列已存在
     }
     try {
+      this.db.exec("ALTER TABLE route_rules ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.exec("ALTER TABLE route_rules ADD COLUMN exclude_match TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
       this.db.exec("ALTER TABLE providers ADD COLUMN max_concurrency INTEGER DEFAULT 0")
     } catch {
       // 列已存在
@@ -218,8 +228,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>) {
@@ -228,8 +238,8 @@ export class GatewayDB {
 
     const updated = { ...existing, ...rule, id }
     this.stmt(
-      "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=? WHERE id=?"
-    ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, id)
+      "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=? WHERE id=?"
+    ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, id)
   }
 
   deleteRouteRule(id: string) {
@@ -245,6 +255,8 @@ export class GatewayDB {
       priority: row.priority as number,
       contentMatch: row.content_match ? JSON.parse(row.content_match as string) : undefined,
       targetModel: (row.target_model as string) || undefined,
+      excludeMatch: row.exclude_match ? JSON.parse(row.exclude_match as string) : undefined,
+      enabled: row.enabled !== 0,
     }
   }
 

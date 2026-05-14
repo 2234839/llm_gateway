@@ -17,6 +17,8 @@
   --tag-purple: #ce93d8;
   --tag-green-bg: rgba(76, 175, 80, 0.15);
   --tag-green: #81c784;
+  --tag-red-bg: rgba(239, 68, 68, 0.15);
+  --tag-red: #f87171;
   --test-ok-bg: rgba(34, 197, 94, 0.1);
   --test-ok: #4ade80;
   --test-ok-border: rgba(34, 197, 94, 0.3);
@@ -40,6 +42,8 @@
   --tag-purple: #7b1fa2;
   --tag-green-bg: #e8f5e9;
   --tag-green: #2e7d32;
+  --tag-red-bg: #fde8e8;
+  --tag-red: #c41e1e;
   --test-ok-bg: #e6f9e6;
   --test-ok: #1a7a1a;
   --test-ok-border: #b2dfb2;

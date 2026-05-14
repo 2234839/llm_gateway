@@ -129,7 +129,6 @@ const typeOptions = [
             <th>{{ t('provider.urlCol') }}</th>
             <th>{{ t('provider.modelCol') }}</th>
             <th>{{ t('provider.concurrencyCol') }}</th>
-            <th>{{ t('provider.statusCol') }}</th>
             <th>{{ t('provider.actionsCol') }}</th>
           </tr>
         </thead>
@@ -142,14 +141,15 @@ const typeOptions = [
               <span v-for="m in p.models" :key="m" class="model-tag">{{ m }}</span>
             </td>
             <td>{{ p.maxConcurrency || t('provider.unlimited') }}</td>
-            <td>
-              <button :class="['toggle-btn', { on: p.enabled }]" @click="toggleEnabled(p)">
-                {{ p.enabled ? t('provider.enabled') : t('provider.disabled') }}
-              </button>
-            </td>
-            <td>
-              <button class="btn-sm" @click="startEdit(p)">{{ t('provider.edit') }}</button>
-              <button class="btn-sm btn-danger" @click="remove(p.id)">{{ t('provider.delete') }}</button>
+            <td colspan="2">
+              <div class="actions-cell">
+                <label class="toggle" :title="p.enabled ? t('provider.enabled') : t('provider.disabled')">
+                  <input type="checkbox" :checked="p.enabled" @change="toggleEnabled(p)" />
+                  <span class="toggle-slider"></span>
+                </label>
+                <button class="btn-sm" @click="startEdit(p)">{{ t('provider.edit') }}</button>
+                <button class="btn-sm btn-danger" @click="remove(p.id)">{{ t('provider.delete') }}</button>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -226,6 +226,56 @@ const typeOptions = [
 </template>
 
 <style scoped>
+.actions-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/** Toggle 开关 */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background: var(--text-dim);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle input:checked + .toggle-slider {
+  background: var(--primary);
+}
+
+.toggle input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
 .model-input-row {
   display: flex;
   flex-direction: column;
