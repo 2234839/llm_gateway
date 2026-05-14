@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue"
 import { logApi, type LogEntry } from "../api"
+import { t } from "../i18n"
 
 const logs = ref<LogEntry[]>([])
 const loading = ref(true)
@@ -44,25 +45,25 @@ function toggleExpand(id: number) {
 <template>
   <div class="request-log">
     <div class="toolbar">
-      <h2>请求日志</h2>
-      <button class="btn" @click="load">刷新</button>
+      <h2>{{ t('log.title') }}</h2>
+      <button class="btn" @click="load">{{ t('log.refresh') }}</button>
     </div>
 
-    <div v-if="loading" class="loading">加载中...</div>
+    <div v-if="loading" class="loading">{{ t('log.loading') }}</div>
 
     <div v-else>
       <table class="table">
         <thead>
           <tr>
-            <th>时间</th>
-            <th>模型</th>
-            <th>服务商</th>
-            <th>目标模型</th>
-            <th>流式</th>
-            <th>状态</th>
-            <th>耗时</th>
-            <th>令牌数</th>
-            <th>错误</th>
+            <th>{{ t('log.timeCol') }}</th>
+            <th>{{ t('log.modelCol') }}</th>
+            <th>{{ t('log.providerCol') }}</th>
+            <th>{{ t('log.targetModelCol') }}</th>
+            <th>{{ t('log.streamCol') }}</th>
+            <th>{{ t('log.statusCol') }}</th>
+            <th>{{ t('log.durationCol') }}</th>
+            <th>{{ t('log.tokensCol') }}</th>
+            <th>{{ t('log.errorCol') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -72,7 +73,7 @@ function toggleExpand(id: number) {
               <td><code>{{ log.model }}</code></td>
               <td>{{ log.providerId }}</td>
               <td><code>{{ log.targetModel }}</code></td>
-              <td>{{ log.stream ? "是" : "否" }}</td>
+              <td>{{ log.stream ? t('log.yes') : t('log.no') }}</td>
               <td :class="statusClass(log.statusCode)">{{ log.statusCode }}</td>
               <td>{{ log.durationMs }}ms</td>
               <td>{{ log.inputTokens }}/{{ log.outputTokens }}</td>
@@ -82,11 +83,11 @@ function toggleExpand(id: number) {
               <td colspan="9">
                 <div class="expand-content">
                   <div v-if="log.inputContent" class="content-block">
-                    <div class="content-label">提示词</div>
+                    <div class="content-label">{{ t('log.prompt') }}</div>
                     <pre class="content-text">{{ log.inputContent }}</pre>
                   </div>
                   <div v-if="log.outputContent" class="content-block">
-                    <div class="content-label">模型响应</div>
+                    <div class="content-label">{{ t('log.response') }}</div>
                     <pre class="content-text">{{ log.outputContent }}</pre>
                   </div>
                 </div>
@@ -97,9 +98,9 @@ function toggleExpand(id: number) {
       </table>
 
       <div class="pagination">
-        <button class="btn" :disabled="offset === 0" @click="prev">上一页</button>
-        <span class="page-info">偏移: {{ offset }}</span>
-        <button class="btn" :disabled="logs.length < limit" @click="next">下一页</button>
+        <button class="btn" :disabled="offset === 0" @click="prev">{{ t('log.prevPage') }}</button>
+        <span class="page-info">{{ t('log.offsetLabel', { offset }) }}</span>
+        <button class="btn" :disabled="logs.length < limit" @click="next">{{ t('log.nextPage') }}</button>
       </div>
     </div>
   </div>

@@ -4,15 +4,13 @@ import Dashboard from "./components/Dashboard.vue"
 import ProviderList from "./components/ProviderList.vue"
 import RouteRules from "./components/RouteRules.vue"
 import RequestLog from "./components/RequestLog.vue"
+import { t, currentLocale, setLocale } from "./i18n"
 
 const activeTab = ref("dashboard")
 
-const tabs = [
-  { key: "dashboard", label: "仪表盘" },
-  { key: "providers", label: "服务商" },
-  { key: "routes", label: "路由规则" },
-  { key: "logs", label: "请求日志" },
-]
+function tabLabel(key: string): string {
+  return t(`app.${key}`)
+}
 
 const isDark = ref(true)
 
@@ -38,7 +36,16 @@ function applyTheme() {
   document.documentElement.dataset.theme = isDark.value ? "dark" : "light"
 }
 
-onMounted(initTheme)
+function toggleLocale() {
+  setLocale(currentLocale.value === "zh" ? "en" : "zh")
+}
+
+const tabKeys = ["dashboard", "providers", "routes", "logs"]
+
+onMounted(() => {
+  initTheme()
+  document.documentElement.lang = currentLocale.value === "zh" ? "zh-CN" : "en"
+})
 </script>
 
 <template>
@@ -47,16 +54,19 @@ onMounted(initTheme)
       <h1 class="logo">LLM Gateway</h1>
       <nav class="nav">
         <button
-          v-for="tab in tabs"
-          :key="tab.key"
-          :class="['nav-btn', { active: activeTab === tab.key }]"
-          @click="activeTab = tab.key"
+          v-for="key in tabKeys"
+          :key="key"
+          :class="['nav-btn', { active: activeTab === key }]"
+          @click="activeTab = key"
         >
-          {{ tab.label }}
+          {{ tabLabel(key) }}
         </button>
       </nav>
       <div class="header-actions">
-        <button class="theme-btn" @click="toggleTheme" :title="isDark ? '切换到亮色模式' : '切换到暗色模式'">
+        <button class="locale-btn" @click="toggleLocale">
+          {{ currentLocale === 'zh' ? 'EN' : '中' }}
+        </button>
+        <button class="theme-btn" @click="toggleTheme" :title="isDark ? t('app.switchToLight') : t('app.switchToDark')">
           {{ isDark ? "&#9788;" : "&#9790;" }}
         </button>
       </div>

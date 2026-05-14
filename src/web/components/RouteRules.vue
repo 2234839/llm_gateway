@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue"
 import { routeApi, providerApi, type RouteRuleInfo, type ProviderInfo } from "../api"
+import { t } from "../i18n"
 
 const rules = ref<RouteRuleInfo[]>([])
 const providers = ref<ProviderInfo[]>([])
@@ -104,90 +105,90 @@ function syncOperator() {
 <template>
   <div class="route-rules">
     <div class="toolbar">
-      <h2>路由规则</h2>
-      <button class="btn btn-primary" @click="startCreate">+ 添加规则</button>
+      <h2>{{ t('route.title') }}</h2>
+      <button class="btn btn-primary" @click="startCreate">{{ t('route.addRule') }}</button>
     </div>
 
-    <div v-if="loading" class="loading">加载中...</div>
+    <div v-if="loading" class="loading">{{ t('route.loading') }}</div>
 
     <div v-else>
       <table class="table" v-if="!creating">
         <thead>
           <tr>
-            <th>#</th>
-            <th>匹配条件</th>
-            <th>服务商</th>
-            <th>目标模型</th>
-            <th>操作</th>
+            <th>{{ t('route.indexCol') }}</th>
+            <th>{{ t('route.matchCol') }}</th>
+            <th>{{ t('route.providerCol') }}</th>
+            <th>{{ t('route.targetModelCol') }}</th>
+            <th>{{ t('route.actionsCol') }}</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="(rule, idx) in rules" :key="rule.id">
             <td>
               <div class="priority-cell">
-                <button class="btn-icon" :disabled="idx === 0" @click="moveUp(idx)" title="上移">&#9650;</button>
+                <button class="btn-icon" :disabled="idx === 0" @click="moveUp(idx)" :title="t('route.moveUp')">&#9650;</button>
                 <span class="priority-num">{{ idx + 1 }}</span>
-                <button class="btn-icon" :disabled="idx === rules.length - 1" @click="moveDown(idx)" title="下移">&#9660;</button>
+                <button class="btn-icon" :disabled="idx === rules.length - 1" @click="moveDown(idx)" :title="t('route.moveDown')">&#9660;</button>
               </div>
             </td>
             <td>
-              <span v-if="rule.pattern && rule.pattern !== '*'" class="match-tag model">模型: <code>{{ rule.pattern }}</code></span>
+              <span v-if="rule.pattern && rule.pattern !== '*'" class="match-tag model">{{ t('route.modelLabel') }} <code>{{ rule.pattern }}</code></span>
               <span v-for="(cond, ci) in rule.contentMatch" :key="ci" class="match-tag" :class="cond.type === 'content_type' ? 'media' : 'content'">
                 <template v-if="cond.type === 'content_type'">
-                  {{ cond.pattern === 'image' ? '包含图片' : cond.pattern === 'file' ? '包含文件' : cond.pattern === 'tool_use' ? '包含工具调用' : cond.pattern }}
+                  {{ cond.pattern === 'image' ? t('route.containsImage') : cond.pattern === 'file' ? t('route.containsFile') : cond.pattern === 'tool_use' ? t('route.containsToolUse') : cond.pattern }}
                 </template>
                 <template v-else>
-                  {{ cond.type === 'keyword' ? '包含' : '匹配' }} "{{ cond.pattern }}"
+                  {{ cond.type === 'keyword' ? t('route.contains') : t('route.match') }} "{{ cond.pattern }}"
                 </template>
               </span>
-              <span v-if="(!rule.pattern || rule.pattern === '*') && !rule.contentMatch?.length" class="muted">匹配所有</span>
+              <span v-if="(!rule.pattern || rule.pattern === '*') && !rule.contentMatch?.length" class="muted">{{ t('route.matchAll') }}</span>
             </td>
             <td>{{ providerName(rule.providerId) }}</td>
             <td>
               <span v-if="rule.targetModel">{{ rule.targetModel }}</span>
-              <span v-else class="muted">原始模型名</span>
+              <span v-else class="muted">{{ t('route.originalModel') }}</span>
             </td>
             <td>
-              <button class="btn-sm btn-danger" @click="remove(rule.id)">删除</button>
+              <button class="btn-sm btn-danger" @click="remove(rule.id)">{{ t('route.delete') }}</button>
             </td>
           </tr>
         </tbody>
       </table>
 
       <div v-if="creating" class="form-card">
-        <h3>添加路由规则</h3>
+        <h3>{{ t('route.addTitle') }}</h3>
 
         <!-- 服务商 & 目标模型 -->
         <div class="form-grid">
           <label>
-            服务商
+            {{ t('route.providerLabel') }}
             <select v-model="form.providerId">
-              <option value="" disabled>选择服务商</option>
+              <option value="" disabled>{{ t('route.selectProvider') }}</option>
               <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
             </select>
           </label>
           <label v-if="providerModels.length">
-            目标模型
+            {{ t('route.targetModelLabel') }}
             <select v-model="form.targetModel">
-              <option value="">使用原始模型名</option>
+              <option value="">{{ t('route.useOriginalModel') }}</option>
               <option v-for="m in providerModels" :key="m" :value="m">{{ m }}</option>
             </select>
           </label>
           <label v-else>
-            目标模型
-            <input v-model="form.targetModel" placeholder="不填则使用原始模型名" />
+            {{ t('route.targetModelLabel') }}
+            <input v-model="form.targetModel" :placeholder="t('route.targetModelPlaceholder')" />
           </label>
         </div>
 
         <!-- 匹配条件 -->
         <div class="match-section">
-          <div class="section-label">匹配条件（至少选一个）</div>
+          <div class="section-label">{{ t('route.matchConditionLabel') }}</div>
 
           <!-- 模型名匹配 -->
           <div class="condition-row">
             <label class="checkbox-label">
               <input type="checkbox" :checked="!!form.pattern" @change="form.pattern = ($event.target as HTMLInputElement).checked ? '*' : ''" />
-              按模型名匹配
+              {{ t('route.matchByModel') }}
             </label>
             <input v-if="form.pattern" v-model="form.pattern" placeholder="gpt-*" class="cond-pattern" />
           </div>
@@ -196,37 +197,37 @@ function syncOperator() {
           <div class="condition-row">
             <label class="checkbox-label">
               <input type="checkbox" :checked="!!form.contentMatch?.length" @change="($event.target as HTMLInputElement).checked ? addCondition() : (form.contentMatch = undefined)" />
-              按消息内容匹配
+              {{ t('route.matchByContent') }}
             </label>
           </div>
 
           <div v-if="form.contentMatch?.length" class="content-conditions">
             <div v-if="form.contentMatch.length > 1" class="operator-select">
               <select :value="form.contentMatch[0].operator ?? 'and'" @change="syncOperator()">
-                <option value="and">全部匹配 (AND)</option>
-                <option value="or">任一匹配 (OR)</option>
+                <option value="and">{{ t('route.matchAllAnd') }}</option>
+                <option value="or">{{ t('route.matchAnyOr') }}</option>
               </select>
             </div>
 
             <div v-for="(cond, i) in form.contentMatch" :key="i" class="condition-row indented">
               <select v-model="cond.type" class="cond-type">
-                <option value="keyword">关键词</option>
-                <option value="regex">正则表达式</option>
-                <option value="content_type">内容类型</option>
+                <option value="keyword">{{ t('route.keyword') }}</option>
+                <option value="regex">{{ t('route.regex') }}</option>
+                <option value="content_type">{{ t('route.contentType') }}</option>
               </select>
               <select
                 v-if="cond.type === 'content_type'"
                 v-model="cond.pattern"
                 class="cond-pattern"
               >
-                <option value="image">包含图片</option>
-                <option value="file">包含文件</option>
-                <option value="tool_use">包含工具调用</option>
+                <option value="image">{{ t('route.containsImage') }}</option>
+                <option value="file">{{ t('route.containsFile') }}</option>
+                <option value="tool_use">{{ t('route.containsToolUse') }}</option>
               </select>
               <input
                 v-else
                 v-model="cond.pattern"
-                :placeholder="cond.type === 'keyword' ? '输入关键词' : '输入正则表达式'"
+                :placeholder="cond.type === 'keyword' ? t('route.keywordPlaceholder') : t('route.regexPlaceholder')"
                 class="cond-pattern"
               />
               <input
@@ -238,13 +239,13 @@ function syncOperator() {
               <button class="btn-sm btn-danger" type="button" @click="removeCondition(i)">&times;</button>
             </div>
 
-            <button class="btn-sm" type="button" @click="addCondition" style="margin-left: 24px">+ 添加条件</button>
+            <button class="btn-sm" type="button" @click="addCondition" style="margin-left: 24px">{{ t('route.addCondition') }}</button>
           </div>
         </div>
 
         <div class="form-actions">
-          <button class="btn btn-primary" @click="save">保存</button>
-          <button class="btn" @click="cancel">取消</button>
+          <button class="btn btn-primary" @click="save">{{ t('route.save') }}</button>
+          <button class="btn" @click="cancel">{{ t('route.cancel') }}</button>
         </div>
       </div>
     </div>

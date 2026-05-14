@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue"
 import { providerApi, type ProviderInfo, type ProviderTestResult } from "../api"
+import { t } from "../i18n"
 
 const providers = ref<ProviderInfo[]>([])
 const loading = ref(true)
@@ -113,23 +114,23 @@ const typeOptions = [
 <template>
   <div class="provider-list">
     <div class="toolbar">
-      <h2>服务商</h2>
-      <button class="btn btn-primary" @click="startCreate">+ 添加服务商</button>
+      <h2>{{ t('provider.title') }}</h2>
+      <button class="btn btn-primary" @click="startCreate">{{ t('provider.addProvider') }}</button>
     </div>
 
-    <div v-if="loading" class="loading">加载中...</div>
+    <div v-if="loading" class="loading">{{ t('provider.loading') }}</div>
 
     <div v-else>
       <table class="table" v-if="!creating && !editing">
         <thead>
           <tr>
-            <th>名称</th>
-            <th>类型</th>
-            <th>接口地址</th>
-            <th>模型</th>
-            <th>并发限制</th>
-            <th>状态</th>
-            <th>操作</th>
+            <th>{{ t('provider.nameCol') }}</th>
+            <th>{{ t('provider.typeCol') }}</th>
+            <th>{{ t('provider.urlCol') }}</th>
+            <th>{{ t('provider.modelCol') }}</th>
+            <th>{{ t('provider.concurrencyCol') }}</th>
+            <th>{{ t('provider.statusCol') }}</th>
+            <th>{{ t('provider.actionsCol') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -140,29 +141,29 @@ const typeOptions = [
             <td>
               <span v-for="m in p.models" :key="m" class="model-tag">{{ m }}</span>
             </td>
-            <td>{{ p.maxConcurrency || '不限' }}</td>
+            <td>{{ p.maxConcurrency || t('provider.unlimited') }}</td>
             <td>
               <button :class="['toggle-btn', { on: p.enabled }]" @click="toggleEnabled(p)">
-                {{ p.enabled ? "启用" : "禁用" }}
+                {{ p.enabled ? t('provider.enabled') : t('provider.disabled') }}
               </button>
             </td>
             <td>
-              <button class="btn-sm" @click="startEdit(p)">编辑</button>
-              <button class="btn-sm btn-danger" @click="remove(p.id)">删除</button>
+              <button class="btn-sm" @click="startEdit(p)">{{ t('provider.edit') }}</button>
+              <button class="btn-sm btn-danger" @click="remove(p.id)">{{ t('provider.delete') }}</button>
             </td>
           </tr>
         </tbody>
       </table>
 
       <div v-if="creating || editing" class="form-card">
-        <h3>{{ creating ? "添加服务商" : "编辑服务商" }}</h3>
+        <h3>{{ creating ? t('provider.addTitle') : t('provider.editTitle') }}</h3>
         <div class="form-grid">
           <label>
-            名称
-            <input v-model="form.name" placeholder="我的服务商" />
+            {{ t('provider.nameLabel') }}
+            <input v-model="form.name" :placeholder="t('provider.namePlaceholder')" />
           </label>
           <label>
-            类型
+            {{ t('provider.typeLabel') }}
             <select v-model="form.type">
               <option v-for="opt in typeOptions" :key="opt.value" :value="opt.value">
                 {{ opt.label }}
@@ -170,15 +171,15 @@ const typeOptions = [
             </select>
           </label>
           <label class="span-2">
-            接口地址
+            {{ t('provider.urlLabel') }}
             <input v-model="form.baseUrl" placeholder="https://api.openai.com/v1" class="mono" />
           </label>
           <label class="span-2">
-            API 密钥
-            <input v-model="form.apiKey" type="password" placeholder="sk-..." />
+            {{ t('provider.apiKeyLabel') }}
+            <input v-model="form.apiKey" type="password" :placeholder="t('provider.apiKeyPlaceholder')" />
           </label>
           <label class="span-2">
-            模型
+            {{ t('provider.modelLabel') }}
             <div class="model-input-row">
               <div class="model-tags">
                 <span v-for="(m, i) in form.models" :key="i" class="model-tag removable" @click="removeModel(i)">
@@ -189,7 +190,7 @@ const typeOptions = [
               <div class="model-add-row">
                 <input
                   v-model="modelInput"
-                  placeholder="输入模型名称"
+                  :placeholder="t('provider.modelInputPlaceholder')"
                   @keydown.enter.prevent="addModel"
                 />
                 <button class="btn-sm" type="button" @click="addModel">+</button>
@@ -197,27 +198,27 @@ const typeOptions = [
             </div>
           </label>
           <label>
-            并发限制
-            <input v-model.number="form.maxConcurrency" type="number" min="0" placeholder="0 = 不限制" />
+            {{ t('provider.concurrencyLabel') }}
+            <input v-model.number="form.maxConcurrency" type="number" min="0" :placeholder="t('provider.concurrencyPlaceholder')" />
           </label>
           <label>
-            启用
+            {{ t('provider.enabledLabel') }}
             <input type="checkbox" v-model="form.enabled" />
           </label>
         </div>
 
         <div v-if="testResult" :class="['test-result', { success: testResult.success, fail: !testResult.success }]">
           {{ testResult.success
-            ? `连接成功 (${testResult.statusCode}) - ${testResult.duration}ms`
-            : `连接失败 (${testResult.statusCode}) - ${testResult.error ?? '未知错误'}` }}
+            ? t('provider.testSuccess', { code: testResult.statusCode, ms: testResult.duration })
+            : t('provider.testFail', { code: testResult.statusCode, error: testResult.error ?? t('provider.unknownError') }) }}
         </div>
 
         <div class="form-actions">
-          <button class="btn btn-primary" @click="save">保存</button>
+          <button class="btn btn-primary" @click="save">{{ t('provider.save') }}</button>
           <button class="btn" :disabled="testing" @click="testConnection">
-            {{ testing ? "测试中..." : "测试连接" }}
+            {{ testing ? t('provider.testing') : t('provider.testConnection') }}
           </button>
-          <button class="btn" @click="cancel">取消</button>
+          <button class="btn" @click="cancel">{{ t('provider.cancel') }}</button>
         </div>
       </div>
     </div>

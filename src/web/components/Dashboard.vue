@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted, nextTick } from "vue"
 import { Chart, registerables } from "chart.js"
 import { healthApi, tokenApi, type HealthInfo, type TokenStats } from "../api"
+import { t } from "../i18n"
 
 Chart.register(...registerables)
 
@@ -87,7 +88,7 @@ onUnmounted(() => {
 function formatUptime(seconds: number): string {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
-  return `${h}小时 ${m}分`
+  return `${h}${t("dashboard.hourUnit")} ${m}${t("dashboard.minuteUnit")}`
 }
 
 function formatTokenCount(stats: TokenStats | undefined): string {
@@ -134,7 +135,7 @@ function initConcurrencyChart() {
         y: {
           position: "left",
           beginAtZero: true,
-          title: { display: true, text: "并发", color: textDim, font: { size: 11 } },
+          title: { display: true, text: t("dashboard.concurrency"), color: textDim, font: { size: 11 } },
           ticks: { color: textDim, stepSize: 1 },
           grid: { color: border },
         },
@@ -219,7 +220,7 @@ function renderConcurrencyChart() {
   }))
 
   const rateDataset = {
-    label: "输出速率 (tokens/s)",
+    label: t("dashboard.outputRateLabel"),
     data: [...outputRateHistory],
     borderColor: "#f472b6",
     backgroundColor: "transparent",
@@ -367,34 +368,34 @@ function truncate(s: string, len: number): string {
 <template>
   <div class="dashboard">
     <div class="toolbar">
-      <h2>仪表盘</h2>
-      <button class="btn" @click="refresh">刷新</button>
+      <h2>{{ t('dashboard.title') }}</h2>
+      <button class="btn" @click="refresh">{{ t('dashboard.refresh') }}</button>
     </div>
 
-    <div v-if="loading" class="loading">加载中...</div>
+    <div v-if="loading" class="loading">{{ t('dashboard.loading') }}</div>
 
     <template v-else-if="info">
       <div class="stats-bar">
         <span class="stat-item"><span class="status-dot ok"></span>ok</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">运行</span>{{ formatUptime(info.uptime) }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.uptime') }}</span>{{ formatUptime(info.uptime) }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">服务商</span>{{ info.providers.enabled }} / {{ info.providers.total }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.providers') }}</span>{{ info.providers.enabled }} / {{ info.providers.total }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">路由</span>{{ info.routeRules }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.routes') }}</span>{{ info.routeRules }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">总请求</span>{{ info.requests.total }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.totalRequests') }}</span>{{ info.requests.total }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">今日</span>{{ info.requests.today }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.today') }}</span>{{ info.requests.today }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">今日 Token</span>{{ formatTokenCount(info.tokenStats?.today) }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.todayTokens') }}</span>{{ formatTokenCount(info.tokenStats?.today) }}</span>
         <span class="stat-sep"></span>
-        <span class="stat-item"><span class="stat-label">总 Token</span>{{ formatTokenCount(info.tokenStats?.total) }}</span>
+        <span class="stat-item"><span class="stat-label">{{ t('dashboard.totalTokens') }}</span>{{ formatTokenCount(info.tokenStats?.total) }}</span>
       </div>
 
       <!-- 并发 + 输出速率监控 -->
       <div class="detail-card" style="margin-bottom: 16px">
-        <h3>并发 / 输出速率</h3>
+        <h3>{{ t('dashboard.concurrencyOutputRate') }}</h3>
         <div class="chart-container">
           <canvas ref="concurrencyCanvas"></canvas>
         </div>
@@ -413,12 +414,12 @@ function truncate(s: string, len: number): string {
             </div>
           </div>
         </div>
-        <div v-else class="empty">无服务商</div>
+        <div v-else class="empty">{{ t('dashboard.noProvider') }}</div>
       </div>
 
       <!-- Token 用量趋势 -->
       <div class="detail-card" style="margin-bottom: 16px">
-        <h3>Token 用量趋势（24小时）</h3>
+        <h3>{{ t('dashboard.tokenTrend') }}</h3>
         <div class="chart-container">
           <canvas ref="tokenTrendCanvas"></canvas>
         </div>
@@ -426,17 +427,17 @@ function truncate(s: string, len: number): string {
 
       <!-- 实时请求日志 -->
       <div class="detail-card" style="margin-bottom: 24px">
-        <h3>实时请求</h3>
+        <h3>{{ t('dashboard.liveRequests') }}</h3>
         <div class="live-logs">
           <template v-if="liveRequests.size === 0 && completedRequests.length === 0">
-            <div class="empty">等待请求...</div>
+            <div class="empty">{{ t('dashboard.waitingRequests') }}</div>
           </template>
           <div v-for="[id, req] in liveRequests" :key="id" class="log-item running" :data-rid="req.requestId">
             <div class="log-header">
               <span class="log-id">#{{ req.requestId }}</span>
               <span class="log-route">{{ req.model }} → {{ req.targetModel }}</span>
               <span class="log-provider">{{ req.provider }}</span>
-              <span class="log-status running">运行中</span>
+              <span class="log-status running">{{ t('dashboard.running') }}</span>
             </div>
             <div v-if="req.input" class="log-input">{{ truncate(req.input, 200) }}</div>
             <div v-if="req.output" class="log-output streaming">{{ req.output }}</div>
@@ -460,10 +461,10 @@ function truncate(s: string, len: number): string {
 
       <div class="detail-grid">
         <div class="detail-card">
-          <h3>服务商请求统计</h3>
+          <h3>{{ t('dashboard.providerStats') }}</h3>
           <table class="table" v-if="info.requestsByProvider.length">
             <thead>
-              <tr><th>服务商</th><th>总请求</th><th>今日</th></tr>
+              <tr><th>{{ t('dashboard.providerCol') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
             </thead>
             <tbody>
               <tr v-for="row in info.requestsByProvider" :key="row.providerId">
@@ -473,14 +474,14 @@ function truncate(s: string, len: number): string {
               </tr>
             </tbody>
           </table>
-          <div v-else class="empty">暂无数据</div>
+          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
 
         <div class="detail-card">
-          <h3>模型请求统计</h3>
+          <h3>{{ t('dashboard.modelStats') }}</h3>
           <table class="table" v-if="info.requestsByModel.length">
             <thead>
-              <tr><th>请求模型</th><th>映射模型</th><th>总请求</th><th>今日</th></tr>
+              <tr><th>{{ t('dashboard.requestModel') }}</th><th>{{ t('dashboard.mappedModel') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
             </thead>
             <tbody>
               <tr v-for="row in info.requestsByModel" :key="row.model + row.targetModel">
@@ -491,14 +492,14 @@ function truncate(s: string, len: number): string {
               </tr>
             </tbody>
           </table>
-          <div v-else class="empty">暂无数据</div>
+          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
 
         <div class="detail-card">
-          <h3>服务商 Token 用量</h3>
+          <h3>{{ t('dashboard.providerTokenUsage') }}</h3>
           <table class="table" v-if="info.tokensByProvider?.length">
             <thead>
-              <tr><th>服务商</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th></tr>
+              <tr><th>{{ t('dashboard.providerCol') }}</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th></tr>
             </thead>
             <tbody>
               <tr v-for="row in info.tokensByProvider" :key="row.providerId">
@@ -510,14 +511,14 @@ function truncate(s: string, len: number): string {
               </tr>
             </tbody>
           </table>
-          <div v-else class="empty">暂无数据</div>
+          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
 
         <div class="detail-card">
-          <h3>模型 Token 用量</h3>
+          <h3>{{ t('dashboard.modelTokenUsage') }}</h3>
           <table class="table" v-if="info.tokensByModel?.length">
             <thead>
-              <tr><th>请求模型</th><th>映射模型</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th></tr>
+              <tr><th>{{ t('dashboard.requestModel') }}</th><th>{{ t('dashboard.mappedModel') }}</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th></tr>
             </thead>
             <tbody>
               <tr v-for="row in info.tokensByModel" :key="row.model + row.targetModel">
@@ -530,18 +531,18 @@ function truncate(s: string, len: number): string {
               </tr>
             </tbody>
           </table>
-          <div v-else class="empty">暂无数据</div>
+          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
       </div>
     </template>
 
     <div class="info-section">
-      <h3>使用方式</h3>
-      <pre class="code-block"># Anthropic 协议客户端（如 Claude Code）
+      <h3>{{ t('dashboard.usage') }}</h3>
+      <pre class="code-block">{{ t('dashboard.anthropicComment') }}
 export ANTHROPIC_BASE_URL=http://localhost:{{ info?.port }}/anthropic
 export ANTHROPIC_API_KEY=your-key
 
-# OpenAI 协议客户端（如 Cursor）
+{{ t('dashboard.openaiComment') }}
 export OPENAI_BASE_URL=http://localhost:{{ info?.port }}/openai/v1
 export OPENAI_API_KEY=your-key</pre>
     </div>
