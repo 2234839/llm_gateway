@@ -166,10 +166,6 @@ async function handleInit() {
     initError.value = t("init.errorPasswordMismatch")
     return
   }
-  if (initForm.password.length < 8) {
-    initError.value = t("init.errorPasswordLength")
-    return
-  }
   try {
     /** init API 内部已自动创建 session cookie，无需再调 login */
     await initApi.init({ username: initForm.username, password: initForm.password })
@@ -241,8 +237,8 @@ async function toggleAuthRequired() {
 }
 
 async function handleChangePassword() {
-  if (!changePasswordForm.newPassword || changePasswordForm.newPassword.length < 8) {
-    changePasswordError.value = t("init.errorPasswordLength")
+  if (!changePasswordForm.newPassword) {
+    changePasswordError.value = t("settings.errorPasswordRequired")
     return
   }
   if (changePasswordForm.newPassword !== changePasswordForm.confirmPassword) {

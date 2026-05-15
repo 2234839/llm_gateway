@@ -242,13 +242,12 @@ export default {
     username: "Username",
     password: "Password",
     confirmPassword: "Confirm Password",
-    passwordPlaceholder: "Min. 8 characters",
+    passwordPlaceholder: "Enter password",
     confirmPasswordPlaceholder: "Re-enter password",
     createButton: "Create Admin",
     loading: "Loading...",
     errorUsernamePassword: "Username and password are required",
     errorPasswordMismatch: "Passwords do not match",
-    errorPasswordLength: "Password must be at least 8 characters",
     errorFailed: "Setup failed",
   },
   login: {
@@ -270,6 +269,7 @@ export default {
     newPassword: "New password",
     confirmNewPassword: "Confirm new password",
     passwordChanged: "Password changed",
+    errorPasswordRequired: "Please enter a new password",
   },
   log: {
     title: "Request Logs",

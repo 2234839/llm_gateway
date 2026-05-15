@@ -16,6 +16,8 @@ Open `http://localhost:3827`. Done.
 
 No Node.js, no Docker, no config files. Single binary, SQLite under the hood, admin dashboard included.
 
+**Data storage**: All data (database, config) is stored in the `data/` directory next to the binary. This directory is created automatically on first run.
+
 ## What Makes This Different
 
 Most LLM gateways rotate API keys and tally bills. This one reads your request content and decides where it should go.

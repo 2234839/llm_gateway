@@ -1,4 +1,6 @@
 import { Database, Statement } from "bun:sqlite"
+import { mkdirSync } from "node:fs"
+import { dirname } from "node:path"
 import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey } from "./types.ts"
 
 const DEFAULT_CONFIG: GatewayConfig = {
@@ -16,11 +18,13 @@ export class GatewayDB {
   private closed = false
 
   constructor(dbPath: string) {
+    /** 自动创建数据库父目录，避免 release 版本直接运行时因缺少 data/ 目录而崩溃 */
+    mkdirSync(dirname(dbPath), { recursive: true })
     this.db = new Database(dbPath, { create: true })
-    this.db.exec("PRAGMA journal_mode=WAL")
-    this.db.exec("PRAGMA synchronous=NORMAL")
-    this.db.exec("PRAGMA foreign_keys = ON")
-    this.db.exec("PRAGMA busy_timeout = 5000")
+    this.db.run("PRAGMA journal_mode=WAL")
+    this.db.run("PRAGMA synchronous=NORMAL")
+    this.db.run("PRAGMA foreign_keys = ON")
+    this.db.run("PRAGMA busy_timeout = 5000")
     this.initTables()
     this.prepareStatements()
     /** 定时清理日志，避免 addLog 热路径中做概率触发 */
@@ -55,14 +59,14 @@ export class GatewayDB {
   }
 
   private initTables() {
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       )
     `)
 
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS providers (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -76,7 +80,7 @@ export class GatewayDB {
       )
     `)
 
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS route_rules (
         id TEXT PRIMARY KEY,
         pattern TEXT NOT NULL,
@@ -86,7 +90,7 @@ export class GatewayDB {
       )
     `)
 
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS request_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL DEFAULT (datetime('now')),
@@ -105,64 +109,64 @@ export class GatewayDB {
     `)
 
     /** 复合索引：加速时间范围 + 服务商的聚合查询 */
-    this.db.exec(`
+    this.db.run(`
       CREATE INDEX IF NOT EXISTS idx_logs_ts_provider ON request_logs(timestamp, provider_id)
     `)
 
     /** 兼容已有数据库：添加新列 */
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN content_match TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN content_match TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN target_model TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN target_model TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN exclude_match TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN exclude_match TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE providers ADD COLUMN max_concurrency INTEGER DEFAULT 0")
+      this.db.run("ALTER TABLE providers ADD COLUMN max_concurrency INTEGER DEFAULT 0")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE providers ADD COLUMN request_timeout INTEGER DEFAULT 0")
+      this.db.run("ALTER TABLE providers ADD COLUMN request_timeout INTEGER DEFAULT 0")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN input_content TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN input_content TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN output_content TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN output_content TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0")
     } catch {
       // 列已存在
     }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0")
     } catch {
       // 列已存在
     }
 
     /** API Key 分组表 */
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS key_groups (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -175,7 +179,7 @@ export class GatewayDB {
     `)
 
     /** API Keys 表 */
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS api_keys (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -192,44 +196,44 @@ export class GatewayDB {
       )
     `)
 
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`)
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_group_id ON api_keys(group_id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_group_id ON api_keys(group_id)`)
 
     /** 兼容已有数据库：添加新列 */
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN key_groups TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN key_groups TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
-      this.db.exec("ALTER TABLE route_rules ADD COLUMN fallbacks TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE route_rules ADD COLUMN fallbacks TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN group_id TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN group_id TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
 
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_provider_id ON request_logs(provider_id)`)
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_status_code ON request_logs(status_code)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_provider_id ON request_logs(provider_id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_status_code ON request_logs(status_code)`)
     try {
-      this.db.exec("ALTER TABLE request_logs ADD COLUMN fallback_attempts TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN fallback_attempts TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     /** 复合索引：加速配额查询中的时间范围 + 密钥/分组条件 */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_ts_apikey ON request_logs(timestamp, api_key_id)`)
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_ts_group ON request_logs(timestamp, group_id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_ts_apikey ON request_logs(timestamp, api_key_id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_ts_group ON request_logs(timestamp, group_id)`)
     /** 配额查询专用复合索引（以 api_key_id 为前缀，支持 WHERE api_key_id = ? AND timestamp >= ? 高效查找） */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_apikey_ts ON request_logs(api_key_id, timestamp)`)
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_group_ts ON request_logs(group_id, timestamp)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_apikey_ts ON request_logs(api_key_id, timestamp)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_group_ts ON request_logs(group_id, timestamp)`)
     /** 覆盖索引：加速 percentile 查询的 timestamp 过滤 + duration_ms 排序 */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_ts_duration ON request_logs(timestamp, duration_ms)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_ts_duration ON request_logs(timestamp, duration_ms)`)
     /** 覆盖索引：加速带 api_key_id 过滤的 percentile 查询 */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_apikey_ts_dur ON request_logs(api_key_id, timestamp, duration_ms)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_apikey_ts_dur ON request_logs(api_key_id, timestamp, duration_ms)`)
     /** 覆盖索引：加速带 group_id 过滤的 percentile 查询 */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_group_ts_dur ON request_logs(group_id, timestamp, duration_ms)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_group_ts_dur ON request_logs(group_id, timestamp, duration_ms)`)
     /** 复合索引：加速按状态码筛选 + id 排序的日志查询 */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_logs_status_id ON request_logs(status_code, id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_status_id ON request_logs(status_code, id)`)
     /** 索引：加速按 provider_id 查找路由规则（级联删除） */
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_route_rules_provider_id ON route_rules(provider_id)`)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_route_rules_provider_id ON route_rules(provider_id)`)
   }
 
   private prepareStatements() {

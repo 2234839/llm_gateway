@@ -106,8 +106,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ error: "Admin already initialized" })
     }
     const { username, password } = request.body
-    if (!username || !password || password.length < 8) {
-      return reply.status(400).send({ error: "Username and password (min 8 chars) required" })
+    if (!username || !password) {
+      return reply.status(400).send({ error: "Username and password required" })
     }
     await fastify.configManager.initAdmin(username, password)
     /** 初始化成功，直接创建 session 登录 */
@@ -181,9 +181,6 @@ export async function adminRoutes(fastify: FastifyInstance) {
       fastify.db.saveConfig({ ...dbConfig, ...gateway })
     }
     if (newPassword) {
-      if (newPassword.length < 8) {
-        return reply.status(400).send({ error: "Password must be at least 8 characters" })
-      }
       await fastify.configManager.changePassword(newPassword)
       /** 修改密码后销毁所有现有 session，强制重新登录 */
       destroyAllSessions()
