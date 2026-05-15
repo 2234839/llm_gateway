@@ -98,11 +98,11 @@ bun run build      # 构建前端 + 生成单文件可执行
 
 ```bash
 # Claude Code，或任何 Anthropic SDK 客户端
-export ANTHROPIC_BASE_URL=http://localhost:3827
+export ANTHROPIC_BASE_URL=http://localhost:3827/anthropic
 export ANTHROPIC_API_KEY=sk-your-gateway-key
 
 # Cursor，或任何 OpenAI SDK 客户端
-export OPENAI_BASE_URL=http://localhost:3827/v1
+export OPENAI_BASE_URL=http://localhost:3827/openai/v1
 export OPENAI_API_KEY=sk-your-gateway-key
 ```
 

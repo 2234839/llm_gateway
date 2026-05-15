@@ -98,11 +98,11 @@ bun run build      # builds frontend + single binary
 
 ```bash
 # Claude Code, or any Anthropic SDK client
-export ANTHROPIC_BASE_URL=http://localhost:3827
+export ANTHROPIC_BASE_URL=http://localhost:3827/anthropic
 export ANTHROPIC_API_KEY=sk-your-gateway-key
 
 # Cursor, or any OpenAI SDK client
-export OPENAI_BASE_URL=http://localhost:3827/v1
+export OPENAI_BASE_URL=http://localhost:3827/openai/v1
 export OPENAI_API_KEY=sk-your-gateway-key
 ```
 
