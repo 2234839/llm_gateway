@@ -13,12 +13,14 @@ const DEFAULT_CONFIG: GatewayConfig = {
 export class GatewayDB {
   private db: Database
   private stmtCache: Map<string, Statement> = new Map()
+  private closed = false
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath, { create: true })
     this.db.exec("PRAGMA journal_mode=WAL")
     this.db.exec("PRAGMA synchronous=NORMAL")
     this.db.exec("PRAGMA foreign_keys = ON")
+    this.db.exec("PRAGMA busy_timeout = 5000")
     this.initTables()
     this.prepareStatements()
     /** 定时清理日志，避免 addLog 热路径中做概率触发 */
@@ -378,6 +380,8 @@ export class GatewayDB {
   private static PRUNE_INTERVAL_MS = 60_000
 
   addLog(log: Omit<RequestLogEntry, "id" | "timestamp">) {
+    /** DB 已关闭（优雅关机期间流式请求可能仍在写入日志） */
+    if (this.closed) return
     /** 裁剪过长的日志内容，避免单条记录过大 */
     const MAX_CONTENT_LEN = 50000
     const inputContent = log.inputContent && log.inputContent.length > MAX_CONTENT_LEN
@@ -433,8 +437,8 @@ export class GatewayDB {
     })
   }
 
-  getLogs(options: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string } = {}): RequestLogEntry[] {
-    const { limit = 100, offset = 0, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime } = options
+  getLogs(options: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: boolean } = {}): RequestLogEntry[] {
+    const { limit = 100, offset = 0, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime, hasFallback } = options
 
     /** 列表查询排除大字段 input_content/output_content，按需通过 getLogDetail 加载 */
     let sql = "SELECT id, timestamp, method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, api_key_id, group_id, fallback_attempts FROM request_logs WHERE 1=1"
@@ -475,6 +479,9 @@ export class GatewayDB {
     if (endTime) {
       sql += " AND timestamp < ?"
       params.push(endTime)
+    }
+    if (hasFallback) {
+      sql += " AND fallback_attempts IS NOT NULL"
     }
 
     /** 排序：白名单列名 + 方向，防止 SQL 注入 */
@@ -872,6 +879,7 @@ export class GatewayDB {
   }
 
   close() {
+    this.closed = true
     this.db.close()
   }
 }

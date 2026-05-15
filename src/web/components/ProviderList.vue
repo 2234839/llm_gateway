@@ -9,6 +9,7 @@ const providers = ref<ProviderInfo[]>([])
 const loading = ref(true)
 const editing = ref<ProviderInfo | null>(null)
 const creating = ref(false)
+const saving = ref(false)
 
 const emptyProvider: Omit<ProviderInfo, "id"> = {
   name: "",
@@ -117,6 +118,7 @@ async function save() {
   /** 防止 v-model.number 清空后产生 NaN */
   if (Number.isNaN(form.value.maxConcurrency)) form.value.maxConcurrency = 0
   if (Number.isNaN(form.value.requestTimeout)) form.value.requestTimeout = 0
+  saving.value = true
   try {
     if (creating.value) {
       await providerApi.create(form.value)
@@ -131,6 +133,7 @@ async function save() {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Save failed"
   }
+  saving.value = false
 }
 
 async function remove(id: string) {
@@ -195,7 +198,7 @@ const typeOptions = [
 const urlPlaceholders: Record<string, string> = {
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
-  "azure-openai": "https://YOUR_RESOURCE.openai.azure.com",
+  "azure-openai": "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT",
   custom: "https://your-provider.example.com/v1",
 }
 
@@ -355,7 +358,7 @@ function removeHeader(index: number) {
         </div>
 
         <div class="form-actions">
-          <button class="btn btn-primary" @click="save">{{ t('provider.save') }}</button>
+          <button class="btn btn-primary" @click="save" :disabled="saving">{{ saving ? '...' : t('provider.save') }}</button>
           <button class="btn" :disabled="testing" @click="testConnection">
             {{ testing ? t('provider.testing') : t('provider.testConnection') }}
           </button>
@@ -492,5 +495,22 @@ function removeHeader(index: number) {
   padding: 40px 0;
   color: var(--text-dim);
   font-size: 13px;
+}
+
+@media (max-width: 768px) {
+  .table {
+    display: block;
+    overflow-x: auto;
+    min-width: 500px;
+  }
+  .model-add-row {
+    flex-wrap: wrap;
+  }
+  .header-row {
+    flex-wrap: wrap;
+  }
+  .header-key {
+    width: 100%;
+  }
 }
 </style>

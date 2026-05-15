@@ -13,6 +13,7 @@ export async function streamAnthropicToOpenAI(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (inputTokens: number, outputTokens: number, cacheCreationTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
+  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -42,6 +43,11 @@ export async function streamAnthropicToOpenAI(
   const decoder = new TextDecoder()
   let buffer = ""
 
+  /** 客户端断连时主动取消上游 reader */
+  if (signal) {
+    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+  }
+
   function writeChunk(delta: Record<string, unknown>, finishReason: OpenAIFinishReason = null) {
     const chunk = {
       id: chatId,
@@ -55,6 +61,7 @@ export async function streamAnthropicToOpenAI(
       }],
     }
     raw.write(formatSSEData(chunk))
+    raw.flushHeaders()
   }
 
   function writeUsage(promptTokens: number, completionTokens: number) {
@@ -76,6 +83,7 @@ export async function streamAnthropicToOpenAI(
       usage,
     }
     raw.write(formatSSEData(chunk))
+    raw.flushHeaders()
   }
 
   try {
@@ -125,7 +133,9 @@ export async function streamAnthropicToOpenAI(
               currentToolCallIndex++
             } else if (block && typeof block === "object" && "type" in block && block.type === "thinking") {
               inThinkingBlock = true
-              writeChunk({ content: "[thinking] " })
+              const marker = "[thinking] "
+              writeChunk({ content: marker })
+              onText?.(marker)
             }
             break
           }
@@ -138,6 +148,7 @@ export async function streamAnthropicToOpenAI(
             } else if (delta.type === "thinking_delta") {
               /** thinking 内容作为文本输出（与非流式保持一致） */
               writeChunk({ content: delta.thinking })
+              onText?.(delta.thinking)
             } else if (delta.type === "input_json_delta") {
               currentToolArgs += delta.partial_json
               if (currentToolCallIndex > 0) {
@@ -160,7 +171,9 @@ export async function streamAnthropicToOpenAI(
               currentToolArgs = ""
             }
             if (inThinkingBlock) {
-              writeChunk({ content: " [/thinking]\n" })
+              const endMarker = " [/thinking]\n"
+              writeChunk({ content: endMarker })
+              onText?.(endMarker)
               inThinkingBlock = false
             }
             break
@@ -170,6 +183,10 @@ export async function streamAnthropicToOpenAI(
             finished = true
             const stopReason = anthropicEvent.delta.stop_reason
             const finishReason = mapStopReason(stopReason)
+            /** 部分 Anthropic 兼容服务商（如 GLM）在 message_start 返回 input_tokens: 0，在 message_delta 才返回真实值 */
+            if (anthropicEvent.usage?.input_tokens) cachedInputTokens = anthropicEvent.usage.input_tokens
+            if (anthropicEvent.usage?.cache_creation_input_tokens) cachedCacheCreation = anthropicEvent.usage.cache_creation_input_tokens
+            if (anthropicEvent.usage?.cache_read_input_tokens) cachedCacheRead = anthropicEvent.usage.cache_read_input_tokens
             outputTokens = anthropicEvent.usage?.output_tokens ?? outputTokens
             writeChunk({}, finishReason)
 
@@ -180,6 +197,7 @@ export async function streamAnthropicToOpenAI(
 
           case "message_stop": {
             raw.write(formatSSEDone())
+            raw.flushHeaders()
             break
           }
 

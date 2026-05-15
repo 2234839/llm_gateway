@@ -71,8 +71,6 @@ export class StatsCache {
 
   /** 内存增量：total 请求计数，-1 表示未初始化 */
   private _totalCount = -1
-  /** 内存增量：total token 累加器 */
-  private _totalTokens: TokenStats = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
 
   constructor(db: GatewayDB) {
     this.db = db
@@ -99,7 +97,6 @@ export class StatsCache {
     this._tokensByGroup = null
     this._tokensByKey = null
     this._totalCount = -1
-    this._totalTokens = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
   }
 
   /** request_end 事件后的增量失效：节流，距上次失效至少 5 秒 */
@@ -118,15 +115,9 @@ export class StatsCache {
     this._tokensByKey = null
   }
 
-  /** 记录一次请求的统计数据，用于增量更新 total 计数器 */
-  recordRequest(tokens?: TokenStats) {
+  /** 记录一次请求，用于增量更新 total 计数器 */
+  recordRequest() {
     this._totalCount = Math.max(0, this._totalCount) + 1
-    if (tokens) {
-      this._totalTokens.inputTokens += tokens.inputTokens
-      this._totalTokens.outputTokens += tokens.outputTokens
-      this._totalTokens.cacheCreationTokens += tokens.cacheCreationTokens
-      this._totalTokens.cacheReadTokens += tokens.cacheReadTokens
-    }
   }
 
   getLogStats(): LogStats {
@@ -164,13 +155,7 @@ export class StatsCache {
   getTokenStats(): { total: TokenStats; today: TokenStats } {
     this.checkDate()
     if (!this._tokenStats) {
-      const hasIncremental = this._totalCount >= 0
-      this._tokenStats = this.db.getTokenStats(hasIncremental)
-      if (hasIncremental) {
-        this._tokenStats.total = { ...this._totalTokens }
-      } else {
-        this._totalTokens = { ...this._tokenStats.total }
-      }
+      this._tokenStats = this.db.getTokenStats()
     }
     return this._tokenStats
   }

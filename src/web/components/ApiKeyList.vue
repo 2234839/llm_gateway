@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue"
+import { ref, onMounted, onUnmounted } from "vue"
 import { apiKeyApi, keyGroupApi, tokenApi, type KeyGroupInfo, type ApiKeyInfo, type TokenStats } from "../api"
 import { t } from "../i18n"
+import { subscribeSSE } from "../sse-manager"
 
 /** ========== Key Groups ========== */
 
@@ -19,6 +20,8 @@ const keyTokenMap = ref<Map<string, { total: TokenStats; today: TokenStats }>>(n
 /** 分组表单状态 */
 const groupEditing = ref<KeyGroupInfo | null>(null)
 const groupCreating = ref(false)
+const groupSaving = ref(false)
+const keySaving = ref(false)
 
 const emptyGroup: Omit<KeyGroupInfo, "id" | "createdAt" | "keyCount"> = {
   name: "",
@@ -49,7 +52,28 @@ const keyForm = ref({ ...emptyKey })
 /** 新建密钥后展示原始密钥 */
 const createdKeySecret = ref<string | null>(null)
 
-onMounted(load)
+/** SSE 驱动的用量刷新：3 秒节流 */
+let tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleTokenRefresh() {
+  if (tokenRefreshTimer) return
+  tokenRefreshTimer = setTimeout(() => {
+    tokenRefreshTimer = null
+    load()
+  }, 3000)
+}
+
+let sseUnsubscribe: (() => void) | null = null
+
+onMounted(() => {
+  load()
+  sseUnsubscribe = subscribeSSE((event) => {
+    if (event.type === "request_end") scheduleTokenRefresh()
+  })
+})
+onUnmounted(() => {
+  sseUnsubscribe?.()
+  if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null }
+})
 
 async function load() {
   try {
@@ -110,6 +134,7 @@ async function saveGroup() {
     error.value = ""
     /** v-model.number 清空输入后会变成空字符串，需规范化为 0 */
     const data = { ...groupForm.value, dailyTokenLimit: Number(groupForm.value.dailyTokenLimit) || 0, monthlyTokenLimit: Number(groupForm.value.monthlyTokenLimit) || 0, rpmLimit: Number(groupForm.value.rpmLimit) || 0 }
+    groupSaving.value = true
     if (groupCreating.value) {
       await keyGroupApi.create(data)
     } else if (groupEditing.value) {
@@ -120,6 +145,7 @@ async function saveGroup() {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Operation failed"
   }
+  groupSaving.value = false
 }
 
 async function removeGroup(id: string) {
@@ -165,6 +191,7 @@ function cancelKey() {
 async function saveKey() {
   try {
     error.value = ""
+    keySaving.value = true
     if (keyCreating.value) {
       const data = { ...keyForm.value, dailyTokenLimit: Number(keyForm.value.dailyTokenLimit) || 0, monthlyTokenLimit: Number(keyForm.value.monthlyTokenLimit) || 0, rpmLimit: Number(keyForm.value.rpmLimit) || 0 }
       const result = await apiKeyApi.create(data)
@@ -187,6 +214,7 @@ async function saveKey() {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Operation failed"
   }
+  keySaving.value = false
 }
 
 async function removeKey(id: string) {
@@ -357,7 +385,7 @@ function quotaPercent(used: number, limit: number): number {
             </label>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" @click="saveGroup">{{ t("keys.save") }}</button>
+            <button class="btn btn-primary" @click="saveGroup" :disabled="groupSaving">{{ groupSaving ? '...' : t("keys.save") }}</button>
             <button class="btn" @click="cancelGroup">{{ t("keys.cancel") }}</button>
           </div>
         </div>
@@ -446,7 +474,7 @@ function quotaPercent(used: number, limit: number): number {
             </label>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" @click="saveKey">{{ t("keys.save") }}</button>
+            <button class="btn btn-primary" @click="saveKey" :disabled="keySaving">{{ keySaving ? '...' : t("keys.save") }}</button>
             <button class="btn" @click="cancelKey">{{ t("keys.cancel") }}</button>
           </div>
         </div>
@@ -561,5 +589,20 @@ tr.disabled {
 
 .quota-fill.danger {
   background: var(--err, #ef4444);
+}
+
+@media (max-width: 768px) {
+  .table {
+    display: block;
+    overflow-x: auto;
+    min-width: 600px;
+  }
+  .secret-row {
+    flex-direction: column;
+  }
+  .modal-card {
+    width: auto;
+    margin: 16px;
+  }
 }
 </style>

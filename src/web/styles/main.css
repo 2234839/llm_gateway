@@ -264,7 +264,8 @@ code {
 .stats-bar {
   display: flex;
   align-items: center;
-  gap: 0;
+  flex-wrap: wrap;
+  gap: 4px 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -284,19 +285,17 @@ code {
   font-weight: 600;
 }
 
+/** 非首项左侧加分隔线 */
+.stat-item + .stat-item {
+  border-left: 1px solid var(--border);
+}
+
 .stat-item .stat-label {
   font-size: 11px;
   color: var(--text-dim);
   text-transform: uppercase;
   letter-spacing: 0.3px;
   font-weight: 400;
-}
-
-.stat-sep {
-  width: 1px;
-  height: 16px;
-  background: var(--border);
-  flex-shrink: 0;
 }
 
 .status-dot {
@@ -470,7 +469,6 @@ code {
   }
 
   .stat-item { padding: 4px 8px; }
-  .stat-sep { display: none; }
 
   .form-grid { grid-template-columns: 1fr; }
   .form-grid .span-2 { grid-column: span 1; }
@@ -478,4 +476,22 @@ code {
   .table { font-size: 12px; display: block; overflow-x: auto; }
 
   .toolbar { flex-wrap: wrap; gap: 8px; }
+}
+
+@media (max-width: 640px) {
+  .app { padding: 0 8px; }
+
+  .header { gap: 8px; padding: 10px 0; }
+  .logo { font-size: 16px; }
+  .nav-btn { padding: 6px 10px; font-size: 12px; }
+  .toolbar h2 { font-size: 15px; }
+  .btn { padding: 6px 12px; font-size: 12px; }
+
+  .stats-bar { font-size: 11px; border-radius: 6px; }
+  .stat-item { padding: 3px 6px; }
+  .stat-item .stat-label { font-size: 10px; }
+
+  .form-card { padding: 16px 12px; }
+
+  .table th, .table td { padding: 8px 6px; font-size: 11px; }
 }

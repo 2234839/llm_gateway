@@ -6,7 +6,7 @@ import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
 import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropicContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
-import { checkQuota, recordRpmRequest } from "../quota.ts"
+import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -135,7 +135,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         }
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
-        /** 客户端断连时取消信号量等待 */
+        /** 客户端断连时中断信号量等待 + 上游 fetch + 流式读取 */
         const ac = new AbortController()
         const onClose = () => ac.abort()
         request.raw.once("close", onClose)
@@ -145,10 +145,11 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           request.raw.removeListener("close", onClose)
           return
         }
-        request.raw.removeListener("close", onClose)
+        /** 信号量获取成功后不立即移除监听 — ac.signal 贯穿 fetch + 流式传输阶段 */
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
-          const result = await handleAnthropicUpstream(currentProvider, currentTarget, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError)
+          const result = await handleAnthropicUpstream(currentProvider, currentTarget, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, ac.signal)
+          request.raw.removeListener("close", onClose)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
             /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */
@@ -185,6 +186,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
             return reply.send(convertErrorToAnthropic(result.errorMsg!, statusCode))
           }
         } catch (err) {
+          request.raw.removeListener("close", onClose)
           /** handleAnthropicUpstream 抛出异常（如网络错误），释放信号量 */
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           semaphore?.release()
@@ -233,6 +235,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         outputContent: outputText || null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
       })
+      recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
         output: outputText, durationMs, stream: isStream, statusCode, error: errorMsg,
@@ -259,6 +262,7 @@ async function handleAnthropicUpstream(
   onText: (text: string) => void,
   onToolCall: (name: string, input: string) => void,
   onStreamError?: (err: string) => void,
+  signal?: AbortSignal,
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -275,7 +279,7 @@ async function handleAnthropicUpstream(
   if (provider.type === "anthropic") {
     /** Anthropic 直连 — 透传 */
     if (isStream) {
-      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, upstreamHeaders)
+      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, upstreamHeaders, signal)
       if (!upstream.ok) {
         const errBody = await upstream.text()
         return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -291,11 +295,11 @@ async function handleAnthropicUpstream(
         oTokens = tu.outputTokens
         ccTokens = tu.cacheCreationTokens
         crTokens = tu.cacheReadTokens
-      }, onStreamError)
+      }, onStreamError, signal)
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest({ ...body, model: targetModel }, upstreamHeaders)
+    const upstream = await provider.sendRequest({ ...body, model: targetModel }, upstreamHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -316,7 +320,7 @@ async function handleAnthropicUpstream(
   const openaiBody = convertRequestToOpenAI(body, targetModel)
 
   if (isStream) {
-    const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {})
+    const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {}, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -324,18 +328,20 @@ async function handleAnthropicUpstream(
 
     let iTokens = estimateInputTokens(body)
     let oTokens = 0
+    let crTokens = 0
     if (!upstream.body) {
       return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
     reply.hijack()
-    await streamOpenAIToAnthropic(upstream.body, reply.raw, body.model, iTokens, onText, onToolCall, (finalInput, finalOutput) => {
+    await streamOpenAIToAnthropic(upstream.body, reply.raw, body.model, iTokens, onText, onToolCall, (finalInput, finalOutput, finalCr) => {
       iTokens = finalInput
       oTokens = finalOutput
-    }, onStreamError)
-    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null, streamHijacked: true }
+      crTokens = finalCr
+    }, onStreamError, signal)
+    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
-  const upstream = await provider.sendRequest(openaiBody as unknown as Record<string, unknown>, {})
+  const upstream = await provider.sendRequest(openaiBody as unknown as Record<string, unknown>, {}, signal)
   if (!upstream.ok) {
     const errBody = await upstream.text()
     return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -357,7 +363,8 @@ async function handleAnthropicUpstream(
     .filter(Boolean)
     .join("\n") ?? ""
   reply.send(converted)
-  return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: oText }
+  const crT = converted.usage.cache_read_input_tokens ?? 0
+  return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: crT, outputText: oText }
   } catch (err) {
     /** 上游响应解析失败（如非 JSON 响应体），返回 502 */
     const msg = (err as Error).message ?? "Failed to parse upstream response"
@@ -373,6 +380,7 @@ function streamPassthrough(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (usage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }) => void,
   onStreamError?: (err: string) => void,
+  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -393,6 +401,11 @@ function streamPassthrough(
   /** token 用量累积：message_start 提供 input+cache，message_delta 覆盖为最终值 */
   let collectedUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
 
+  /** 客户端断连时主动取消上游 reader（无需等下一个 chunk） */
+  if (signal) {
+    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+  }
+
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
@@ -405,45 +418,50 @@ function streamPassthrough(
         reader.cancel().catch(() => {})
         return
       }
-      raw.write(value)
-      /** 从 SSE 中提取 text_delta、工具调用和 token 用量 */
-      if (onText || onToolCall || onTokenUsage) {
-        sseBuffer += decoder.decode(value, { stream: true })
-        const lines = sseBuffer.split("\n")
-        sseBuffer = lines.pop()!
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue
-          try {
-            const obj = JSON.parse(line.slice(6))
-            if (obj.type === "message_start") {
-              const usage = obj.message?.usage
-              if (usage) {
-                collectedUsage.inputTokens = usage.input_tokens ?? 0
-                collectedUsage.cacheCreationTokens = usage.cache_creation_input_tokens ?? 0
-                collectedUsage.cacheReadTokens = usage.cache_read_input_tokens ?? 0
-              }
-            } else if (obj.type === "message_delta" && obj.usage) {
-              /** message_delta 包含最终的完整 usage，覆盖所有字段 */
-              collectedUsage.inputTokens = obj.usage.input_tokens ?? collectedUsage.inputTokens
-              collectedUsage.outputTokens = obj.usage.output_tokens ?? 0
-              collectedUsage.cacheCreationTokens = obj.usage.cache_creation_input_tokens ?? collectedUsage.cacheCreationTokens
-              collectedUsage.cacheReadTokens = obj.usage.cache_read_input_tokens ?? collectedUsage.cacheReadTokens
-            } else if (obj.type === "content_block_start" && obj.content_block?.type === "tool_use") {
-              currentToolName = obj.content_block.name
-              currentToolArgs = ""
-            } else if (obj.type === "content_block_delta" && obj.delta?.type === "text_delta") {
-              onText?.(obj.delta.text)
-            } else if (obj.type === "content_block_delta" && obj.delta?.type === "thinking_delta") {
-              onText?.(obj.delta.thinking)
-            } else if (obj.type === "content_block_delta" && obj.delta?.type === "input_json_delta") {
-              currentToolArgs += obj.delta.partial_json
-            } else if (obj.type === "content_block_stop" && currentToolName) {
-              onToolCall?.(currentToolName, currentToolArgs)
-              currentToolName = ""
-              currentToolArgs = ""
+      /**
+       * 逐事件写入而非整个 chunk 透传。
+       * 上游 fetch 返回的 chunk 可能包含多个 SSE 事件，
+       * 整个 chunk 一次性 write 会导致客户端 reader.read() 批量返回。
+       * 逐事件 write + flushHeaders 保证每个事件独立到达客户端。
+       */
+      sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+      const lines = sseBuffer.split("\n")
+      sseBuffer = lines.pop()!
+      for (const line of lines) {
+        raw.write(line + "\n")
+        /** 空行 = SSE 事件结束边界，立即 flush */
+        if (line === "") raw.flushHeaders()
+        if (!line.startsWith("data: ")) continue
+        try {
+          const obj = JSON.parse(line.slice(6))
+          if (obj.type === "message_start") {
+            const usage = obj.message?.usage
+            if (usage) {
+              collectedUsage.inputTokens = usage.input_tokens ?? 0
+              collectedUsage.cacheCreationTokens = usage.cache_creation_input_tokens ?? 0
+              collectedUsage.cacheReadTokens = usage.cache_read_input_tokens ?? 0
             }
-          } catch { /* skip */ }
-        }
+          } else if (obj.type === "message_delta" && obj.usage) {
+            /** message_delta 包含最终的完整 usage，覆盖所有字段 */
+            collectedUsage.inputTokens = obj.usage.input_tokens ?? collectedUsage.inputTokens
+            collectedUsage.outputTokens = obj.usage.output_tokens ?? 0
+            collectedUsage.cacheCreationTokens = obj.usage.cache_creation_input_tokens ?? collectedUsage.cacheCreationTokens
+            collectedUsage.cacheReadTokens = obj.usage.cache_read_input_tokens ?? collectedUsage.cacheReadTokens
+          } else if (obj.type === "content_block_start" && obj.content_block?.type === "tool_use") {
+            currentToolName = obj.content_block.name
+            currentToolArgs = ""
+          } else if (obj.type === "content_block_delta" && obj.delta?.type === "text_delta") {
+            onText?.(obj.delta.text)
+          } else if (obj.type === "content_block_delta" && obj.delta?.type === "thinking_delta") {
+            onText?.(obj.delta.thinking)
+          } else if (obj.type === "content_block_delta" && obj.delta?.type === "input_json_delta") {
+            currentToolArgs += obj.delta.partial_json
+          } else if (obj.type === "content_block_stop" && currentToolName) {
+            onToolCall?.(currentToolName, currentToolArgs)
+            currentToolName = ""
+            currentToolArgs = ""
+          }
+        } catch { /* skip */ }
       }
       return pump()
     }).catch((err) => {

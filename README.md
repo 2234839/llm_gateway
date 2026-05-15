@@ -1,197 +1,148 @@
 # LLM Gateway
 
-A unified LLM API proxy gateway with **content-aware routing** and **bidirectional protocol conversion** (Anthropic ↔ OpenAI). Built for teams who want fine-grained control over how LLM requests are routed — not just round-robin load balancing, but intelligent routing based on what's actually in the request.
+A self-hosted LLM API gateway. Routes requests to the right model based on **what's in them**, not just the model name. Translates between Anthropic and OpenAI protocols so any tool works with any provider.
 
 [**中文文档**](docs/README.zh-CN.md)
 
-## One Binary. Zero Dependencies.
+## 30-Second Setup
 
-Download a single executable from [GitHub Releases](https://github.com/2234839/llm_gateway/releases) — no runtime, no Node.js, no Docker, no config files. Just run it:
+Download from [Releases](https://github.com/2234839/llm_gateway/releases), run it:
 
 ```bash
 ./llm-gateway
 ```
 
-That's it. Open `http://localhost:3827` and you have a full admin dashboard, real-time monitoring, and a ready-to-use LLM proxy.
+Open `http://localhost:3827`. Done.
 
-## Why LLM Gateway
+No Node.js, no Docker, no config files. Single binary, SQLite under the hood, admin dashboard included.
 
-Other gateways do account rotation and billing. LLM Gateway does something different — it understands **what you're asking** and routes accordingly.
+## What Makes This Different
 
-**Content-aware routing that no other gateway provides:**
-- Route code review to a cheap model, architecture design to a premium model — based on **message content**
-- Route image-containing requests to vision-capable models — based on **content type detection**
-- Route Claude Code sessions to a dedicated provider — based on **API key group**
-- Use Claude Code with OpenAI models, or Cursor with Anthropic models — via **protocol conversion**
+Most LLM gateways rotate API keys and tally bills. This one reads your request content and decides where it should go.
 
-When your team has 10 people sharing LLM access, you need to answer:
-- Who used what? → Per-key usage tracking
-- Can we limit the junior devs? → Per-group token quotas
-- Can different roles use different models? → Group-based routing
-- Can we use any SDK with any provider? → Bidirectional protocol conversion
+**The routing problem it solves:**
 
-## Features
+Your team uses Claude Code, Cursor, and a custom app. You have OpenAI, Anthropic, and a cheap local model. Right now every tool is hardcoded to one provider. You want:
 
-### Routing Engine (The Killer Feature)
+- Code review requests → the cheap model (detected by message content)
+- Architecture discussions → the premium model (detected by message content)
+- Image requests → a vision-capable model (detected by content type)
+- Junior devs → limited token quota (by key group)
+- Claude Code → can call OpenAI models (protocol conversion)
+- Cursor → can call Anthropic models (protocol conversion)
 
-- **Model name matching**: glob patterns like `claude-*`, `gpt-4*`
-- **Content-aware routing**: keyword inclusion, regex matching, multimodal content type detection
-- **Group-based routing**: different API key groups can match different route rules
-- **Exclusion rules**: skip certain patterns with negative matching
-- **Fallback providers**: automatic failover to backup providers on 5xx/timeout
-- **Priority ordering**: rules evaluated top-down, first match wins
+That's content-aware routing with protocol translation. That's what this does.
 
-### Protocol Conversion
+## Routing Examples
 
-- **Bidirectional**: Anthropic ↔ OpenAI, including request body, non-streaming response, and SSE streaming
-- **Transparent**: same-protocol requests pass through with zero overhead (raw byte passthrough)
-- **SDK-compatible**: works with any client using standard Anthropic or OpenAI SDKs
+| Rule | Match | Route To |
+|------|-------|----------|
+| Model pattern | `gpt-4*` | Any provider with matching models |
+| Keyword in message | "review this code" | A cost-effective model |
+| Content type | Contains images | A vision model |
+| API key group | `senior-devs` group | Premium provider with high quota |
+| Exclude pattern | Contains "/internal/" | Skip this rule, try next |
 
-### Team Management
+Rules are evaluated top-down. First match wins. Each rule can have fallback providers for when the primary fails.
 
-- **API Key authentication**: gateway-level keys (not provider keys), compatible with both SDK conventions
-- **Key groups**: organize keys by team/role, route rules can target specific groups
-- **Token quotas**: daily/monthly per-key or per-group limits, RPM rate limiting (all default to unlimited)
-- **Usage tracking**: token usage by provider, model, key, and group
+## Feature Breakdown
 
-### Observability
+**Routing**
+- Glob model matching (`claude-*`, `gpt-4*`)
+- Keyword / regex content matching
+- Multimodal content type detection (images, files, tool calls)
+- Per-group routing (different teams see different rules)
+- Exclusion rules with priority over match rules
+- Fallback providers on 5xx / timeout
+- Source-to-target model name mapping
 
-- **Real-time dashboard**: concurrency trend charts, live request stream, token usage by hour
-- **Request logging**: SQLite persistence with full request/response content (pruned automatically)
-- **Per-request details**: model mapping, matched route rule, provider, duration, token counts
+**Protocol Conversion**
+- Anthropic ↔ OpenAI, bidirectional
+- Covers request body, streaming SSE, and non-streaming responses
+- Same-protocol requests pass through as raw bytes — zero conversion overhead
+- Works with official SDKs, no client changes needed
+
+**Team Management**
+- Gateway-level API keys (not your provider keys)
+- Key groups with per-group and per-key token quotas (daily / monthly)
+- RPM rate limiting
+- Usage tracking by provider, model, key, and group
+
+**Dashboard**
+- Real-time concurrency monitoring with trend charts
+- Live request stream via SSE
+- Token usage breakdown by hour, provider, model
+- Full request/response logging (auto-pruned)
 
 ## Quick Start
 
-### Prerequisites
+### From Source
 
-- [Bun](https://bun.sh/) >= 1.0
-
-### Install & Run
+Requires [Bun](https://bun.sh/) >= 1.0.
 
 ```bash
-# Clone
 git clone <repo-url>
 cd llm_gateway
-
-# Install dependencies
 bun install
-
-# Development mode (backend watch + Vite frontend)
-bun run dev
-
-# Or production mode
-bun run build:web
-bun run start
+bun run dev        # dev mode: backend watch + Vite frontend
 ```
 
-Visit `http://localhost:3827` for the admin dashboard. On first visit, you'll be guided to set up an admin account.
-
-### Configure Providers
-
-Add providers in the **Providers** page of the admin dashboard:
-
-| Field | Description |
-|-------|-------------|
-| Name | Custom identifier |
-| Type | `openai` / `anthropic` / `azure-openai` / `custom` |
-| API Base URL | Provider API endpoint |
-| API Key | Authentication key |
-| Models | Supported model names for this provider |
-| Max Concurrency | Concurrent request limit (0 = unlimited) |
-
-### Configure Route Rules
-
-Add rules in the **Route Rules** page to define model name matching conditions and target providers. Supports:
-
-- **Model name matching**: glob patterns like `claude-*`, `gpt-4*`
-- **Content matching**: keyword inclusion, regex, multimodal content type detection, multi-condition AND/OR
-- **Group-based routing**: route different API key groups to different providers
-- **Exclusion rules**: negative matching to skip certain patterns
-- **Target model mapping**: fixed name or source-to-target mapping
-
-### Create API Keys (Optional)
-
-In the **API Keys** page, create key groups and API keys for your team members. Each key belongs to a group, and you can set per-key or per-group token quotas (default: unlimited).
-
-### Usage
-
-Point your client's API base URL to the gateway:
+Or build for production:
 
 ```bash
-# Anthropic protocol clients (e.g. Claude Code)
+bun run build      # builds frontend + single binary
+./llm-gateway
+```
+
+### Point Your Tools At It
+
+```bash
+# Claude Code, or any Anthropic SDK client
 export ANTHROPIC_BASE_URL=http://localhost:3827
 export ANTHROPIC_API_KEY=sk-your-gateway-key
 
-# OpenAI protocol clients (e.g. Cursor)
+# Cursor, or any OpenAI SDK client
 export OPENAI_BASE_URL=http://localhost:3827/v1
 export OPENAI_API_KEY=sk-your-gateway-key
 ```
 
-When API key auth is disabled (default), any key value works. Enable it in Settings to require valid gateway keys.
+By default, auth is off — any key works. Enable it in Settings to require valid gateway keys.
 
-## API Endpoints
+## API
 
-### Proxy Routes (for LLM clients)
+### Proxy Endpoints
 
-The gateway exposes both protocols at the root path — no prefix needed:
+No protocol-specific prefixes needed — the gateway detects the format:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/messages` | Anthropic Messages API proxy |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions API proxy |
-| GET | `/v1/models` | Aggregated model list (both formats) |
+| Method | Path | Protocol |
+|--------|------|----------|
+| POST | `/v1/messages` | Anthropic Messages API |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions API |
+| GET | `/v1/models` | Aggregated model list |
 | POST | `/v1/messages/count_tokens` | Token count estimation |
 
-Legacy prefixed paths (`/anthropic/*`, `/openai/*`) are also supported for backward compatibility.
-
-### Admin Routes
+### Admin Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/admin/init-check` | Check if admin is initialized |
-| POST | `/admin/init` | Initialize admin account |
-| GET/PUT | `/admin/config` | Gateway config & auth settings |
-| GET/POST/PUT/DELETE | `/admin/providers/*` | Provider CRUD |
-| GET/POST | `/admin/providers/test` | Provider connectivity test |
-| GET/POST/PUT/DELETE | `/admin/routes/*` | Route rule CRUD |
-| GET/POST/PUT/DELETE | `/admin/key-groups/*` | Key group CRUD |
-| GET/POST/PUT/DELETE | `/admin/keys/*` | API key CRUD |
-| GET | `/admin/token-stats/by-group` | Token usage by group |
-| GET | `/admin/token-stats/by-key` | Token usage by key |
-| GET | `/admin/logs` | Request log query (filterable by key/group) |
+| GET | `/admin/init-check` | Check if admin is set up |
+| POST | `/admin/init` | Create admin account |
+| GET/PUT | `/admin/config` | Gateway settings |
+| CRUD | `/admin/providers/*` | Provider management |
+| GET/POST | `/admin/providers/test` | Connectivity test |
+| CRUD | `/admin/routes/*` | Route rule management |
+| CRUD | `/admin/key-groups/*` | Key group management |
+| CRUD | `/admin/keys/*` | API key management |
+| GET | `/admin/token-stats/by-group` | Usage by group |
+| GET | `/admin/token-stats/by-key` | Usage by key |
+| GET | `/admin/logs` | Request logs |
 | GET | `/admin/stats` | Request statistics |
-| GET | `/admin/events` | SSE real-time event stream |
+| GET | `/admin/events` | SSE event stream |
 | GET | `/health` | Health check |
-
-## Project Structure
-
-```
-src/
-├── server/
-│   ├── index.ts              # Backend entry point
-│   ├── types.ts              # TypeScript type definitions
-│   ├── config.ts             # Config manager (data/config.json)
-│   ├── db.ts                 # SQLite database layer
-│   ├── auth.ts               # API key auth + admin Basic Auth hooks
-│   ├── quota.ts              # Token quota & RPM rate limiting
-│   ├── converters/           # Anthropic ↔ OpenAI format converters (bidirectional)
-│   ├── providers/            # Provider adapters + registry
-│   ├── routes/               # Routes: proxy + admin + health check
-│   └── utils/                # Event bus, semaphore, logging, key generation
-└── web/
-    ├── App.vue               # Root component (navigation + init flow + settings)
-    ├── api.ts                # Frontend API wrapper
-    ├── i18n/                 # Internationalization (Chinese / English)
-    ├── styles/               # Global styles (dark/light theme)
-    └── components/           # Dashboard / ProviderList / RouteRules / ApiKeyList / RequestLog
-```
 
 ## Tech Stack
 
-- **Backend**: Bun + Fastify + SQLite (bun:sqlite)
-- **Frontend**: Vue 3 + Chart.js + Vanilla CSS
-- **Build**: Vite (frontend) + Bun (backend, runs natively)
-- **Single-binary deploy**: `bun build --compile` embeds frontend assets
+Bun runtime + Fastify + bun:sqlite + Vue 3 + Chart.js. Single-binary deployment via `bun build --compile`.
 
 ## License
 

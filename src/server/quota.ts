@@ -117,3 +117,12 @@ export function checkQuota(db: GatewayDB, auth: AuthContext | null): QuotaResult
 
   return { allowed: true }
 }
+
+/** 请求完成后将实际 token 消耗累加到缓存，缩小 TOCTOU 窗口 */
+export function recordUsage(keyId: string | null, tokens: number) {
+  if (!keyId || tokens <= 0) return
+  const cached = usageCache.get(keyId)
+  if (!cached) return
+  cached.daily += tokens
+  cached.monthly += tokens
+}

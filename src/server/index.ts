@@ -66,6 +66,7 @@ declare module "fastify" {
     registry: ProviderRegistry
     configManager: ConfigManager
     statsCache: StatsCache
+    closeSSEConnections: () => void
   }
   interface FastifyRequest {
     authContext: import("./types.ts").AuthContext | null
@@ -75,11 +76,15 @@ declare module "fastify" {
 async function main() {
   const db = new GatewayDB("data/gateway.db")
   const configManager = new ConfigManager()
+  /** 服务器启动时间戳（秒），用于 /v1/models 的 created 字段 */
+  const startedAt = Math.floor(Date.now() / 1000)
   const config = db.getConfig()
 
   const fastify = Fastify({
     logger: { stream: prettyStream, level: config.logLevel } as Record<string, unknown>,
     bodyLimit: 50 * 1024 * 1024,
+    /** SIGINT 时强制关闭所有连接（包括 keep-alive），不等待 */
+    forceCloseConnections: true,
   })
 
   fastify.decorate("db", db)
@@ -135,14 +140,12 @@ async function main() {
       const data = models.map(m => ({
         id: m.id,
         object: "model",
-        created: Math.floor(Date.now() / 1000),
+        created: startedAt,
         owned_by: m.owned_by,
       }))
       return reply.send({
         object: "list",
         data,
-        first_id: data[0]?.id ?? "",
-        last_id: data[data.length - 1]?.id ?? "",
         has_more: false,
       })
     })
@@ -242,6 +245,8 @@ async function main() {
       process.exit(1)
     }, 10_000)
     try {
+      /** 先关闭 SSE 长连接（管理面板），避免阻塞 fastify.close() */
+      fastify.closeSSEConnections?.()
       await fastify.close()
       db.close()
       console.log("Goodbye.")
@@ -255,4 +260,4 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"))
 }
 
-main()
+main().catch(err => { console.error("Fatal:", err); process.exit(1) })

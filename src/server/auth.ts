@@ -36,6 +36,8 @@ const sessions = new Map<string, { username: string; expiresAt: number }>()
 
 /** Session 有效期：7 天 */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+/** Session 最大数量 */
+const MAX_SESSIONS = 1000
 
 /** 定期清理过期 session（每小时一次） */
 const SESSION_CLEANUP_MS = 60 * 60 * 1000
@@ -50,6 +52,8 @@ setInterval(cleanupExpiredSessions, SESSION_CLEANUP_MS).unref()
 /** 创建 session，返回 token */
 export function createSession(username: string): string {
   const now = Date.now()
+  /** 超过上限时先清理过期 session */
+  if (sessions.size >= MAX_SESSIONS) cleanupExpiredSessions()
   const token = generateSessionToken()
   sessions.set(token, { username, expiresAt: now + SESSION_TTL_MS })
   return token
@@ -147,6 +151,11 @@ export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
 
     const keyRecord = db.getApiKeyByHash(hash)
     if (!keyRecord || !keyRecord.enabled) {
+      /** 未开启认证时，无效 key 视为无 key，放行请求 */
+      if (!configManager.get().authRequired) {
+        request.authContext = null
+        return
+      }
       return reply.status(401).send({
         type: "error",
         error: { type: "authentication_error", message: "Invalid or disabled API key." },

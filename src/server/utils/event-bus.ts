@@ -43,6 +43,10 @@ export interface RequestStatsEvent {
   byModel: { model: string; targetModel: string; total: number; today: number }[]
   /** Token 用量统计 */
   tokenStats?: { total: TokenStats; today: TokenStats }
+  /** 按服务商 Token 明细 */
+  tokensByProvider?: { providerId: string; providerName: string; total: TokenStats; today: TokenStats }[]
+  /** 按模型 Token 明细 */
+  tokensByModel?: { model: string; targetModel: string; total: TokenStats; today: TokenStats }[]
 }
 
 /** 上游 API 调用开始（信号量 acquire 之后） */

@@ -33,6 +33,28 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>()
 const LOGIN_MAX_ATTEMPTS = 5
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 
+/** Provider 测试限流：每个 IP 最多 10 次 / 60 秒窗口 */
+const testAttempts = new Map<string, { count: number; resetAt: number }>()
+const TEST_MAX_ATTEMPTS = 10
+const TEST_WINDOW_MS = 60_000
+
+function checkTestRate(ip: string): boolean {
+  const now = Date.now()
+  if (Math.random() < 0.01 || testAttempts.size > 500) {
+    for (const [key, val] of testAttempts) {
+      if (val.resetAt < now) testAttempts.delete(key)
+    }
+  }
+  const entry = testAttempts.get(ip)
+  if (!entry || entry.resetAt < now) {
+    testAttempts.set(ip, { count: 1, resetAt: now + TEST_WINDOW_MS })
+    return true
+  }
+  if (entry.count >= TEST_MAX_ATTEMPTS) return false
+  entry.count++
+  return true
+}
+
 function checkLoginRate(ip: string): boolean {
   const now = Date.now()
   /** 惰性清理过期条目：1% 概率或 Map 超过 1000 条时触发 */
@@ -134,11 +156,29 @@ export async function adminRoutes(fastify: FastifyInstance) {
   })
 
   /** 更新网关配置 */
-  fastify.put<{ Body: { authRequired?: boolean; newPassword?: string } }>("/admin/config", async (request, reply) => {
-    const { authRequired, newPassword } = request.body
+  fastify.put<{ Body: { authRequired?: boolean; newPassword?: string; gateway?: Partial<import("../types.ts").GatewayConfig> } }>("/admin/config", async (request, reply) => {
+    const { authRequired, newPassword, gateway } = request.body
     if (authRequired !== undefined) {
       if (typeof authRequired !== "boolean") return reply.status(400).send({ error: "authRequired must be a boolean" })
       fastify.configManager.setAuthRequired(authRequired)
+      /** 同步 authRequired 到 DB，保持双重配置源一致 */
+      const dbConfig = fastify.db.getConfig()
+      fastify.db.saveConfig({ ...dbConfig, authRequired })
+    }
+    if (gateway) {
+      /** 白名单校验：只允许已知的 GatewayConfig 字段 */
+      const allowedKeys = new Set(["port", "logLevel", "enableRequestLog", "logContentRetention", "maxLogRows", "authRequired"])
+      const unknownKeys = Object.keys(gateway).filter(k => !allowedKeys.has(k))
+      if (unknownKeys.length > 0) return reply.status(400).send({ error: `Unknown gateway config fields: ${unknownKeys.join(", ")}` })
+      if (gateway.port !== undefined && (typeof gateway.port !== "number" || gateway.port < 1 || gateway.port > 65535)) return reply.status(400).send({ error: "port must be 1-65535" })
+      if (gateway.logLevel !== undefined && !["debug", "info", "warn", "error"].includes(gateway.logLevel)) return reply.status(400).send({ error: "logLevel must be debug|info|warn|error" })
+      if (gateway.enableRequestLog !== undefined && typeof gateway.enableRequestLog !== "boolean") return reply.status(400).send({ error: "enableRequestLog must be a boolean" })
+      if (gateway.logContentRetention !== undefined && (typeof gateway.logContentRetention !== "number" || gateway.logContentRetention < 0)) return reply.status(400).send({ error: "logContentRetention must be a non-negative number" })
+      if (gateway.maxLogRows !== undefined && (typeof gateway.maxLogRows !== "number" || gateway.maxLogRows < 1000)) return reply.status(400).send({ error: "maxLogRows must be >= 1000" })
+      fastify.configManager.updateGateway(gateway)
+      /** 同步 gateway 配置到 DB */
+      const dbConfig = fastify.db.getConfig()
+      fastify.db.saveConfig({ ...dbConfig, ...gateway })
     }
     if (newPassword) {
       if (newPassword.length < 8) {
@@ -166,6 +206,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const validTypes = ["openai", "anthropic", "azure-openai", "custom"]
     if (!validTypes.includes(body.type)) return reply.status(400).send({ error: `type must be one of: ${validTypes.join(", ")}` })
     if (!Array.isArray(body.models) || body.models.length === 0) return reply.status(400).send({ error: "models must be a non-empty array" })
+    if (body.models.some((m: unknown) => typeof m !== "string" || !m.trim())) return reply.status(400).send({ error: "Each model must be a non-empty string" })
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
+    if (body.maxConcurrency !== undefined && (typeof body.maxConcurrency !== "number" || body.maxConcurrency < 0)) return reply.status(400).send({ error: "maxConcurrency must be a non-negative number" })
+    if (body.requestTimeout !== undefined && (typeof body.requestTimeout !== "number" || body.requestTimeout < 0)) return reply.status(400).send({ error: "requestTimeout must be a non-negative number" })
     const provider: ProviderConfig = {
       ...body,
       id: uuid(),
@@ -190,6 +234,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (update.models !== undefined && (!Array.isArray(update.models) || update.models.length === 0)) {
       return reply.status(400).send({ error: "models must be a non-empty array" })
     }
+    if (Array.isArray(update.models) && update.models.some((m: unknown) => typeof m !== "string" || !m.trim())) {
+      return reply.status(400).send({ error: "Each model must be a non-empty string" })
+    }
+    if (update.enabled !== undefined && typeof update.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
+    if (update.maxConcurrency !== undefined && (typeof update.maxConcurrency !== "number" || update.maxConcurrency < 0)) return reply.status(400).send({ error: "maxConcurrency must be a non-negative number" })
+    if (update.requestTimeout !== undefined && (typeof update.requestTimeout !== "number" || update.requestTimeout < 0)) return reply.status(400).send({ error: "requestTimeout must be a non-negative number" })
     /** 脱敏 apiKey 不覆盖原值 */
     if (update.apiKey && isMaskedApiKey(update.apiKey)) {
       delete update.apiKey
@@ -207,7 +257,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const rules = fastify.db.getRouteRules()
     const affectedRules = rules.filter(r => r.providerId === id || r.fallbacks?.some(fb => fb.providerId === id))
     if (affectedRules.length > 0) {
-      return reply.status(400).send({ error: `Cannot delete: ${affectedRules.length} route rule(s) reference this provider. Remove or update those rules first.` })
+      const names = affectedRules.map(r => r.pattern || r.id).join(", ")
+      return reply.status(400).send({ error: `Cannot delete: route rules [${names}] reference this provider. Remove or update those rules first.` })
     }
     fastify.db.deleteProvider(id)
     fastify.registry.reload()
@@ -318,12 +369,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
   }
 
   /** 创建前测试（apiKey 由前端传入） */
-  fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; model?: string; customHeaders?: Record<string, string> } }>("/admin/providers/test", async (request) => {
+  fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; model?: string; customHeaders?: Record<string, string> } }>("/admin/providers/test", async (request, reply) => {
+    if (!checkTestRate(request.ip)) return reply.status(429).send({ error: "Too many test requests. Try again later." })
     return doProviderTest(request.body)
   })
 
   /** 按 provider ID 测试（使用数据库中存储的真实 apiKey） */
   fastify.post<{ Params: { id: string } }>("/admin/providers/:id/test", async (request, reply) => {
+    if (!checkTestRate(request.ip)) return reply.status(429).send({ error: "Too many test requests. Try again later." })
     const { id } = request.params
     const provider = fastify.db.getProvider(id)
     if (!provider) {
@@ -431,7 +484,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
       id: uuid(),
       createdAt: new Date().toISOString(),
     }
-    fastify.db.addKeyGroup(group)
+    try {
+      fastify.db.addKeyGroup(group)
+    } catch (e: unknown) {
+      if (e instanceof Error && e.message?.includes("UNIQUE")) {
+        return reply.status(400).send({ error: `Group name "${body.name}" already exists` })
+      }
+      throw e
+    }
     invalidateNameCache()
     return reply.status(201).send(group)
   })
@@ -526,8 +586,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   // ========== Logs ==========
 
-  fastify.get<{ Querystring: { limit?: string; offset?: string; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string } }>("/admin/logs", async (request) => {
-    const { limit, offset, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime } = request.query
+  fastify.get<{ Querystring: { limit?: string; offset?: string; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: string } }>("/admin/logs", async (request) => {
+    const { limit, offset, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime, hasFallback } = request.query
     const parsedLimit = limit ? parseInt(limit) : 100
     const parsedOffset = offset ? parseInt(offset) : 0
     const logs = fastify.db.getLogs({
@@ -541,6 +601,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       sort: sort ?? undefined,
       startTime: startTime ?? undefined,
       endTime: endTime ?? undefined,
+      hasFallback: hasFallback === "1" ? true : undefined,
     })
     /** 附加 provider/key/group 名称（使用缓存） */
     const { providerMap, keyMap, groupMap } = getNameMaps()
@@ -666,8 +727,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
         byProvider: fastify.statsCache.getByProvider(),
         byModel: fastify.statsCache.getByModel(),
         tokenStats: fastify.statsCache.getTokenStats(),
+        tokensByProvider: fastify.statsCache.getTokensByProvider(),
+        tokensByModel: fastify.statsCache.getTokensByModel(),
       })
     }, 3000)
+    statsTimer.unref()
   }
 
   /** 聚合并发状态：按 provider 聚合，包含模型维度和两层并发 */
@@ -710,7 +774,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     } else if (event.type === "request_end") {
       activeRequests.delete(event.requestId)
       /** 增量更新 total 计数器（避免全表 COUNT/SUM） */
-      fastify.statsCache.recordRequest(event.tokenUsage)
+      fastify.statsCache.recordRequest()
       /** 使统计缓存失效 */
       fastify.statsCache.onRequestEnd()
       recordSnapshot()
@@ -728,6 +792,16 @@ export async function adminRoutes(fastify: FastifyInstance) {
   /** SSE 最大连接数，超出时拒绝新连接 */
   const MAX_SSE_CONNECTIONS = 20
   let sseConnectionCount = 0
+  /** 活跃 SSE 连接的 raw response，用于 shutdown 时主动关闭 */
+  const activeSSEConnections = new Set<import("node:http").ServerResponse>()
+
+  /** 暴露关闭 SSE 连接的方法给 shutdown 流程使用 */
+  fastify.decorate("closeSSEConnections", () => {
+    for (const raw of activeSSEConnections) {
+      raw.destroy()
+    }
+    activeSSEConnections.clear()
+  })
 
   fastify.get("/admin/events", async (request, reply) => {
     if (sseConnectionCount >= MAX_SSE_CONNECTIONS) {
@@ -751,6 +825,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       if (unsubscribe) { unsubscribe(); unsubscribe = undefined }
       buffered = false
       sseConnectionCount--
+      activeSSEConnections.delete(raw)
     }
 
     /** 安全写入：检查背压，缓冲满时丢弃后续数据 */
@@ -767,6 +842,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     reply.hijack()
     const raw = reply.raw
 
+    activeSSEConnections.add(raw)
+
     /** 处理底层连接错误（如 ECONNRESET） */
     request.raw.on("error", cleanup)
 
@@ -776,8 +853,6 @@ export async function adminRoutes(fastify: FastifyInstance) {
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     })
-    /** 设置浏览器 SSE 重连间隔为 5 秒，避免断连后频繁重试 */
-    safeWrite("retry: 5000\n")
     safeWrite("data: {\"type\":\"connected\"}\n\n")
 
     /** 推送历史并发快照，前端刷新后可恢复图表 */

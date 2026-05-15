@@ -239,11 +239,20 @@ const picomatchCache = new Map<string, (input: string) => boolean>()
 
 const MAX_PATTERN_CACHE = 200
 
+/** 淘汰 Map 中最早插入的一半条目，避免全量清除导致缓存雪崩 */
+function evictHalf<K, V>(map: Map<K, V>) {
+  let count = 0
+  for (const key of map.keys()) {
+    if (++count > map.size / 2) break
+    map.delete(key)
+  }
+}
+
 /** 获取或创建 picomatch matcher */
 function getCachedPicomatch(pattern: string): (input: string) => boolean {
   let matcher = picomatchCache.get(pattern)
   if (!matcher) {
-    if (picomatchCache.size >= MAX_PATTERN_CACHE) picomatchCache.clear()
+    if (picomatchCache.size >= MAX_PATTERN_CACHE) evictHalf(picomatchCache)
     matcher = picomatch(pattern)
     picomatchCache.set(pattern, matcher)
   }
@@ -255,7 +264,7 @@ function getCachedRegex(pattern: string, flags: string): RegExp | null {
   const key = `${flags}:${pattern}`
   const cached = regexCache.get(key)
   if (cached !== undefined) return cached
-  if (regexCache.size >= MAX_PATTERN_CACHE) regexCache.clear()
+  if (regexCache.size >= MAX_PATTERN_CACHE) evictHalf(regexCache)
   try {
     const re = new RegExp(pattern, flags)
     regexCache.set(key, re)

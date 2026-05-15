@@ -123,7 +123,12 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
   /** tool_result 拆分为独立的 role: "tool" 消息 */
   for (const tr of toolResults) {
     const raw = tr.content
-    const content = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map(b => "text" in b ? b.text : "[image]").join("") : ""
+    const content = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map(b => {
+      if ("text" in b) return b.text
+      /** 图片内容：保留 base64 数据描述，OpenAI tool message content 不支持 image_url */
+      const img = b as { type: "image"; source: { type: string; media_type?: string; data?: string } }
+      return `[image: ${img.source.media_type ?? "unknown"}, ${img.source.data?.length ?? 0} bytes]`
+    }).join("\n") : ""
     results.push({ role: "tool", tool_call_id: tr.tool_use_id, content: tr.is_error ? `[ERROR] ${content}` : content })
   }
 

@@ -21,9 +21,11 @@ export function formatSSEDone(): string {
  */
 export function parseSSEBuffer(buffer: string): { events: SSEParsedEvent[]; remaining: string } {
   const events: SSEParsedEvent[] = []
-  const lines = buffer.split("\n")
+  /** 统一 \r\n 为 \n，兼容部分代理/CDN 注入的 Windows 行尾 */
+  const normalized = buffer.replace(/\r\n/g, "\n")
+  const lines = normalized.split("\n")
   /** 最后一个元素可能不完整 */
-  const remaining = buffer.endsWith("\n") ? "" : (lines.pop() ?? "")
+  const remaining = normalized.endsWith("\n") ? "" : (lines.pop() ?? "")
 
   let currentEvent: SSEParsedEvent | null = null
 

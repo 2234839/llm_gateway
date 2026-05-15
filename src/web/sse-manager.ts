@@ -11,6 +11,8 @@ const listeners = new Set<SseListener>()
 /** 指数退避重连 */
 let retryDelay = 1000
 const MAX_RETRY_DELAY = 30_000
+/** 是否正在重连中（防止 onerror 多次触发重复调度） */
+let reconnecting = false
 
 function resetRetryDelay() {
   retryDelay = 1000
@@ -24,6 +26,7 @@ function resetHeartbeat() {
 }
 
 function connect() {
+  reconnecting = false
   eventSource?.close()
   eventSource = new EventSource("/admin/events")
   resetHeartbeat()
@@ -39,7 +42,10 @@ function connect() {
   }
 
   eventSource.onerror = () => {
-    /** EventSource 内置重连机制，超时时 heartbeat timer 会强制重建连接 */
+    /** 禁用 EventSource 内置重连：关闭并交给 reconnect() 处理指数退避 */
+    eventSource?.close()
+    eventSource = null
+    reconnect()
   }
 
   eventSource.onopen = () => {
@@ -50,11 +56,14 @@ function connect() {
 
 /** 带指数退避的重连 */
 function reconnect() {
+  if (reconnecting) return
+  reconnecting = true
   eventSource?.close()
   eventSource = null
   if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null }
-  if (listeners.size === 0) return
+  if (listeners.size === 0) { reconnecting = false; return }
   setTimeout(() => {
+    reconnecting = false
     if (listeners.size > 0) connect()
   }, retryDelay)
   retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY)

@@ -9,6 +9,7 @@ const keyGroups = ref<KeyGroupInfo[]>([])
 const loading = ref(true)
 const creating = ref(false)
 const editingId = ref<string | null>(null)
+const saving = ref(false)
 const error = ref("")
 
 const emptyRule: Omit<RouteRuleInfo, "id"> = {
@@ -95,6 +96,7 @@ async function save() {
   if (!data.keyGroups?.length) data.keyGroups = undefined
   if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = undefined
   error.value = ""
+  saving.value = true
   try {
     if (editingId.value) {
       await routeApi.update(editingId.value, data)
@@ -106,6 +108,7 @@ async function save() {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Save failed"
   }
+  saving.value = false
 }
 
 async function remove(id: string) {
@@ -299,14 +302,18 @@ function syncMappingToForm() {
                   {{ cond.type === 'keyword' ? t('route.contains') : t('route.match') }} "{{ cond.pattern }}"
                 </template>
               </span>
-              <span v-if="rule.excludeMatch?.length" class="match-tag exclude-label">{{ t('route.excludes') }}</span>
-              <span v-for="(cond, ci) in rule.excludeMatch" :key="'ex'+ci" class="match-tag exclude">
-                <template v-if="cond.type === 'content_type'">
-                  {{ cond.pattern === 'image' ? t('route.containsImage') : cond.pattern === 'file' ? t('route.containsFile') : cond.pattern === 'tool_use' ? t('route.containsToolUse') : cond.pattern }}
-                </template>
-                <template v-else>
-                  {{ cond.type === 'keyword' ? t('route.contains') : t('route.match') }} "{{ cond.pattern }}"
-                </template>
+              <span v-if="rule.excludeMatch?.length" class="exclude-group">
+                <span class="exclude-prefix">{{ t('route.excludes') }}</span>
+                <span class="exclude-conditions">
+                  <span v-for="(cond, ci) in rule.excludeMatch" :key="'ex'+ci" class="match-tag exclude">
+                    <template v-if="cond.type === 'content_type'">
+                      {{ cond.pattern === 'image' ? t('route.containsImage') : cond.pattern === 'file' ? t('route.containsFile') : cond.pattern === 'tool_use' ? t('route.containsToolUse') : cond.pattern }}
+                    </template>
+                    <template v-else>
+                      {{ cond.type === 'keyword' ? t('route.contains') : t('route.match') }} "{{ cond.pattern }}"
+                    </template>
+                  </span>
+                </span>
               </span>
               <span v-if="(!rule.pattern || rule.pattern === '*') && !rule.contentMatch?.length" class="muted">{{ t('route.matchAll') }}</span>
               <span v-if="rule.keyGroups?.length" class="match-tag keygroup-label">{{ t('route.keyGroupsLabel') }}</span>
@@ -379,6 +386,59 @@ function syncMappingToForm() {
           <button class="btn-sm" type="button" @click="addMapping" style="margin-left: 24px">{{ t('route.addMapping') }}</button>
         </div>
 
+        <!-- 排除条件（优先级高于匹配条件） -->
+        <div class="match-section">
+          <div class="section-label">{{ t('route.excludeConditionLabel') }}<span class="section-hint" style="margin: 0 0 0 8px; display: inline">{{ t('route.excludePriorityHint') }}</span></div>
+
+          <div class="condition-row">
+            <label class="checkbox-label">
+              <input type="checkbox" :checked="!!form.excludeMatch?.length" @change="($event.target as HTMLInputElement).checked ? addExcludeCondition() : (form.excludeMatch = undefined)" />
+              {{ t('route.excludeByContent') }}
+            </label>
+          </div>
+
+          <div v-if="form.excludeMatch?.length" class="content-conditions">
+            <div v-if="form.excludeMatch.length > 1" class="operator-select">
+              <select :value="form.excludeMatch[0].operator ?? 'and'" @change="syncExcludeOperator($event)">
+                <option value="and">{{ t('route.matchAllAnd') }}</option>
+                <option value="or">{{ t('route.matchAnyOr') }}</option>
+              </select>
+            </div>
+
+            <div v-for="(cond, i) in form.excludeMatch" :key="i" class="condition-row indented">
+              <select v-model="cond.type" class="cond-type">
+                <option value="keyword">{{ t('route.keyword') }}</option>
+                <option value="regex">{{ t('route.regex') }}</option>
+                <option value="content_type">{{ t('route.contentType') }}</option>
+              </select>
+              <select
+                v-if="cond.type === 'content_type'"
+                v-model="cond.pattern"
+                class="cond-pattern"
+              >
+                <option value="image">{{ t('route.containsImage') }}</option>
+                <option value="file">{{ t('route.containsFile') }}</option>
+                <option value="tool_use">{{ t('route.containsToolUse') }}</option>
+              </select>
+              <input
+                v-else
+                v-model="cond.pattern"
+                :placeholder="cond.type === 'keyword' ? t('route.keywordPlaceholder') : t('route.regexPlaceholder')"
+                class="cond-pattern"
+              />
+              <input
+                v-if="cond.type === 'regex'"
+                v-model="cond.flags"
+                placeholder="flags"
+                class="cond-flags"
+              />
+              <button class="btn-sm btn-danger" type="button" @click="removeExcludeCondition(i)">&times;</button>
+            </div>
+
+            <button class="btn-sm" type="button" @click="addExcludeCondition" style="margin-left: 24px">{{ t('route.addExclude') }}</button>
+          </div>
+        </div>
+
         <!-- 匹配条件 -->
         <div class="match-section">
           <div class="section-label">{{ t('route.matchConditionLabel') }}</div>
@@ -442,59 +502,6 @@ function syncMappingToForm() {
           </div>
         </div>
 
-        <!-- 排除条件 -->
-        <div class="match-section">
-          <div class="section-label">{{ t('route.excludeConditionLabel') }}</div>
-
-          <div class="condition-row">
-            <label class="checkbox-label">
-              <input type="checkbox" :checked="!!form.excludeMatch?.length" @change="($event.target as HTMLInputElement).checked ? addExcludeCondition() : (form.excludeMatch = undefined)" />
-              {{ t('route.excludeByContent') }}
-            </label>
-          </div>
-
-          <div v-if="form.excludeMatch?.length" class="content-conditions">
-            <div v-if="form.excludeMatch.length > 1" class="operator-select">
-              <select :value="form.excludeMatch[0].operator ?? 'and'" @change="syncExcludeOperator($event)">
-                <option value="and">{{ t('route.matchAllAnd') }}</option>
-                <option value="or">{{ t('route.matchAnyOr') }}</option>
-              </select>
-            </div>
-
-            <div v-for="(cond, i) in form.excludeMatch" :key="i" class="condition-row indented">
-              <select v-model="cond.type" class="cond-type">
-                <option value="keyword">{{ t('route.keyword') }}</option>
-                <option value="regex">{{ t('route.regex') }}</option>
-                <option value="content_type">{{ t('route.contentType') }}</option>
-              </select>
-              <select
-                v-if="cond.type === 'content_type'"
-                v-model="cond.pattern"
-                class="cond-pattern"
-              >
-                <option value="image">{{ t('route.containsImage') }}</option>
-                <option value="file">{{ t('route.containsFile') }}</option>
-                <option value="tool_use">{{ t('route.containsToolUse') }}</option>
-              </select>
-              <input
-                v-else
-                v-model="cond.pattern"
-                :placeholder="cond.type === 'keyword' ? t('route.keywordPlaceholder') : t('route.regexPlaceholder')"
-                class="cond-pattern"
-              />
-              <input
-                v-if="cond.type === 'regex'"
-                v-model="cond.flags"
-                placeholder="flags"
-                class="cond-flags"
-              />
-              <button class="btn-sm btn-danger" type="button" @click="removeExcludeCondition(i)">&times;</button>
-            </div>
-
-            <button class="btn-sm" type="button" @click="addExcludeCondition" style="margin-left: 24px">{{ t('route.addExclude') }}</button>
-          </div>
-        </div>
-
         <!-- 密钥分组限制 -->
         <div v-if="keyGroups.length" class="match-section">
           <div class="section-label">{{ t('route.keyGroupsLabel') }}</div>
@@ -529,7 +536,7 @@ function syncMappingToForm() {
         </div>
 
         <div class="form-actions">
-          <button class="btn btn-primary" @click="save">{{ t('route.save') }}</button>
+          <button class="btn btn-primary" @click="save" :disabled="saving">{{ saving ? '...' : t('route.save') }}</button>
           <button class="btn" @click="cancel">{{ t('route.cancel') }}</button>
         </div>
       </div>
@@ -714,10 +721,32 @@ function syncMappingToForm() {
   color: var(--tag-red);
 }
 
-.match-tag.exclude-label {
+/** 排除规则整体分组：前缀标签 + 竖线 + 条件列表 */
+.exclude-group {
+  display: inline-flex;
+  align-items: center;
   background: var(--tag-red-bg);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-right: 4px;
+  vertical-align: top;
+}
+
+.exclude-prefix {
+  padding: 2px 8px;
   color: var(--tag-red);
   font-weight: 600;
+  font-size: 12px;
+  background: rgba(239, 68, 68, 0.15);
+  border-right: 1px solid var(--tag-red);
+}
+
+.exclude-conditions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 0;
+  padding: 2px 6px;
 }
 
 .priority-cell {
@@ -761,6 +790,13 @@ function syncMappingToForm() {
 
 tr.disabled {
   opacity: 0.45;
+}
+
+/** 匹配规则列不截断，允许完整显示所有 tag */
+.table td:nth-child(2) {
+  max-width: none;
+  overflow: visible;
+  white-space: normal;
 }
 
 .section-hint {
@@ -831,5 +867,39 @@ tr.disabled {
   padding: 40px 0;
   color: var(--text-dim);
   font-size: 13px;
+}
+
+@media (max-width: 768px) {
+  .form-card {
+    padding: 14px 10px;
+  }
+  .match-section {
+    padding: 12px 8px;
+  }
+  .condition-row {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .condition-row.indented {
+    margin-left: 8px;
+  }
+  .cond-type {
+    width: 100%;
+    min-width: 0;
+  }
+  .cond-pattern {
+    min-width: 0;
+  }
+  .cond-flags {
+    width: 60px;
+  }
+  .table {
+    display: block;
+    overflow-x: auto;
+    min-width: 600px;
+  }
+  .key-groups-grid {
+    gap: 8px;
+  }
 }
 </style>

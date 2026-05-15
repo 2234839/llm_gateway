@@ -156,7 +156,7 @@ function convertToolChoice(choice: OpenAIChatCompletionRequest["tool_choice"]): 
       case "none":
         return { type: "none" }
       case "required":
-        return { type: "any" }
+        return { type: "any", disable_parallel_tool_use: true }
     }
   }
   if (typeof choice === "object" && choice.type === "function") {

@@ -27,7 +27,7 @@ export function convertResponseToAnthropic(
         input_tokens: resp.usage?.prompt_tokens ?? 0,
         output_tokens: resp.usage?.completion_tokens ?? 0,
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
       },
     }
   }
@@ -67,7 +67,7 @@ export function convertResponseToAnthropic(
       input_tokens: resp.usage?.prompt_tokens ?? 0,
       output_tokens: resp.usage?.completion_tokens ?? 0,
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: resp.usage?.prompt_tokens_details?.cached_tokens ?? 0,
     },
   }
 }

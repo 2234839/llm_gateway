@@ -102,10 +102,10 @@ const tokenTrendOptions = [
   { label: "7d", value: 168 },
 ]
 
-/** 输出速率历史（tokens/s），与并发共享时间轴 */
+/** 输出速率历史（chars/s），与并发共享时间轴 */
 const outputRateHistory: number[] = []
-/** 当前采样窗口内累积的输出 token 数 */
-let windowOutputTokens = 0
+/** 当前采样窗口内累积的输出字符数 */
+let windowOutputChars = 0
 /** 上一次 appendChartPoint 的时间戳（用于计算实际经过时间） */
 let lastChartPointTime = 0
 /** EMA 平滑后的当前输出速率 */
@@ -169,6 +169,9 @@ onDeactivated(() => {
 /** KeepAlive activate：恢复 SSE 和定时器 */
 onActivated(() => {
   if (!info.value) return
+  /** 清除离线期间的过期请求，避免显示陈旧数据 */
+  liveRequests.value.clear()
+  completedRequests.value = []
   connectSSE()
   cleanupTimer = setInterval(cleanupCompleted, 30000)
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
@@ -298,17 +301,17 @@ function appendChartPoint() {
   const nowMs = Date.now()
   const elapsedMs = lastChartPointTime > 0 ? nowMs - lastChartPointTime : 0
   lastChartPointTime = nowMs
-  if (elapsedMs > 0 && windowOutputTokens > 0) {
-    const instantRate = windowOutputTokens / (elapsedMs / 1000)
+  if (elapsedMs > 0 && windowOutputChars > 0) {
+    const instantRate = windowOutputChars / (elapsedMs / 1000)
     smoothedRate = smoothedRate === 0 ? instantRate : EMA_ALPHA * instantRate + (1 - EMA_ALPHA) * smoothedRate
-  } else if (windowOutputTokens === 0) {
+  } else if (windowOutputChars === 0) {
     /** 无新数据时衰减，不直接归零 */
     smoothedRate *= EMA_DECAY
     if (smoothedRate < 0.5) smoothedRate = 0
   }
   outputRateHistory.push(Math.round(smoothedRate))
   if (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
-  windowOutputTokens = 0
+  windowOutputChars = 0
 
   renderConcurrencyChart()
 }
@@ -465,31 +468,16 @@ function renderTokenChart(data: ({ hour: string } & TokenStats)[]) {
 
 /** ========== SSE 连接 ========== */
 
-/** 心跳超时：10 秒无消息则重连 */
-let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
-const HEARTBEAT_TIMEOUT = 10_000
-
-function resetHeartbeat() {
-  if (heartbeatTimer) clearTimeout(heartbeatTimer)
-  heartbeatTimer = setTimeout(() => {
-    /** 心跳超时，断开并重连 */
-    disconnectSSE()
-    connectSSE()
-  }, HEARTBEAT_TIMEOUT)
-}
-
 function disconnectSSE() {
   if (sseUnsubscribe) { sseUnsubscribe(); sseUnsubscribe = null }
-  if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null }
 }
 
 function connectSSE() {
   disconnectSSE()
   /** 重连时重置速率窗口，避免用旧累积值计算尖峰 */
-  windowOutputTokens = 0
+  windowOutputChars = 0
   lastChartPointTime = 0
   smoothedRate = 0
-  resetHeartbeat()
 
   sseUnsubscribe = subscribeSSE((event) => {
     if (event.type === "concurrency_history") {
@@ -521,7 +509,10 @@ function connectSSE() {
     } else if (event.type === "request_stream") {
       const req = liveRequests.value.get(event.requestId)
       if (req) {
-        req.output += event.text
+        /** 截断过长输出防止浏览器内存膨胀 */
+        if (req.output.length < 50000) req.output += event.text
+        /** 实时累加输出字符数到速率窗口 */
+        if (event.text) windowOutputChars += event.text.length
         /** 节流 DOM 滚动：每 200ms 最多触发一次 */
         if (!req._scrollTimer) {
           req._scrollTimer = setTimeout(() => {
@@ -555,10 +546,7 @@ function connectSSE() {
         /** 新完成的请求插入顶部后，滚动到顶部以显示最新条目 */
         nextTick(() => { if (liveLogsRef.value) liveLogsRef.value.scrollTop = 0 })
       }
-      /** 累加到输出速率窗口 */
-      if (event.tokenUsage) {
-        windowOutputTokens += event.tokenUsage.outputTokens ?? 0
-      }
+      /** 输出字符速率已通过 request_stream 实时累加 */
       scheduleTokenTrendRefresh()
     } else if (event.type === "request_stats") {
       if (!info.value) return
@@ -567,6 +555,12 @@ function connectSSE() {
       info.value.requestsByModel = event.byModel
       if (event.tokenStats) {
         info.value.tokenStats = event.tokenStats
+      }
+      if (event.tokensByProvider) {
+        info.value.tokensByProvider = event.tokensByProvider
+      }
+      if (event.tokensByModel) {
+        info.value.tokensByModel = event.tokensByModel
       }
     }
   })
@@ -607,29 +601,17 @@ function truncate(s: string, len: number): string {
     <template v-else-if="info">
       <div class="stats-bar">
         <span class="stat-item"><span class="status-dot ok"></span>{{ t('dashboard.statusOk') }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item"><span class="stat-label">{{ t('dashboard.uptime') }}</span>{{ formatUptime(info.uptime) }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item"><span class="stat-label">{{ t('dashboard.providers') }}</span>{{ info.providers.enabled }} / {{ info.providers.total }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item"><span class="stat-label">{{ t('dashboard.routes') }}</span>{{ info.routeRules }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item"><span class="stat-label">{{ t('dashboard.totalRequests') }}</span>{{ info.requests.total }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item"><span class="stat-label">{{ t('dashboard.today') }}</span>{{ info.requests.today }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item" v-if="info.requests.today > 0" :style="{ color: info.requests.todayErrors > 0 ? 'var(--err)' : undefined }"><span class="stat-label">{{ t('dashboard.errorRate') }}</span>{{ info.requests.todayErrors }} ({{ (info.requests.todayErrors / Math.max(info.requests.today, 1) * 100).toFixed(1) }}%)</span>
-        <span class="stat-sep" v-if="info.requests.today > 0"></span>
         <span class="stat-item" v-if="info.requests.todayAvgMs > 0"><span class="stat-label">{{ t('dashboard.avgLatency') }}</span>{{ formatDuration(info.requests.todayAvgMs) }}</span>
-        <span class="stat-sep" v-if="info.requests.todayAvgMs > 0"></span>
         <span class="stat-item" v-if="info.requests.todayP50Ms > 0"><span class="stat-label">P50</span>{{ formatDuration(info.requests.todayP50Ms) }}</span>
-        <span class="stat-sep" v-if="info.requests.todayP50Ms > 0"></span>
         <span class="stat-item" v-if="info.requests.todayP95Ms > 0"><span class="stat-label">P95</span>{{ formatDuration(info.requests.todayP95Ms) }}</span>
-        <span class="stat-sep" v-if="info.requests.todayP95Ms > 0"></span>
         <span class="stat-item" v-if="info.requests.todayP99Ms > 0"><span class="stat-label">P99</span>{{ formatDuration(info.requests.todayP99Ms) }}</span>
-        <span class="stat-sep" v-if="info.requests.todayP99Ms > 0"></span>
         <span class="stat-item" :title="info.tokenStats?.today ? `${t('dashboard.inputCol')}: ${formatNumber(info.tokenStats.today.inputTokens)}\n${t('dashboard.outputCol')}: ${formatNumber(info.tokenStats.today.outputTokens)}${info.tokenStats.today.cacheReadTokens ? `\n${t('dashboard.cacheReadCol')}: ${formatNumber(info.tokenStats.today.cacheReadTokens)}` : ''}${info.tokenStats.today.cacheCreationTokens ? `\n${t('dashboard.cacheWriteCol')}: ${formatNumber(info.tokenStats.today.cacheCreationTokens)}` : ''}` : undefined"><span class="stat-label">{{ t('dashboard.todayTokens') }}</span>{{ formatTokenCount(info.tokenStats?.today) }}</span>
-        <span class="stat-sep"></span>
         <span class="stat-item" :title="info.tokenStats?.total ? `${t('dashboard.inputCol')}: ${formatNumber(info.tokenStats.total.inputTokens)}\n${t('dashboard.outputCol')}: ${formatNumber(info.tokenStats.total.outputTokens)}${info.tokenStats.total.cacheReadTokens ? `\n${t('dashboard.cacheReadCol')}: ${formatNumber(info.tokenStats.total.cacheReadTokens)}` : ''}${info.tokenStats.total.cacheCreationTokens ? `\n${t('dashboard.cacheWriteCol')}: ${formatNumber(info.tokenStats.total.cacheCreationTokens)}` : ''}` : undefined"><span class="stat-label">{{ t('dashboard.totalTokens') }}</span>{{ formatTokenCount(info.tokenStats?.total) }}</span>
       </div>
 
@@ -777,7 +759,7 @@ function truncate(s: string, len: number): string {
           <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
 
-        <div class="detail-card">
+        <div class="detail-card span-2">
           <h3>{{ t('dashboard.providerTokenUsage') }}</h3>
           <table class="table" v-if="info.tokensByProvider?.length">
             <thead>
@@ -801,7 +783,7 @@ function truncate(s: string, len: number): string {
           <div v-else class="empty">{{ t('dashboard.noData') }}</div>
         </div>
 
-        <div class="detail-card">
+        <div class="detail-card span-2">
           <h3>{{ t('dashboard.modelTokenUsage') }}</h3>
           <table class="table" v-if="info.tokensByModel?.length">
             <thead>
@@ -907,6 +889,12 @@ export OPENAI_API_KEY=your-key</pre>
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 20px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.detail-card.span-2 {
+  grid-column: span 2;
 }
 
 .detail-card h3 {
@@ -958,7 +946,11 @@ export OPENAI_API_KEY=your-key</pre>
 }
 
 .detail-card .table {
-  font-size: 13px;
+  font-size: 12px;
+}
+.detail-card .table th,
+.detail-card .table td {
+  padding: 8px 8px;
 }
 
 .empty {
@@ -1213,5 +1205,50 @@ export OPENAI_API_KEY=your-key</pre>
   border-radius: 4px;
   margin-left: 8px;
   vertical-align: middle;
+}
+
+@media (max-width: 768px) {
+  .log-header {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .log-status {
+    margin-left: 0;
+    width: 100%;
+    text-align: right;
+  }
+  .log-item {
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .chart-container {
+    height: 160px;
+  }
+  .detail-card {
+    padding: 14px 10px;
+    overflow-x: auto;
+  }
+  .detail-card .table {
+    min-width: 700px;
+  }
+  .log-token-detail {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 640px) {
+  .stats-bar {
+    font-size: 11px;
+  }
+  .concurrency-grid {
+    gap: 8px;
+  }
+  .detail-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .detail-card.span-2 {
+    grid-column: span 1;
+  }
 }
 </style>

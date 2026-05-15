@@ -6,7 +6,7 @@ import { streamAnthropicToOpenAI } from "../converters/stream-to-openai.ts"
 import { extractOpenAIText, extractOpenAIResponseSummary, extractOpenAIContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
-import { checkQuota, recordRpmRequest } from "../quota.ts"
+import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -143,7 +143,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
-        /** 客户端断连时取消信号量等待 */
+        /** 客户端断连时中断信号量等待 + 上游 fetch + 流式读取 */
         const ac = new AbortController()
         const onClose = () => ac.abort()
         request.raw.once("close", onClose)
@@ -153,10 +153,11 @@ export async function openaiRoutes(fastify: FastifyInstance) {
           request.raw.removeListener("close", onClose)
           return
         }
-        request.raw.removeListener("close", onClose)
+        /** 信号量获取成功后不立即移除监听 — ac.signal 贯穿 fetch + 流式传输阶段 */
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
-          const result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall)
+          const result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, ac.signal)
+          request.raw.removeListener("close", onClose)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
             /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */
@@ -192,6 +193,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
             return reply.send(convertErrorToOpenAI(result.errorMsg ?? "Upstream error", statusCode))
           }
         } catch (err) {
+          request.raw.removeListener("close", onClose)
           /** handleOpenAIUpstream 抛出异常（如网络错误），释放信号量 */
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           semaphore?.release()
@@ -243,6 +245,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         outputContent: outputText || null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
       })
+      recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
         output: outputText, durationMs, stream: isStream, statusCode, error: errorMsg,
@@ -263,6 +266,7 @@ async function handleOpenAIUpstream(
   flushToolCalls: () => void,
   onStreamError?: (err: string) => void,
   onAnthropicToolCall?: (name: string, input: string) => void,
+  signal?: AbortSignal,
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -279,35 +283,38 @@ async function handleOpenAIUpstream(
   if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
     /** OpenAI 兼容提供商 — 透传 */
     if (isStream) {
-      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, {})
+      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, {}, signal)
       if (!upstream.ok) {
         const errBody = await upstream.text()
         return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
-      let iTokens = 0, oTokens = 0
+      let iTokens = 0, oTokens = 0, crTokens = 0
       if (!upstream.body) {
         return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
       reply.hijack()
-      await streamPassthroughOpenAI(upstream.body, reply.raw, onText, onToolCall, flushToolCalls, (i, o) => {
+      await streamPassthroughOpenAI(upstream.body, reply.raw, onText, onToolCall, flushToolCalls, (i, o, cr) => {
         iTokens = i
         oTokens = o
-      }, onStreamError)
-      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null, streamHijacked: true }
+        crTokens = cr
+      }, onStreamError, estimateOpenAIInputTokens(body), signal)
+      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest({ ...body, model: targetModel }, {})
+    const upstream = await provider.sendRequest({ ...body, model: targetModel }, {}, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
     const resp = await upstream.json() as Record<string, unknown>
-    const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage
+    const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } }).usage
     const iT = respUsage?.prompt_tokens ?? 0
     const oT = respUsage?.completion_tokens ?? 0
+    /** OpenAI 兼容服务商的 prompt_tokens_details.cached_tokens 对应 cache read */
+    const crT = respUsage?.prompt_tokens_details?.cached_tokens ?? 0
     const oText = extractOpenAIResponseSummary(resp)
     reply.send(resp)
-    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: oText }
+    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: crT, outputText: oText }
   }
 
   /** Anthropic 提供商 — 转换格式 */
@@ -315,7 +322,7 @@ async function handleOpenAIUpstream(
   const upstreamHeaders: Record<string, string> = { "anthropic-version": "2023-06-01" }
 
   if (isStream) {
-    const upstream = await provider.sendStreamRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders)
+    const upstream = await provider.sendStreamRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -330,11 +337,11 @@ async function handleOpenAIUpstream(
       oTokens = o
       ccTokens = cc
       crTokens = cr
-    }, onStreamError)
+    }, onStreamError, signal)
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
-  const upstream = await provider.sendRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders)
+  const upstream = await provider.sendRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
   if (!upstream.ok) {
     const errBody = await upstream.text()
     return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -363,8 +370,10 @@ function streamPassthroughOpenAI(
   onText?: (text: string) => void,
   onToolCall?: (idx: number, name: string | undefined, args: string | undefined) => void,
   onEnd?: () => void,
-  onTokenUsage?: (inputTokens: number, outputTokens: number) => void,
+  onTokenUsage?: (inputTokens: number, outputTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
+  estimatedInputTokens?: number,
+  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -377,12 +386,24 @@ function streamPassthroughOpenAI(
 
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
+  /** 客户端断连时主动取消上游 reader */
+  if (signal) {
+    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+  }
   /** SSE 行缓冲区，处理跨 chunk 的行分割 */
   let sseBuffer = ""
+  /** 跟踪是否收到过 usage 报告（部分 provider 不支持 stream_options） */
+  let hasUsageReport = false
+  /** 手动计数 output delta 块数，作为无 usage 报告时的 fallback */
+  let outputChunks = 0
 
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
+        /** 如果上游未返回 usage（不支持 stream_options），用 delta 块计数作为近似 output token */
+        if (!hasUsageReport && outputChunks > 0) {
+          onTokenUsage?.(estimatedInputTokens ?? 0, outputChunks, 0)
+        }
         onEnd?.()
         raw.end()
         return
@@ -392,28 +413,31 @@ function streamPassthroughOpenAI(
         reader.cancel().catch(() => {})
         return
       }
-      raw.write(value)
-      /** 从 SSE 中提取文本内容、工具调用和 token 用量 */
-      if (onText || onToolCall || onTokenUsage) {
-        sseBuffer += decoder.decode(value, { stream: true })
-        const lines = sseBuffer.split("\n")
-        sseBuffer = lines.pop()!
-        for (const line of lines) {
-          if (!line.startsWith("data: ") || line === "data: [DONE]") continue
-          try {
-            const obj = JSON.parse(line.slice(6))
-            const delta = obj.choices?.[0]?.delta
-            if (delta?.content) onText?.(delta.content)
-            if (delta?.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                onToolCall?.(tc.index, tc.function?.name, tc.function?.arguments)
-              }
+      /**
+       * 逐事件写入而非整个 chunk 透传（与 anthropic streamPassthrough 同理）。
+       */
+      sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+      const lines = sseBuffer.split("\n")
+      sseBuffer = lines.pop()!
+      for (const line of lines) {
+        raw.write(line + "\n")
+        /** 空行 = SSE 事件结束边界，立即 flush */
+        if (line === "") raw.flushHeaders()
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue
+        try {
+          const obj = JSON.parse(line.slice(6))
+          const delta = obj.choices?.[0]?.delta
+          if (delta?.content) { onText?.(delta.content); outputChunks++ }
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              onToolCall?.(tc.index, tc.function?.name, tc.function?.arguments)
             }
-            if (obj.usage) {
-              onTokenUsage?.(obj.usage.prompt_tokens ?? 0, obj.usage.completion_tokens ?? 0)
-            }
-          } catch { /* skip */ }
-        }
+          }
+          if (obj.usage) {
+            hasUsageReport = true
+            onTokenUsage?.(obj.usage.prompt_tokens ?? 0, obj.usage.completion_tokens ?? 0, obj.usage.prompt_tokens_details?.cached_tokens ?? 0)
+          }
+        } catch { /* skip */ }
       }
       return pump()
     }).catch((err) => {
@@ -433,6 +457,21 @@ function streamPassthroughOpenAI(
   }
 
   return pump()
+}
+
+/** 粗略估算 OpenAI 请求的 input token 数（chars / 4） */
+function estimateOpenAIInputTokens(body: OpenAIChatCompletionRequest): number {
+  let chars = 0
+  for (const msg of body.messages) {
+    if (typeof msg.content === "string") {
+      chars += msg.content.length
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if ("text" in part) chars += (part as { text: string }).text.length
+      }
+    }
+  }
+  return Math.ceil(chars / 4)
 }
 
 /** 提取最后一条 user 消息的文本 */

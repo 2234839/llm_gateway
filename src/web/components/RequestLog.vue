@@ -16,12 +16,16 @@ const limit = 50
 const hasMore = ref(true)
 const expandedId = ref<number | null>(null)
 
+/** 复制成功提示：显示后自动消失 */
+const copyToast = ref("")
+let copyToastTimer: ReturnType<typeof setTimeout> | null = null
 /** 筛选条件 */
 const filterModel = ref("")
 const filterStatus = ref("")
 const filterProvider = ref("")
 const filterKey = ref("")
 const filterGroup = ref("")
+const filterFallback = ref(false)
 const filterStartTime = ref("")
 const filterEndTime = ref("")
 
@@ -72,7 +76,7 @@ function disconnectSSE() {
 
 /** 仅在第一页且无筛选条件时自动刷新 */
 function scheduleRefresh() {
-  if (offset.value > 0 || filterModel.value || filterStatus.value || filterProvider.value || filterKey.value || filterGroup.value || filterStartTime.value || filterEndTime.value) return
+  if (offset.value > 0 || filterModel.value || filterStatus.value || filterProvider.value || filterKey.value || filterGroup.value || filterFallback.value || filterStartTime.value || filterEndTime.value) return
   if (refreshTimer) return
   refreshTimer = setTimeout(() => {
     refreshTimer = null
@@ -92,6 +96,7 @@ onMounted(async () => {
 onUnmounted(() => {
   disconnectSSE()
   if (refreshTimer) clearTimeout(refreshTimer)
+  if (copyToastTimer) clearTimeout(copyToastTimer)
 })
 
 /** KeepAlive deactivate：暂停 SSE 以节省资源 */
@@ -107,12 +112,13 @@ onActivated(() => {
 
 async function load() {
   loading.value = true
-  const params: { limit: number; offset: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; startTime?: string; endTime?: string } = { limit: limit + 1, offset: offset.value }
+  const params: { limit: number; offset: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; startTime?: string; endTime?: string; hasFallback?: boolean } = { limit: limit + 1, offset: offset.value }
   if (filterModel.value) params.model = filterModel.value
   if (filterProvider.value) params.providerId = filterProvider.value
   if (filterKey.value) params.apiKeyId = filterKey.value
   if (filterGroup.value) params.groupId = filterGroup.value
   if (filterStatus.value) params.status = filterStatus.value
+  if (filterFallback.value) params.hasFallback = true
   if (filterStartTime.value) params.startTime = new Date(filterStartTime.value).toISOString().replace("T", " ").slice(0, 19)
   if (filterEndTime.value) params.endTime = new Date(filterEndTime.value).toISOString().replace("T", " ").slice(0, 19)
   try {
@@ -146,6 +152,7 @@ function clearFilters() {
   filterProvider.value = ""
   filterKey.value = ""
   filterGroup.value = ""
+  filterFallback.value = false
   filterStartTime.value = ""
   filterEndTime.value = ""
   activeQuickRange.value = ""
@@ -264,12 +271,11 @@ function formatFallbackAttempts(raw: string | null): string {
   }
 }
 
-/** 复制文本到剪贴板 */
+/** 复制文本到剪贴板，成功后显示 toast 提示 */
 async function copyContent(text: string) {
   try {
     await navigator.clipboard.writeText(text)
   } catch {
-    /** Clipboard API 不可用时回退到 select + copy */
     const ta = document.createElement("textarea")
     ta.value = text
     ta.style.position = "fixed"
@@ -282,11 +288,15 @@ async function copyContent(text: string) {
       document.body.removeChild(ta)
     }
   }
+  copyToast.value = "Copied!"
+  if (copyToastTimer) clearTimeout(copyToastTimer)
+  copyToastTimer = setTimeout(() => { copyToast.value = "" }, 1500)
 }
 </script>
 
 <template>
   <div class="request-log">
+    <div v-if="copyToast" class="copy-toast">{{ copyToast }}</div>
     <div class="toolbar">
       <h2>{{ t('log.title') }}</h2>
       <button class="btn" @click="load">{{ t('log.refresh') }}</button>
@@ -319,6 +329,9 @@ async function copyContent(text: string) {
         <option value="4">4xx (Client Error)</option>
         <option value="5">5xx (Server Error)</option>
       </select>
+      <label class="filter-checkbox">
+        <input type="checkbox" v-model="filterFallback" @change="applyFilters" /> FB
+      </label>
       <input type="datetime-local" v-model="filterStartTime" class="filter-input filter-time" @change="applyFilters" />
       <span class="time-sep">~</span>
       <input type="datetime-local" v-model="filterEndTime" class="filter-input filter-time" @change="applyFilters" />
@@ -421,6 +434,27 @@ async function copyContent(text: string) {
 </template>
 
 <style scoped>
+.copy-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--primary);
+  color: #fff;
+  padding: 8px 20px;
+  border-radius: 6px;
+  font-size: 13px;
+  z-index: 100;
+  pointer-events: none;
+  animation: toast-fade 1.5s ease;
+}
+@keyframes toast-fade {
+  0% { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  15% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 .filter-bar {
   display: flex;
   gap: 8px;
@@ -441,6 +475,20 @@ async function copyContent(text: string) {
 .filter-input:focus {
   outline: none;
   border-color: var(--primary);
+}
+
+.filter-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.filter-checkbox input {
+  accent-color: var(--primary);
 }
 
 .filter-time {
@@ -602,5 +650,32 @@ th.sortable:hover {
   border-radius: 3px;
   cursor: help;
   vertical-align: middle;
+}
+
+@media (max-width: 768px) {
+  .filter-bar {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .filter-input {
+    min-width: 0;
+    flex: 1 1 140px;
+  }
+  .filter-select {
+    flex: 1 1 120px;
+    min-width: 0;
+  }
+  .filter-time {
+    flex: 1 1 140px;
+    width: auto;
+  }
+  .table {
+    display: block;
+    overflow-x: auto;
+    min-width: 700px;
+  }
+  .detail-summary {
+    gap: 8px;
+  }
 }
 </style>

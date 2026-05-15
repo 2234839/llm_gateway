@@ -133,7 +133,7 @@ export type AnthropicSSEEvent =
   | { type: "content_block_start"; index: number; content_block: { type: string; [key: string]: unknown } }
   | { type: "content_block_delta"; index: number; delta: AnthropicContentDelta }
   | { type: "content_block_stop"; index: number }
-  | { type: "message_delta"; delta: { stop_reason: AnthropicStopReason; stop_sequence: string | null }; usage: { output_tokens: number } }
+  | { type: "message_delta"; delta: { stop_reason: AnthropicStopReason; stop_sequence: string | null }; usage: { output_tokens: number; input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }
   | { type: "message_stop" }
   | { type: "ping" }
   | { type: "error"; error: { type: string; message: string } }
@@ -255,6 +255,10 @@ export interface OpenAIUsage {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  prompt_tokens_details?: {
+    /** 已缓存命中的 token 数 */
+    cached_tokens?: number
+  }
   /** Anthropic 扩展：cache 写入 token 数 */
   cache_creation_input_tokens?: number
   /** Anthropic 扩展：cache 读取 token 数 */
@@ -399,9 +403,9 @@ export interface Provider {
   readonly baseUrl: string
   readonly apiKey: string
 
-  sendRequest(body: Record<string, unknown>, headers: Record<string, string>): Promise<Response>
+  sendRequest(body: Record<string, unknown>, headers: Record<string, string>, signal?: AbortSignal): Promise<Response>
 
-  sendStreamRequest(body: Record<string, unknown>, headers: Record<string, string>): Promise<Response>
+  sendStreamRequest(body: Record<string, unknown>, headers: Record<string, string>, signal?: AbortSignal): Promise<Response>
 }
 
 export interface RouteResult {

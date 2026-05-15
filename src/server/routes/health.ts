@@ -28,6 +28,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
       /** health 端点自身不应崩溃，返回降级响应 */
       return {
         status: "degraded",
+        version: process.env.GATEWAY_VERSION ?? "dev",
         uptime: process.uptime(),
         error: (err as Error).message,
       }

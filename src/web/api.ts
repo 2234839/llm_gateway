@@ -200,7 +200,7 @@ export const routeApi = {
 }
 
 export const logApi = {
-  list: (options?: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string }) => {
+  list: (options?: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: boolean }) => {
     const params = new URLSearchParams()
     if (options?.limit) params.set("limit", String(options.limit))
     if (options?.offset) params.set("offset", String(options.offset))
@@ -212,6 +212,7 @@ export const logApi = {
     if (options?.sort) params.set("sort", options.sort)
     if (options?.startTime) params.set("startTime", options.startTime)
     if (options?.endTime) params.set("endTime", options.endTime)
+    if (options?.hasFallback) params.set("hasFallback", "1")
     return api<LogEntry[]>(`/admin/logs?${params}`)
   },
   detail: (id: number) => api<LogEntry>(`/admin/logs/${id}`),
@@ -330,6 +331,8 @@ export interface SseRequestStatsEvent {
   byProvider: { providerId: string; providerName: string; total: number; today: number }[]
   byModel: { model: string; targetModel: string; total: number; today: number }[]
   tokenStats?: { total: TokenStats; today: TokenStats }
+  tokensByProvider?: { providerId: string; providerName: string; total: TokenStats; today: TokenStats }[]
+  tokensByModel?: { model: string; targetModel: string; total: TokenStats; today: TokenStats }[]
 }
 
 export type SseEvent =

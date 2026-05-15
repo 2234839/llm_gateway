@@ -20,8 +20,9 @@ export async function streamOpenAIToAnthropic(
   inputTokens: number,
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
-  onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number) => void,
+  onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
+  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -38,6 +39,7 @@ export async function streamOpenAIToAnthropic(
   const toolCallMap = new Map<number, ToolCallState>()
   let outputTokens = 0
   let realInputTokens = inputTokens
+  let cacheReadTokens = 0
   let started = false
   let finished = false
 
@@ -45,8 +47,14 @@ export async function streamOpenAIToAnthropic(
   const decoder = new TextDecoder()
   let buffer = ""
 
+  /** 客户端断连时主动取消上游 reader */
+  if (signal) {
+    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+  }
+
   function writeEvent(event: string, data: unknown) {
     raw.write(formatSSE(event, data))
+    raw.flushHeaders()
   }
 
   function startMessage() {
@@ -171,6 +179,7 @@ export async function streamOpenAIToAnthropic(
         if (chunk.usage) {
           outputTokens = chunk.usage.completion_tokens ?? outputTokens
           if (chunk.usage.prompt_tokens) realInputTokens = chunk.usage.prompt_tokens
+          if (chunk.usage.prompt_tokens_details?.cached_tokens) cacheReadTokens = chunk.usage.prompt_tokens_details.cached_tokens
         }
 
         if (!choice) continue
@@ -243,7 +252,7 @@ export async function streamOpenAIToAnthropic(
     if (!started && raw.writable) startMessage()
     if (raw.writable) finish("end_turn", { type: "api_error", message: errMsg })
   } finally {
-    onTokenUsage?.(realInputTokens, outputTokens)
+    onTokenUsage?.(realInputTokens, outputTokens, cacheReadTokens)
     if (raw.writable) raw.end()
   }
 }

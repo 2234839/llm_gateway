@@ -44,14 +44,16 @@ export class AnthropicProvider implements Provider {
     return merged
   }
 
-  async sendRequest(body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Response> {
+  async sendRequest(body: Record<string, unknown>, headers: Record<string, string> = {}, signal?: AbortSignal): Promise<Response> {
     const url = `${this.baseUrl}/v1/messages`
+    const signals: AbortSignal[] = [AbortSignal.timeout(this.timeout)]
+    if (signal) signals.push(signal)
     try {
       const resp = await fetch(url, {
         method: "POST",
         headers: this.buildHeaders(headers),
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeout),
+        signal: AbortSignal.any(signals),
       })
       return resp
     } catch (err) {
@@ -59,18 +61,22 @@ export class AnthropicProvider implements Provider {
     }
   }
 
-  async sendStreamRequest(body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Response> {
+  async sendStreamRequest(body: Record<string, unknown>, headers: Record<string, string> = {}, signal?: AbortSignal): Promise<Response> {
     const url = `${this.baseUrl}/v1/messages`
     /** 流式请求：timeout 仅应用于获取初始响应（headers），不覆盖整个流生命周期 */
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeout)
+    /** 外部 signal（客户端断连）同时中断 fetch */
+    if (signal) signal.addEventListener("abort", () => controller.abort(), { once: true })
     try {
       const resp = await fetch(url, {
         method: "POST",
-        headers: this.buildHeaders(headers),
+        headers: { ...this.buildHeaders(headers), "Accept-Encoding": "identity" },
         body: JSON.stringify({ ...body, stream: true }),
         signal: controller.signal,
-      })
+        /** Bun 默认自动解压 gzip 响应，会缓冲 SSE chunk 导致流式输出"一次性出来" */
+        decompress: false,
+      } as RequestInit & { decompress: boolean })
       clearTimeout(timer)
       return resp
     } catch (err) {
