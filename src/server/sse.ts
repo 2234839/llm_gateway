@@ -45,6 +45,9 @@ export function parseSSEBuffer(buffer: string): { events: SSEParsedEvent[]; rema
       const dataStr = line.slice(5).trim()
       if (dataStr === "[DONE]") {
         currentEvent.data = "[DONE]"
+      } else if (currentEvent.data && currentEvent.data !== "[DONE]") {
+        /** SSE 规范：多个 data: 行用换行拼接 */
+        currentEvent.data += "\n" + dataStr
       } else {
         currentEvent.data = dataStr
       }
@@ -68,26 +71,34 @@ export interface SSEParsedEvent {
 /** 解析 Anthropic SSE 事件数据为类型化对象 */
 export function parseAnthropicEvent(parsed: SSEParsedEvent): AnthropicSSEEvent | null {
   if (parsed.event === "ping") return { type: "ping" }
-  if (parsed.event === "error") {
-    return { type: "error", error: JSON.parse(parsed.data).error }
-  }
+  try {
+    if (parsed.event === "error") {
+      return { type: "error", error: JSON.parse(parsed.data).error }
+    }
 
-  const data = JSON.parse(parsed.data)
-  switch (parsed.event) {
-    case "message_start":
-    case "content_block_start":
-    case "content_block_delta":
-    case "content_block_stop":
-    case "message_delta":
-    case "message_stop":
-      return data as AnthropicSSEEvent
-    default:
-      return null
+    const data = JSON.parse(parsed.data)
+    switch (parsed.event) {
+      case "message_start":
+      case "content_block_start":
+      case "content_block_delta":
+      case "content_block_stop":
+      case "message_delta":
+      case "message_stop":
+        return data as AnthropicSSEEvent
+      default:
+        return null
+    }
+  } catch {
+    return null
   }
 }
 
 /** 解析 OpenAI SSE 数据为 StreamChunk */
 export function parseOpenAIChunk(parsed: SSEParsedEvent): OpenAIStreamChunk | "DONE" | null {
   if (parsed.data === "[DONE]") return "DONE"
-  return JSON.parse(parsed.data) as OpenAIStreamChunk
+  try {
+    return JSON.parse(parsed.data) as OpenAIStreamChunk
+  } catch {
+    return null
+  }
 }

@@ -13,7 +13,7 @@ export function convertResponseToOpenAI(
   let content: string | null = null
   const toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = []
 
-  for (const block of resp.content) {
+  for (const block of resp.content ?? []) {
     if (block.type === "text") {
       content = (content ?? "") + block.text
     } else if (block.type === "tool_use") {
@@ -25,6 +25,10 @@ export function convertResponseToOpenAI(
           arguments: JSON.stringify(block.input),
         },
       })
+    } else if (block.type === "thinking") {
+      content = (content ?? "") + `[thinking] ${block.thinking} [/thinking]\n`
+    } else if (block.type !== "redacted_thinking") {
+      console.warn(`[resp-to-openai] skipping unsupported content block type: ${(block as { type: string }).type}`)
     }
   }
 
@@ -47,9 +51,12 @@ export function convertResponseToOpenAI(
       finish_reason: mapStopReason(resp.stop_reason),
     }],
     usage: {
-      prompt_tokens: resp.usage.input_tokens,
-      completion_tokens: resp.usage.output_tokens,
-      total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+      prompt_tokens: resp.usage?.input_tokens ?? 0,
+      completion_tokens: resp.usage?.output_tokens ?? 0,
+      total_tokens: (resp.usage?.input_tokens ?? 0) + (resp.usage?.output_tokens ?? 0),
+      /** Anthropic 扩展字段，保留 cache token 信息 */
+      cache_creation_input_tokens: resp.usage?.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: resp.usage?.cache_read_input_tokens ?? 0,
     },
   }
 }
@@ -63,6 +70,10 @@ function mapStopReason(reason: string | null): OpenAIFinishReason {
     case "tool_use":
       return "tool_calls"
     case "stop_sequence":
+      return "stop"
+    case "refusal":
+      return "content_filter"
+    case "pause_turn":
       return "stop"
     default:
       return "stop"

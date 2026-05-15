@@ -6,7 +6,7 @@ import RouteRules from "./components/RouteRules.vue"
 import ApiKeyList from "./components/ApiKeyList.vue"
 import RequestLog from "./components/RequestLog.vue"
 import { t, currentLocale, setLocale } from "./i18n"
-import { initApi, configApi, authApi, ApiAuthError } from "./api"
+import { initApi, configApi, authApi, ApiAuthError, setOnAuthError } from "./api"
 import type { GatewayConfigInfo } from "./api"
 
 /** 应用状态：loading -> init | login | main */
@@ -21,7 +21,14 @@ const loginError = ref("")
 
 const gatewayConfig = ref<GatewayConfigInfo | null>(null)
 
+/** 修改密码表单 */
+const changePasswordMode = ref(false)
+const changePasswordForm = reactive({ newPassword: "", confirmPassword: "" })
+const changePasswordError = ref("")
+const changePasswordSuccess = ref(false)
+
 const activeTab = ref("dashboard")
+const appVersion = __APP_VERSION__
 const isDark = ref(true)
 const showSettings = ref(false)
 
@@ -35,9 +42,8 @@ watch(appState, (state) => {
     const saved = localStorage.getItem(LS_KEY_CREDENTIALS)
     if (saved) {
       try {
-        const { username, password } = JSON.parse(saved)
+        const { username } = JSON.parse(saved)
         loginForm.username = username ?? ""
-        loginForm.password = password ?? ""
         rememberMe.value = true
       } catch { /* ignore */ }
     }
@@ -86,9 +92,14 @@ const tabKeys = ["dashboard", "providers", "routes", "keys", "logs"]
 
 /** 启动时判断状态 */
 onMounted(async () => {
+  setOnAuthError(() => {
+    clearLoggedIn()
+    appState.value = "login"
+  })
   initTheme()
   document.documentElement.lang = currentLocale.value === "zh" ? "zh-CN" : "en"
   document.addEventListener("click", handleDocumentClick)
+  document.addEventListener("keydown", handleDocumentKeydown)
 
   /** 先读 localStorage 缓存，有则乐观显示主界面 */
   const cachedLoggedIn = localStorage.getItem(LS_KEY_LOGGED_IN) === "1"
@@ -126,13 +137,21 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  setOnAuthError(null)
   document.removeEventListener("click", handleDocumentClick)
+  document.removeEventListener("keydown", handleDocumentKeydown)
 })
 
-/** 点击外部关闭设置面板 */
+/** 点击外部或按 Escape 关闭设置面板 */
 function handleDocumentClick(e: MouseEvent) {
   const target = e.target as HTMLElement
   if (!target.closest(".settings-btn") && !target.closest(".settings-panel")) {
+    showSettings.value = false
+  }
+}
+
+function handleDocumentKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape" && showSettings.value) {
     showSettings.value = false
   }
 }
@@ -147,7 +166,7 @@ async function handleInit() {
     initError.value = t("init.errorPasswordMismatch")
     return
   }
-  if (initForm.password.length < 4) {
+  if (initForm.password.length < 8) {
     initError.value = t("init.errorPasswordLength")
     return
   }
@@ -180,7 +199,7 @@ async function handleLogin() {
     gatewayConfig.value = await configApi.get()
     /** 记住帐号 */
     if (rememberMe.value) {
-      localStorage.setItem(LS_KEY_CREDENTIALS, JSON.stringify({ username: loginForm.username, password: loginForm.password }))
+      localStorage.setItem(LS_KEY_CREDENTIALS, JSON.stringify({ username: loginForm.username }))
     } else {
       localStorage.removeItem(LS_KEY_CREDENTIALS)
     }
@@ -211,8 +230,38 @@ async function handleLogout() {
 async function toggleAuthRequired() {
   if (!gatewayConfig.value) return
   const newValue = !gatewayConfig.value.authRequired
-  await configApi.update({ authRequired: newValue })
-  gatewayConfig.value.authRequired = newValue
+  try {
+    await configApi.update({ authRequired: newValue })
+    gatewayConfig.value.authRequired = newValue
+  } catch {
+    /** 修改密码后 session 已失效，需要重新登录 */
+    clearLoggedIn()
+    appState.value = "login"
+  }
+}
+
+async function handleChangePassword() {
+  if (!changePasswordForm.newPassword || changePasswordForm.newPassword.length < 8) {
+    changePasswordError.value = t("init.errorPasswordLength")
+    return
+  }
+  if (changePasswordForm.newPassword !== changePasswordForm.confirmPassword) {
+    changePasswordError.value = t("init.errorPasswordMismatch")
+    return
+  }
+  try {
+    changePasswordError.value = ""
+    await configApi.update({ newPassword: changePasswordForm.newPassword })
+    changePasswordSuccess.value = true
+    changePasswordForm.newPassword = ""
+    changePasswordForm.confirmPassword = ""
+    setTimeout(() => {
+      changePasswordSuccess.value = false
+      changePasswordMode.value = false
+    }, 2000)
+  } catch (e: unknown) {
+    changePasswordError.value = e instanceof Error ? e.message : "Failed"
+  }
 }
 </script>
 
@@ -234,7 +283,7 @@ async function toggleAuthRequired() {
         </label>
         <label>
           <span>{{ t("init.password") }}</span>
-          <input v-model="initForm.password" type="password" :placeholder="t('init.errorPasswordLength')" @keyup.enter="handleInit" />
+          <input v-model="initForm.password" type="password" :placeholder="t('init.passwordPlaceholder')" @keyup.enter="handleInit" />
         </label>
         <label>
           <span>{{ t("init.confirmPassword") }}</span>
@@ -296,11 +345,28 @@ async function toggleAuthRequired() {
               <span>{{ t('settings.requireAuth') }}</span>
               <label class="toggle">
                 <input type="checkbox" :checked="gatewayConfig?.authRequired" @change="toggleAuthRequired">
-                <span class="slider"></span>
+                <span class="toggle-slider"></span>
               </label>
+            </div>
+            <div v-if="!changePasswordMode" class="settings-item">
+              <span>{{ t('settings.changePassword') }}</span>
+              <button class="btn-sm" @click="changePasswordMode = true; changePasswordSuccess = false">{{ t('settings.changeBtn') }}</button>
+            </div>
+            <div v-else class="settings-pw-form">
+              <input v-model="changePasswordForm.newPassword" type="password" :placeholder="t('settings.newPassword')" />
+              <input v-model="changePasswordForm.confirmPassword" type="password" :placeholder="t('settings.confirmNewPassword')" @keyup.enter="handleChangePassword" />
+              <div class="settings-pw-actions">
+                <button class="btn-sm btn-primary" @click="handleChangePassword">{{ t('provider.save') }}</button>
+                <button class="btn-sm" @click="changePasswordMode = false; changePasswordError = ''">{{ t('provider.cancel') }}</button>
+              </div>
+              <p v-if="changePasswordError" class="error-text">{{ changePasswordError }}</p>
+              <p v-if="changePasswordSuccess" class="success-text">{{ t('settings.passwordChanged') }}</p>
             </div>
             <div class="settings-item settings-hint">
               {{ t('settings.configFile') }}
+            </div>
+            <div class="settings-item settings-hint" style="border-top: none; margin-top: 0; padding-top: 4px;">
+              {{ appVersion }}
             </div>
           </div>
         </div>
@@ -315,11 +381,13 @@ async function toggleAuthRequired() {
     </header>
 
     <main class="main">
-      <Dashboard v-if="activeTab === 'dashboard'" />
-      <ProviderList v-else-if="activeTab === 'providers'" />
-      <RouteRules v-else-if="activeTab === 'routes'" />
-      <ApiKeyList v-else-if="activeTab === 'keys'" />
-      <RequestLog v-else-if="activeTab === 'logs'" />
+      <KeepAlive :max="5">
+        <Dashboard v-if="activeTab === 'dashboard'" />
+        <ProviderList v-else-if="activeTab === 'providers'" />
+        <RouteRules v-else-if="activeTab === 'routes'" />
+        <ApiKeyList v-else-if="activeTab === 'keys'" />
+        <RequestLog v-else-if="activeTab === 'logs'" />
+      </KeepAlive>
     </main>
   </div>
 </template>
@@ -465,48 +533,43 @@ async function toggleAuthRequired() {
   justify-content: flex-start;
 }
 
-/* Toggle 开关 */
-.toggle {
-  position: relative;
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  flex-shrink: 0;
+.settings-pw-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0;
 }
 
-.toggle input {
-  opacity: 0;
-  width: 0;
-  height: 0;
+.settings-pw-form input {
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 13px;
 }
 
-.toggle .slider {
-  position: absolute;
-  cursor: pointer;
-  inset: 0;
-  background: var(--border);
-  border-radius: 20px;
-  transition: 0.2s;
+.settings-pw-form input:focus {
+  outline: none;
+  border-color: var(--primary);
 }
 
-.toggle .slider::before {
-  content: "";
-  position: absolute;
-  height: 14px;
-  width: 14px;
-  left: 3px;
-  bottom: 3px;
-  background: var(--text-dim);
-  border-radius: 50%;
-  transition: 0.2s;
+.settings-pw-actions {
+  display: flex;
+  gap: 6px;
 }
 
-.toggle input:checked + .slider {
-  background: var(--primary);
+.success-text {
+  color: var(--ok);
+  font-size: 12px;
+  margin-top: 2px;
 }
 
-.toggle input:checked + .slider::before {
-  transform: translateX(16px);
-  background: #fff;
+.error-text {
+  color: var(--err);
+  font-size: 12px;
+  margin-top: 2px;
 }
+
+
 </style>

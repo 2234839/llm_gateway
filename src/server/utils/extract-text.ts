@@ -16,8 +16,9 @@ function extractOpenAIMessageText(msg: OpenAIChatCompletionRequest["messages"][n
       return msg.content
     case "user":
       if (typeof msg.content === "string") return msg.content
+      if (!msg.content) return ""
       return msg.content
-        .filter((part): part is { type: "text"; text: string } => part.type === "text" && "text" in part)
+        .filter((part): part is { type: "text"; text: string } => part.type === "text" && !!part.text)
         .map(part => part.text)
         .join("\n")
     case "assistant": {
@@ -31,7 +32,9 @@ function extractOpenAIMessageText(msg: OpenAIChatCompletionRequest["messages"][n
       return parts.join("\n")
     }
     case "tool":
-      return `[tool_result: ${msg.content}]`
+      return `[tool_result: ${msg.content ?? ""}]`
+    default:
+      return ""
   }
 }
 
@@ -54,12 +57,14 @@ export function extractAnthropicText(body: AnthropicMessagesRequest): string {
       for (const block of msg.content) {
         if (block.type === "text") {
           parts.push(block.text)
+        } else if (block.type === "thinking") {
+          parts.push(`[thinking] ${block.thinking} [/thinking]`)
         } else if (block.type === "tool_use") {
           parts.push(`[tool_call: ${block.name}(${JSON.stringify(block.input)})]`)
         } else if (block.type === "tool_result") {
           const resultText = typeof block.content === "string"
             ? block.content
-            : block.content.map(b => b.text).join("")
+            : block.content ? block.content.map(b => "text" in b ? b.text : "").join("") : ""
           parts.push(`[tool_result: ${resultText}]`)
         }
       }
@@ -92,7 +97,7 @@ export function extractAnthropicContentTypes(body: AnthropicMessagesRequest): Se
     if (typeof msg.content === "string") continue
     for (const block of msg.content) {
       if (block.type === "image") {
-        if (block.source.media_type.startsWith("application/")) {
+        if (block.source.type === "base64" && block.source.media_type.startsWith("application/")) {
           types.add("file")
         } else {
           types.add("image")
@@ -126,6 +131,8 @@ export function extractOpenAIContentTypes(body: OpenAIChatCompletionRequest): Se
         } else {
           types.add("image")
         }
+      } else if (part.type === "input_audio" && part.input_audio) {
+        types.add("audio")
       }
     }
   }
@@ -139,6 +146,8 @@ export function extractAnthropicResponseSummary(resp: AnthropicMessagesResponse)
   for (const block of resp.content) {
     if (block.type === "text") {
       parts.push(block.text)
+    } else if (block.type === "thinking") {
+      parts.push(`[thinking] ${block.thinking} [/thinking]`)
     } else if (block.type === "tool_use") {
       parts.push(`[tool_call: ${block.name}(${JSON.stringify(block.input)})]`)
     }

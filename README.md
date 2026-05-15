@@ -28,6 +28,7 @@ When your team has 10 people sharing LLM access, you need to answer:
 - **Content-aware routing**: keyword inclusion, regex matching, multimodal content type detection
 - **Group-based routing**: different API key groups can match different route rules
 - **Exclusion rules**: skip certain patterns with negative matching
+- **Fallback providers**: automatic failover to backup providers on 5xx/timeout
 - **Priority ordering**: rules evaluated top-down, first match wins
 
 ### Protocol Conversion
@@ -108,11 +109,11 @@ Point your client's API base URL to the gateway:
 
 ```bash
 # Anthropic protocol clients (e.g. Claude Code)
-export ANTHROPIC_BASE_URL=http://localhost:3827/anthropic
+export ANTHROPIC_BASE_URL=http://localhost:3827
 export ANTHROPIC_API_KEY=sk-your-gateway-key
 
 # OpenAI protocol clients (e.g. Cursor)
-export OPENAI_BASE_URL=http://localhost:3827/openai/v1
+export OPENAI_BASE_URL=http://localhost:3827/v1
 export OPENAI_API_KEY=sk-your-gateway-key
 ```
 
@@ -122,12 +123,16 @@ When API key auth is disabled (default), any key value works. Enable it in Setti
 
 ### Proxy Routes (for LLM clients)
 
+The gateway exposes both protocols at the root path — no prefix needed:
+
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/anthropic/v1/messages` | Anthropic Messages API proxy |
-| POST | `/openai/v1/chat/completions` | OpenAI Chat Completions API proxy |
-| GET | `/openai/v1/models` | Aggregated model list |
-| POST | `/anthropic/v1/messages/count_tokens` | Token count estimation |
+| POST | `/v1/messages` | Anthropic Messages API proxy |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions API proxy |
+| GET | `/v1/models` | Aggregated model list (both formats) |
+| POST | `/v1/messages/count_tokens` | Token count estimation |
+
+Legacy prefixed paths (`/anthropic/*`, `/openai/*`) are also supported for backward compatibility.
 
 ### Admin Routes
 

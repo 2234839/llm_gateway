@@ -37,14 +37,19 @@ const sessions = new Map<string, { username: string; expiresAt: number }>()
 /** Session 有效期：7 天 */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
-/** 创建 session，返回 token */
-export function createSession(username: string): string {
-  /** 清理过期 session */
+/** 定期清理过期 session（每小时一次） */
+const SESSION_CLEANUP_MS = 60 * 60 * 1000
+function cleanupExpiredSessions() {
   const now = Date.now()
   for (const [token, session] of sessions) {
     if (session.expiresAt < now) sessions.delete(token)
   }
+}
+setInterval(cleanupExpiredSessions, SESSION_CLEANUP_MS).unref()
 
+/** 创建 session，返回 token */
+export function createSession(username: string): string {
+  const now = Date.now()
   const token = generateSessionToken()
   sessions.set(token, { username, expiresAt: now + SESSION_TTL_MS })
   return token
@@ -66,6 +71,11 @@ export function destroySession(token: string): void {
   sessions.delete(token)
 }
 
+/** 销毁所有 session（修改密码后调用） */
+export function destroyAllSessions(): void {
+  sessions.clear()
+}
+
 /** 从 cookie 中提取 admin_token */
 export function extractSessionToken(headers: Record<string, string | string[] | undefined>): string | null {
   const cookie = headers["cookie"]
@@ -78,6 +88,33 @@ export function extractSessionToken(headers: Record<string, string | string[] | 
   }
   return null
 }
+
+/** API Key 内存缓存：hash -> { context, expiresAt } */
+const keyCache = new Map<string, { context: AuthContext; expiresAt: number }>()
+/** 缓存有效期：30 秒（平衡实时性与性能） */
+const KEY_CACHE_TTL_MS = 30_000
+
+/** 清除指定 keyId 的缓存（key 被禁用/删除/修改时调用） */
+export function invalidateKeyCache(keyId: string) {
+  for (const [hash, entry] of keyCache) {
+    if (entry.context.keyId === keyId) {
+      keyCache.delete(hash)
+    }
+  }
+}
+
+/** 清除所有 key 缓存（group 被修改时调用） */
+export function invalidateAllKeyCache() {
+  keyCache.clear()
+}
+
+/** 定期清理过期的 API Key 缓存条目（每 60 秒） */
+setInterval(() => {
+  const now = Date.now()
+  for (const [hash, entry] of keyCache) {
+    if (entry.expiresAt < now) keyCache.delete(hash)
+  }
+}, 60_000).unref()
 
 /** API 路由认证钩子工厂 */
 export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
@@ -98,6 +135,16 @@ export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
 
     /** 查找 Key */
     const hash = sha256(rawKey)
+
+    /** 检查缓存 */
+    const cached = keyCache.get(hash)
+    if (cached && cached.expiresAt > Date.now()) {
+      request.authContext = cached.context
+      /** 缓存命中时概率性更新 last_used_at，减少高频请求下的 DB 写入 */
+      if (Math.random() < 0.1) db.updateKeyLastUsed(cached.context.keyId)
+      return
+    }
+
     const keyRecord = db.getApiKeyByHash(hash)
     if (!keyRecord || !keyRecord.enabled) {
       return reply.status(401).send({
@@ -109,14 +156,21 @@ export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
     /** 解析分组 */
     const group = db.getKeyGroup(keyRecord.groupId)
 
-    request.authContext = {
+    const context = {
       keyId: keyRecord.id,
       groupId: keyRecord.groupId,
       groupName: group?.name ?? "",
       keyName: keyRecord.name,
+      keyLimits: { dailyTokenLimit: keyRecord.dailyTokenLimit, monthlyTokenLimit: keyRecord.monthlyTokenLimit, rpmLimit: keyRecord.rpmLimit },
+      groupLimits: { dailyTokenLimit: group?.dailyTokenLimit ?? 0, monthlyTokenLimit: group?.monthlyTokenLimit ?? 0, rpmLimit: group?.rpmLimit ?? 0 },
     } satisfies AuthContext
 
-    /** 更新最后使用时间（异步，不阻塞请求） */
+    request.authContext = context
+
+    /** 写入缓存 */
+    keyCache.set(hash, { context, expiresAt: Date.now() + KEY_CACHE_TTL_MS })
+
+    /** 更新最后使用时间 */
     db.updateKeyLastUsed(keyRecord.id)
   }
 }

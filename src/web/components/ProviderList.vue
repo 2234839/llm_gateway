@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue"
+import { ref, computed, onMounted } from "vue"
 import { providerApi, type ProviderInfo, type ProviderTestResult } from "../api"
 import { t } from "../i18n"
+
+const error = ref("")
 
 const providers = ref<ProviderInfo[]>([])
 const loading = ref(true)
@@ -16,6 +18,8 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
   models: [],
   enabled: true,
   maxConcurrency: 0,
+  requestTimeout: 0,
+  customHeaders: {},
 }
 
 const form = ref({ ...emptyProvider })
@@ -24,31 +28,66 @@ const form = ref({ ...emptyProvider })
 const testing = ref(false)
 const testResult = ref<ProviderTestResult | null>(null)
 
+/** 批量健康检查结果：providerId -> TestResult */
+const healthMap = ref<Map<string, ProviderTestResult & { checking?: boolean }>>(new Map())
+
+/** 安全获取 provider 健康检查状态 */
+function getHealth(id: string) {
+  return healthMap.value.get(id)
+}
+
 /** 模型输入框临时值 */
 const modelInput = ref("")
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  checkAllHealth()
+})
 
 async function load() {
   loading.value = true
-  providers.value = await providerApi.list()
+  error.value = ""
+  try {
+    providers.value = await providerApi.list()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Failed to load"
+  }
   loading.value = false
+}
+
+/** 并行检查所有启用 provider 的连通性 */
+async function checkAllHealth() {
+  const enabled = providers.value.filter(p => p.enabled)
+  /** 清理已不存在的 provider 的健康检查结果 */
+  const activeIds = new Set(enabled.map(p => p.id))
+  for (const id of healthMap.value.keys()) {
+    if (!activeIds.has(id)) healthMap.value.delete(id)
+  }
+  const checks = enabled.map(async (p) => {
+    healthMap.value.set(p.id, { success: false, statusCode: 0, duration: 0, checking: true })
+    const result = await providerApi.testById(p.id)
+    healthMap.value.set(p.id, { ...result, checking: false })
+  })
+  await Promise.allSettled(checks)
 }
 
 function startEdit(p: ProviderInfo) {
   editing.value = p
-  form.value = { ...p }
+  /** apiKey 已脱敏，编辑时清空并用 placeholder 提示 */
+  form.value = { ...p, apiKey: "", customHeaders: { ...(p.customHeaders ?? {}) } }
   creating.value = false
   testResult.value = null
   modelInput.value = ""
+  syncHeadersFromForm()
 }
 
 function startCreate() {
   editing.value = null
   creating.value = true
-  form.value = { ...emptyProvider }
+  form.value = { ...emptyProvider, customHeaders: {} }
   testResult.value = null
   modelInput.value = ""
+  headerEntries.value = []
 }
 
 function cancel() {
@@ -59,32 +98,65 @@ function cancel() {
 }
 
 async function save() {
-  if (creating.value) {
-    await providerApi.create(form.value)
-  } else if (editing.value) {
-    await providerApi.update(editing.value.id, form.value)
+  error.value = ""
+  if (!form.value.name.trim()) { error.value = t('provider.errorNameRequired'); return }
+  if (!form.value.baseUrl.trim()) { error.value = t('provider.errorUrlRequired'); return }
+  /** 创建时 apiKey 必填，编辑时为空表示不修改 */
+  if (creating.value && !form.value.apiKey.trim()) { error.value = t('provider.errorKeyRequired'); return }
+  if (form.value.models.length === 0) { error.value = t('provider.errorModelRequired'); return }
+  /** 防止 v-model.number 清空后产生 NaN */
+  if (Number.isNaN(form.value.maxConcurrency)) form.value.maxConcurrency = 0
+  if (Number.isNaN(form.value.requestTimeout)) form.value.requestTimeout = 0
+  try {
+    if (creating.value) {
+      await providerApi.create(form.value)
+    } else if (editing.value) {
+      /** 编辑时只发送非空字段 */
+      const data: Partial<typeof form.value> = { ...form.value }
+      if (!data.apiKey?.trim()) delete data.apiKey
+      await providerApi.update(editing.value.id, data)
+    }
+    cancel()
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Save failed"
   }
-  cancel()
-  await load()
 }
 
 async function remove(id: string) {
-  await providerApi.delete(id)
-  await load()
+  const provider = providers.value.find(p => p.id === id)
+  if (!confirm(t('provider.deleteConfirm', { name: provider?.name ?? '' }))) return
+  error.value = ""
+  try {
+    await providerApi.delete(id)
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : t('provider.deleteFailed')
+  }
 }
 
 async function toggleEnabled(p: ProviderInfo) {
-  await providerApi.update(p.id, { enabled: !p.enabled })
-  await load()
+  error.value = ""
+  try {
+    await providerApi.update(p.id, { enabled: !p.enabled })
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Update failed"
+  }
 }
 
 async function testConnection() {
   testing.value = true
   testResult.value = null
-  const data = creating.value || !editing.value
-    ? { baseUrl: form.value.baseUrl, apiKey: form.value.apiKey, type: form.value.type, customHeaders: form.value.customHeaders }
-    : { baseUrl: form.value.baseUrl, apiKey: form.value.apiKey, type: form.value.type, customHeaders: form.value.customHeaders }
-  testResult.value = await providerApi.test(data)
+  error.value = ""
+  /** 使用第一个配置的模型作为测试模型（Anthropic 类型会用到） */
+  const testModel = form.value.models[0] || undefined
+  const data = { baseUrl: form.value.baseUrl, apiKey: form.value.apiKey, type: form.value.type, model: testModel, customHeaders: form.value.customHeaders }
+  try {
+    testResult.value = await providerApi.test(data)
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Test failed"
+  }
   testing.value = false
 }
 
@@ -109,6 +181,40 @@ const typeOptions = [
   { value: "azure-openai", label: "Azure OpenAI" },
   { value: "custom", label: "Custom (OpenAI-compatible)" },
 ]
+
+const urlPlaceholders: Record<string, string> = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com",
+  "azure-openai": "https://YOUR_RESOURCE.openai.azure.com",
+  custom: "https://your-provider.example.com/v1",
+}
+
+const urlPlaceholder = computed(() => urlPlaceholders[form.value.type] ?? urlPlaceholders.custom)
+
+/** 自定义 Headers 编辑 */
+const headerEntries = ref<{ key: string; value: string }[]>([])
+
+function syncHeadersFromForm() {
+  const h = form.value.customHeaders ?? {}
+  headerEntries.value = Object.entries(h).map(([key, value]) => ({ key, value }))
+}
+
+function syncHeadersToForm() {
+  const h: Record<string, string> = {}
+  for (const e of headerEntries.value) {
+    if (e.key.trim()) h[e.key.trim()] = e.value.trim()
+  }
+  form.value.customHeaders = h
+}
+
+function addHeader() {
+  headerEntries.value.push({ key: "", value: "" })
+}
+
+function removeHeader(index: number) {
+  headerEntries.value.splice(index, 1)
+  syncHeadersToForm()
+}
 </script>
 
 <template>
@@ -119,6 +225,8 @@ const typeOptions = [
     </div>
 
     <div v-if="loading" class="loading">{{ t('provider.loading') }}</div>
+
+    <p v-if="error" class="error-text">{{ error }}</p>
 
     <div v-else>
       <table class="table" v-if="!creating && !editing">
@@ -134,11 +242,16 @@ const typeOptions = [
         </thead>
         <tbody>
           <tr v-for="p in providers" :key="p.id">
-            <td>{{ p.name }}</td>
+            <td>
+              <span v-if="p.enabled && getHealth(p.id)" :class="['health-dot', getHealth(p.id)!.checking ? 'checking' : getHealth(p.id)!.success ? 'ok' : 'err']" :title="getHealth(p.id)!.checking ? t('provider.healthChecking') : getHealth(p.id)!.success ? `${t('provider.healthOk')} (${getHealth(p.id)!.duration}ms)` : `${t('provider.healthFail')} ${getHealth(p.id)!.statusCode}`"></span>
+              <span v-else-if="!p.enabled" class="health-dot disabled"></span>
+              {{ p.name }}
+            </td>
             <td><span class="badge">{{ p.type }}</span></td>
             <td class="mono">{{ p.baseUrl }}</td>
             <td>
-              <span v-for="m in p.models" :key="m" class="model-tag">{{ m }}</span>
+              <span v-for="m in p.models.slice(0, 3)" :key="m" class="model-tag">{{ m }}</span>
+              <span v-if="p.models.length > 3" class="model-tag model-more" :title="p.models.slice(3).join(', ')">+{{ p.models.length - 3 }}</span>
             </td>
             <td>{{ p.maxConcurrency || t('provider.unlimited') }}</td>
             <td colspan="2">
@@ -154,6 +267,8 @@ const typeOptions = [
           </tr>
         </tbody>
       </table>
+
+      <div v-if="providers.length === 0 && !creating && !editing" class="empty">{{ t('provider.noProviders') }}</div>
 
       <div v-if="creating || editing" class="form-card">
         <h3>{{ creating ? t('provider.addTitle') : t('provider.editTitle') }}</h3>
@@ -172,11 +287,11 @@ const typeOptions = [
           </label>
           <label class="span-2">
             {{ t('provider.urlLabel') }}
-            <input v-model="form.baseUrl" placeholder="https://api.openai.com/v1" class="mono" />
+            <input v-model="form.baseUrl" :placeholder="urlPlaceholder" class="mono" />
           </label>
           <label class="span-2">
             {{ t('provider.apiKeyLabel') }}
-            <input v-model="form.apiKey" type="password" :placeholder="t('provider.apiKeyPlaceholder')" />
+            <input v-model="form.apiKey" type="password" :placeholder="editing ? t('provider.apiKeyEditHint') : t('provider.apiKeyPlaceholder')" />
           </label>
           <label class="span-2">
             {{ t('provider.modelLabel') }}
@@ -202,9 +317,25 @@ const typeOptions = [
             <input v-model.number="form.maxConcurrency" type="number" min="0" :placeholder="t('provider.concurrencyPlaceholder')" />
           </label>
           <label>
+            {{ t('provider.timeoutLabel') }}
+            <input v-model.number="form.requestTimeout" type="number" min="0" :placeholder="t('provider.timeoutPlaceholder')" />
+          </label>
+          <label>
             {{ t('provider.enabledLabel') }}
             <input type="checkbox" v-model="form.enabled" />
           </label>
+        </div>
+
+        <!-- 自定义 Headers -->
+        <div class="headers-section">
+          <div class="section-label">{{ t('provider.customHeadersLabel') }}</div>
+          <p class="section-hint">{{ t('provider.customHeadersHint') }}</p>
+          <div v-for="(entry, i) in headerEntries" :key="i" class="header-row">
+            <input v-model="entry.key" :placeholder="t('provider.headerKeyPlaceholder')" class="header-key" @input="syncHeadersToForm" />
+            <input v-model="entry.value" :placeholder="t('provider.headerValuePlaceholder')" class="header-value" @input="syncHeadersToForm" />
+            <button class="btn-sm btn-danger" type="button" @click="removeHeader(i)">&times;</button>
+          </div>
+          <button class="btn-sm" type="button" @click="addHeader">{{ t('provider.addHeader') }}</button>
         </div>
 
         <div v-if="testResult" :class="['test-result', { success: testResult.success, fail: !testResult.success }]">
@@ -232,49 +363,6 @@ const typeOptions = [
   gap: 8px;
 }
 
-/** Toggle 开关 */
-.toggle {
-  position: relative;
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  cursor: pointer;
-}
-
-.toggle input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-
-.toggle-slider {
-  position: absolute;
-  inset: 0;
-  background: var(--border);
-  border-radius: 10px;
-  transition: background 0.2s;
-}
-
-.toggle-slider::before {
-  content: "";
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  left: 2px;
-  top: 2px;
-  background: var(--text-dim);
-  border-radius: 50%;
-  transition: transform 0.2s, background 0.2s;
-}
-
-.toggle input:checked + .toggle-slider {
-  background: var(--primary);
-}
-
-.toggle input:checked + .toggle-slider::before {
-  transform: translateX(16px);
-  background: #fff;
-}
 
 .model-input-row {
   display: flex;
@@ -330,5 +418,69 @@ const typeOptions = [
   background: var(--test-fail-bg);
   color: var(--test-fail);
   border: 1px solid var(--test-fail-border);
+}
+
+.health-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.health-dot.ok { background: var(--ok); }
+.health-dot.err { background: var(--err); }
+.health-dot.checking { background: var(--text-dim); animation: pulse 1s infinite; }
+.health-dot.disabled { background: var(--border); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.headers-section {
+  margin-top: 12px;
+}
+
+.section-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.section-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+
+.header-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.header-key {
+  width: 200px;
+  font-family: var(--mono);
+}
+
+.header-value {
+  flex: 1;
+}
+
+.error-text {
+  color: var(--err);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.empty {
+  text-align: center;
+  padding: 40px 0;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 </style>

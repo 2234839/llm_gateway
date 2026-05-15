@@ -1,20 +1,37 @@
 import type { FastifyInstance } from "fastify"
-import type { AnthropicMessagesRequest, AnthropicErrorResponse, AuthContext } from "../types.ts"
+import type { AnthropicMessagesRequest, AnthropicErrorResponse, Provider, ProviderConfig } from "../types.ts"
 import { convertRequestToOpenAI } from "../converters/to-openai.ts"
 import { convertResponseToAnthropic } from "../converters/resp-to-anthropic.ts"
 import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
 import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropicContentTypes } from "../utils/extract-text.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
-import { checkQuota } from "../quota.ts"
+import { checkQuota, recordRpmRequest } from "../quota.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
   fastify.post("/v1/messages", async (request, reply) => {
     const body = request.body as AnthropicMessagesRequest
     const model = body.model
+    if (!model) {
+      return reply.status(400).send({
+        type: "error",
+        error: { type: "invalid_request_error", message: "model is required" },
+      } satisfies AnthropicErrorResponse)
+    }
+    if (!body.max_tokens || body.max_tokens < 1) {
+      return reply.status(400).send({
+        type: "error",
+        error: { type: "invalid_request_error", message: "max_tokens: must be ≥ 1" },
+      } satisfies AnthropicErrorResponse)
+    }
     const startTime = Date.now()
     console.log(`[anthropic] Received request for model: ${model}`)
+
+    /** 生成网关级别的 request-id，附加到响应 header */
+    const gatewayRequestId = `gw_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
+    reply.header("request-id", gatewayRequestId)
+    reply.header("x-gateway-request-id", gatewayRequestId)
 
     /** 提取上游 headers（需要透传的） */
     const upstreamHeaders: Record<string, string> = {}
@@ -25,7 +42,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let providerId = ""
     let targetModel = ""
     let providerName = ""
-    let statusCode = 200
+    let statusCode = 0
     let errorMsg: string | null = null
     let inputTokens = 0
     let outputTokens = 0
@@ -33,156 +50,169 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let cacheReadTokens = 0
     let outputText = ""
     let fullMessageText = ""
+    /** fallback 中间尝试记录 */
+    const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
     const reqId = nextReqId()
-    const auth = (request as any).authContext as AuthContext | null
+    const auth = request.authContext
 
     /** 提取输入摘要：最后一条 user 消息 */
     const inputSummary = extractLastAnthropicUserMessage(body) ?? model
 
+    /** 流式文本批量缓冲：每 100ms 或请求结束时刷新，减少 SSE 事件频率 */
+    let streamBuffer = ""
+    let streamTimer: ReturnType<typeof setTimeout> | null = null
+    const flushStreamBuffer = () => {
+      streamTimer = null
+      if (streamBuffer) {
+        emitEvent({ type: "request_stream", requestId: reqId, text: streamBuffer })
+        streamBuffer = ""
+      }
+    }
     const collectStreamText = (text: string) => {
       outputText += text
-      if (isStream) emitEvent({ type: "request_stream", requestId: reqId, text })
+      if (isStream) {
+        streamBuffer += text
+        if (!streamTimer) streamTimer = setTimeout(flushStreamBuffer, 100)
+      }
     }
     const collectStreamToolCall = (name: string, input: string) => { outputText += (outputText ? "\n" : "") + `[tool_call: ${name}(${input})]` }
+
+    /** 流式传输中途出错时设置错误信息用于日志记录 */
+    const setStreamError = (err: string) => {
+      errorMsg = err
+      statusCode = 502
+    }
 
     /** 配额检查 */
     if (auth) {
       const quotaResult = checkQuota(fastify.db, auth)
       if (!quotaResult.allowed) {
+        if (quotaResult.retryAfterMs) reply.header("Retry-After", Math.ceil(quotaResult.retryAfterMs / 1000))
         return reply.status(429).send({
           type: "error",
           error: { type: "rate_limit_error", message: quotaResult.reason! },
         } satisfies AnthropicErrorResponse)
       }
+      recordRpmRequest(auth.keyId, auth.keyLimits.rpmLimit, auth.groupLimits.rpmLimit)
     }
 
     try {
       const messageText = extractAnthropicText(body)
       fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
-      providerId = providerConfig.id
-      targetModel = tm
-      providerName = providerConfig.name
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
 
-      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerName, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
+      /** 附加路由调试 header */
+      reply.header("x-gateway-provider", providerConfig.name)
+      reply.header("x-gateway-model", tm)
 
-      const semaphore = fastify.registry.getSemaphore(providerConfig.id)
-      await semaphore?.acquire()
-      emitEvent({ type: "upstream_start", requestId: reqId, providerId })
-      try {
-        if (provider.type === "anthropic") {
-          /** Anthropic 直连 — 透传 */
-          if (isStream) {
-            const upstream = await provider.sendStreamRequest(
-              { ...body, model: targetModel },
-              upstreamHeaders,
-            )
+      /** 构建尝试列表：主 provider + fallbacks */
+      const candidates: { provider: Provider; providerConfig: ProviderConfig; targetModel: string }[] = [
+        { provider, providerConfig, targetModel: tm },
+      ]
+      for (const fb of fallbacks) {
+        const fbProvider = fastify.registry.getProvider(fb.providerId)
+        const fbConfig = fastify.registry.getProviderConfig(fb.providerId)
+        if (fbProvider && fbConfig) {
+          candidates.push({ provider: fbProvider, providerConfig: fbConfig, targetModel: fb.targetModel || tm })
+        }
+      }
 
-            if (!upstream.ok) {
-              const errBody = await upstream.text()
-              statusCode = upstream.status
-              errorMsg = errBody
-              reply.status(upstream.status)
-              return reply.send(errBody)
-            }
+      emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerConfig.name, providerId: providerConfig.id, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
 
-            reply.hijack()
-            return await streamPassthrough(upstream.body!, reply.raw, collectStreamText, collectStreamToolCall, (tu) => {
-              inputTokens = tu.inputTokens
-              outputTokens = tu.outputTokens
-              cacheCreationTokens = tu.cacheCreationTokens
-              cacheReadTokens = tu.cacheReadTokens
-            })
-          }
+      /** 依次尝试每个候选 provider，直到成功 */
+      let lastError: string | null = null
+      for (let attempt = 0; attempt < candidates.length; attempt++) {
+        const { provider: currentProvider, providerConfig: currentConfig, targetModel: currentTarget } = candidates[attempt]!
 
-          const upstream = await provider.sendRequest(
-            { ...body, model: targetModel },
-            upstreamHeaders,
-          )
+        providerId = currentConfig.id
+        targetModel = currentTarget
+        providerName = currentConfig.name
 
-          if (!upstream.ok) {
-            const errBody = await upstream.text()
-            statusCode = upstream.status
-            errorMsg = errBody
-            reply.status(upstream.status)
-            return reply.send(errBody)
-          }
-
-          const respBody = await upstream.json()
-          const respUsage = (respBody as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
-          inputTokens = respUsage?.input_tokens ?? 0
-          outputTokens = respUsage?.output_tokens ?? 0
-          cacheCreationTokens = respUsage?.cache_creation_input_tokens ?? 0
-          cacheReadTokens = respUsage?.cache_read_input_tokens ?? 0
-          outputText = extractAnthropicResponseSummary(respBody as import("../types.ts").AnthropicMessagesResponse)
-          return reply.send(respBody)
+        if (attempt > 0) {
+          console.log(`[anthropic] Fallback #${attempt} → ${providerName} / ${targetModel}`)
         }
 
-        /** 非 Anthropic 提供商 — 转换格式 */
-        const openaiBody = convertRequestToOpenAI(body, targetModel)
-
-        if (isStream) {
-          const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {})
-
-          if (!upstream.ok) {
-            const errBody = await upstream.text()
-            statusCode = upstream.status
-            errorMsg = errBody
-            reply.status(upstream.status)
-            return reply.send(convertErrorToAnthropic(errBody, upstream.status))
-          }
-
-          inputTokens = estimateInputTokens(body)
-          reply.hijack()
-          await streamOpenAIToAnthropic(upstream.body!, reply.raw, model, inputTokens, collectStreamText, collectStreamToolCall, (finalInput, finalOutput) => {
-            inputTokens = finalInput
-            outputTokens = finalOutput
-          })
+        const semaphore = fastify.registry.getSemaphore(currentConfig.id)
+        /** 客户端断连时取消信号量等待 */
+        const ac = new AbortController()
+        const onClose = () => ac.abort()
+        request.raw.once("close", onClose)
+        try {
+          await semaphore?.acquire(ac.signal)
+        } catch {
+          request.raw.removeListener("close", onClose)
           return
         }
+        request.raw.removeListener("close", onClose)
+        emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
+        try {
+          const result = await handleAnthropicUpstream(currentProvider, currentTarget, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError)
+          emitEvent({ type: "upstream_end", requestId: reqId, providerId })
+          if (result.ok) {
+            /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */
+            if (result.streamHijacked) {
+              if (statusCode === 0) statusCode = 200
+            } else {
+              statusCode = result.statusCode
+            }
+            inputTokens = result.inputTokens
+            outputTokens = result.outputTokens
+            cacheCreationTokens = result.cacheCreationTokens
+            cacheReadTokens = result.cacheReadTokens
+            outputText = result.outputText ?? outputText
+            if (result.streamHijacked) {
+              /** 流式传输仍在进行，延迟释放信号量到流结束时 */
+              reply.raw.once("close", () => semaphore?.release())
+            } else {
+              semaphore?.release()
+            }
+            return
+          }
+          /** 请求失败，释放信号量 */
+          semaphore?.release()
+          /** 请求失败，记录错误，尝试下一个 fallback */
+          lastError = result.errorMsg
+          statusCode = result.statusCode
+          errorMsg = result.errorMsg
+          fallbackAttempts.push({ providerId, providerName, targetModel, statusCode, error: result.errorMsg ?? "" })
+          console.warn(`[anthropic] Provider "${providerName}" failed (${statusCode}): ${result.errorMsg}`)
 
-        const upstream = await provider.sendRequest(openaiBody as unknown as Record<string, unknown>, {})
-
-        if (!upstream.ok) {
-          const errBody = await upstream.text()
-          statusCode = upstream.status
-          errorMsg = errBody
-          reply.status(upstream.status)
-          return reply.send(convertErrorToAnthropic(errBody, upstream.status))
+          /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回 */
+          if (statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
+            reply.status(statusCode)
+            return reply.send(convertErrorToAnthropic(result.errorMsg!, statusCode))
+          }
+        } catch (err) {
+          /** handleAnthropicUpstream 抛出异常（如网络错误），释放信号量 */
+          emitEvent({ type: "upstream_end", requestId: reqId, providerId })
+          semaphore?.release()
+          throw err
         }
-
-        const openaiResp = await upstream.json() as Record<string, unknown>
-        const converted = convertResponseToAnthropic(
-          openaiResp as unknown as import("../types.ts").OpenAIChatCompletionResponse,
-          model,
-        )
-        inputTokens = converted.usage.input_tokens
-        outputTokens = converted.usage.output_tokens
-        outputText = converted.content
-          ?.map(b => {
-            if (b.type === "text") return b.text
-            if (b.type === "tool_use") return `[tool_call: ${b.name}(${JSON.stringify(b.input)})]`
-            return ""
-          })
-          .filter(Boolean)
-          .join("\n") ?? ""
-        return reply.send(converted)
-      } finally {
-        emitEvent({ type: "upstream_end", requestId: reqId, providerId })
-        semaphore?.release()
       }
+
+      /** 所有候选都失败了 */
+      reply.status(statusCode || 502)
+      return reply.send(convertErrorToAnthropic(lastError ?? "All providers failed", statusCode || 502))
     } catch (err) {
-      statusCode = 400
-      errorMsg = (err as Error).message
-      return reply.status(400).send({
+      const msg = (err as Error).message
+      const isNetworkError = msg.startsWith("Provider ") && (msg.includes("timed out") || msg.includes("connection failed") || msg.includes("aborted"))
+      statusCode = isNetworkError ? 502 : 400
+      errorMsg = msg
+      return reply.status(statusCode).send({
         type: "error",
-        error: { type: "invalid_request_error", message: errorMsg },
+        error: { type: isNetworkError ? "api_error" : "invalid_request_error", message: errorMsg },
       } satisfies AnthropicErrorResponse)
     } finally {
+      /** 刷新流式文本缓冲区 */
+      if (streamTimer) { clearTimeout(streamTimer); flushStreamBuffer() }
       const durationMs = Date.now() - startTime
       emitEvent({ type: "request_end", requestId: reqId, durationMs, statusCode, error: errorMsg, tokenUsage: { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens } })
+      /** 附加 fallback 尝试 header */
+      if (fallbackAttempts.length > 0) {
+        reply.header("x-gateway-fallback-attempts", fallbackAttempts.length)
+      }
       fastify.db.addLog({
         method: "POST",
         path: "/v1/messages",
@@ -201,29 +231,13 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         error: errorMsg,
         inputContent: fullMessageText,
         outputContent: outputText || null,
+        fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
       })
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
         output: outputText, durationMs, stream: isStream, statusCode, error: errorMsg,
       })
     }
-  })
-
-  /** GET /v1/models — 模型发现 */
-  fastify.get("/v1/models", async (_request, reply) => {
-    const models = fastify.registry.getAvailableModels()
-
-    return reply.send({
-      data: models.map(m => ({
-        id: m.id,
-        object: "model",
-        created: 0,
-        owned_by: m.owned_by,
-      })),
-      first_id: models[0]?.id ?? "",
-      last_id: models[models.length - 1]?.id ?? "",
-      has_more: false,
-    })
   })
 
   /** POST /v1/messages/count_tokens — 透传 token 计数 */
@@ -234,6 +248,123 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
   })
 }
 
+/** 处理单个 Anthropic 上游请求，返回统一的结果对象 */
+async function handleAnthropicUpstream(
+  provider: Provider,
+  targetModel: string,
+  body: AnthropicMessagesRequest,
+  isStream: boolean,
+  upstreamHeaders: Record<string, string>,
+  reply: import("fastify").FastifyReply,
+  onText: (text: string) => void,
+  onToolCall: (name: string, input: string) => void,
+  onStreamError?: (err: string) => void,
+): Promise<{
+  ok: boolean
+  statusCode: number
+  errorMsg: string | null
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  outputText: string | null
+  /** 流式传输已 hijack，即使发生流中断也算 ok（响应已发给客户端） */
+  streamHijacked?: boolean
+}> {
+  try {
+  if (provider.type === "anthropic") {
+    /** Anthropic 直连 — 透传 */
+    if (isStream) {
+      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, upstreamHeaders)
+      if (!upstream.ok) {
+        const errBody = await upstream.text()
+        return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+      }
+
+      let iTokens = 0, oTokens = 0, ccTokens = 0, crTokens = 0
+      if (!upstream.body) {
+        return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+      }
+      reply.hijack()
+      await streamPassthrough(upstream.body, reply.raw, onText, onToolCall, (tu) => {
+        iTokens = tu.inputTokens
+        oTokens = tu.outputTokens
+        ccTokens = tu.cacheCreationTokens
+        crTokens = tu.cacheReadTokens
+      }, onStreamError)
+      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
+    }
+
+    const upstream = await provider.sendRequest({ ...body, model: targetModel }, upstreamHeaders)
+    if (!upstream.ok) {
+      const errBody = await upstream.text()
+      return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
+
+    const respBody = await upstream.json()
+    const respUsage = (respBody as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
+    const iT = respUsage?.input_tokens ?? 0
+    const oT = respUsage?.output_tokens ?? 0
+    const ccT = respUsage?.cache_creation_input_tokens ?? 0
+    const crT = respUsage?.cache_read_input_tokens ?? 0
+    const oText = extractAnthropicResponseSummary(respBody as import("../types.ts").AnthropicMessagesResponse)
+    reply.send(respBody)
+    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
+  }
+
+  /** 非 Anthropic 提供商 — 转换格式 */
+  const openaiBody = convertRequestToOpenAI(body, targetModel)
+
+  if (isStream) {
+    const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {})
+    if (!upstream.ok) {
+      const errBody = await upstream.text()
+      return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
+
+    let iTokens = estimateInputTokens(body)
+    let oTokens = 0
+    if (!upstream.body) {
+      return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
+    reply.hijack()
+    await streamOpenAIToAnthropic(upstream.body, reply.raw, body.model, iTokens, onText, onToolCall, (finalInput, finalOutput) => {
+      iTokens = finalInput
+      oTokens = finalOutput
+    }, onStreamError)
+    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null, streamHijacked: true }
+  }
+
+  const upstream = await provider.sendRequest(openaiBody as unknown as Record<string, unknown>, {})
+  if (!upstream.ok) {
+    const errBody = await upstream.text()
+    return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
+
+  const openaiResp = await upstream.json() as Record<string, unknown>
+  const converted = convertResponseToAnthropic(
+    openaiResp as unknown as import("../types.ts").OpenAIChatCompletionResponse,
+    body.model,
+  )
+  const iT = converted.usage.input_tokens
+  const oT = converted.usage.output_tokens
+  const oText = converted.content
+    ?.map(b => {
+      if (b.type === "text") return b.text
+      if (b.type === "tool_use") return `[tool_call: ${b.name}(${JSON.stringify(b.input)})]`
+      return ""
+    })
+    .filter(Boolean)
+    .join("\n") ?? ""
+  reply.send(converted)
+  return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: oText }
+  } catch (err) {
+    /** 上游响应解析失败（如非 JSON 响应体），返回 502 */
+    const msg = (err as Error).message ?? "Failed to parse upstream response"
+    return { ok: false, statusCode: 502, errorMsg: msg, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
+}
+
 /** SSE 透传（Anthropic 直连时使用），同时收集文本摘要和 token 用量 */
 function streamPassthrough(
   upstream: ReadableStream<Uint8Array>,
@@ -241,6 +372,7 @@ function streamPassthrough(
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (usage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }) => void,
+  onStreamError?: (err: string) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -266,6 +398,11 @@ function streamPassthrough(
       if (done) {
         onTokenUsage?.(collectedUsage)
         raw.end()
+        return
+      }
+      /** 客户端已断连，取消上游读取 */
+      if (!raw.writable) {
+        reader.cancel().catch(() => {})
         return
       }
       raw.write(value)
@@ -296,6 +433,8 @@ function streamPassthrough(
               currentToolArgs = ""
             } else if (obj.type === "content_block_delta" && obj.delta?.type === "text_delta") {
               onText?.(obj.delta.text)
+            } else if (obj.type === "content_block_delta" && obj.delta?.type === "thinking_delta") {
+              onText?.(obj.delta.thinking)
             } else if (obj.type === "content_block_delta" && obj.delta?.type === "input_json_delta") {
               currentToolArgs += obj.delta.partial_json
             } else if (obj.type === "content_block_stop" && currentToolName) {
@@ -307,6 +446,18 @@ function streamPassthrough(
         }
       }
       return pump()
+    }).catch((err) => {
+      /** 上游流式传输中断，发送 SSE error 事件并关闭连接 */
+      const errMsg = "Stream interrupted: " + (err as Error).message
+      console.error(`[anthropic] Stream interrupted: ${(err as Error).message}`)
+      onStreamError?.(errMsg)
+      if (raw.writable) {
+        const errorEvent = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: errMsg } })}\n\n`
+        raw.write(errorEvent)
+      }
+      onTokenUsage?.(collectedUsage)
+      if (raw.writable) raw.end()
+      reader.cancel().catch(() => {})
     })
   }
 
@@ -317,16 +468,23 @@ function convertErrorToAnthropic(errorBody: string, status: number): AnthropicEr
   let message = errorBody
   try {
     const parsed = JSON.parse(errorBody)
-    message = parsed.error?.message || parsed.message || errorBody
+    /** 已经是 Anthropic 格式 */
+    if (parsed.type === "error" && parsed.error?.message) return parsed
+    /** OpenAI 格式：尝试透传原始错误类型 */
+    if (parsed.error?.message) {
+      message = parsed.error.message
+    } else if (typeof parsed.error === "string") {
+      message = parsed.error
+    } else if (parsed.message) {
+      message = parsed.message
+    }
   } catch { /* keep original */ }
 
-  return {
-    type: "error",
-    error: {
-      type: status === 401 ? "authentication_error" : status === 429 ? "rate_limit_error" : "api_error",
-      message,
-    },
-  }
+  if (status === 401) return { type: "error", error: { type: "authentication_error", message } }
+  if (status === 429) return { type: "error", error: { type: "rate_limit_error", message } }
+  if (status === 404) return { type: "error", error: { type: "not_found_error", message } }
+  if (status >= 500) return { type: "error", error: { type: "api_error", message } }
+  return { type: "error", error: { type: "invalid_request_error", message } }
 }
 
 /** 提取最后一条 user 消息的文本 */

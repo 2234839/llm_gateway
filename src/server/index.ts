@@ -10,6 +10,7 @@ import { adminRoutes } from "./routes/admin.ts"
 import { healthRoutes } from "./routes/health.ts"
 import { embeddedAssets } from "./embed-assets.ts"
 import { ConfigManager } from "./config.ts"
+import { StatsCache } from "./utils/stats-cache.ts"
 import { createApiAuthHook, createAdminAuthHook } from "./auth.ts"
 
 /** ANSI 颜色 */
@@ -64,6 +65,7 @@ declare module "fastify" {
     db: GatewayDB
     registry: ProviderRegistry
     configManager: ConfigManager
+    statsCache: StatsCache
   }
   interface FastifyRequest {
     authContext: import("./types.ts").AuthContext | null
@@ -83,12 +85,27 @@ async function main() {
   fastify.decorate("db", db)
   fastify.decorate("registry", new ProviderRegistry(db))
   fastify.decorate("configManager", configManager)
+  fastify.decorate("statsCache", new StatsCache(db))
 
   await fastify.register(cors, { origin: true })
 
-  /** 请求日志中间件 */
-  fastify.addHook("onRequest", async (request) => {
-    console.log(`[REQ] ${request.method} ${request.url} from ${request.ip}`)
+  /** 全局错误处理器：捕获未处理的异常，返回统一格式 */
+  fastify.setErrorHandler((error, _request, reply) => {
+    const err = error as Error & { statusCode?: number; validation?: unknown }
+    /** Fastify 验证错误（如 body 解析失败） */
+    if (err.validation) {
+      reply.status(400).send({ error: { message: err.message, type: "invalid_request_error" } })
+      return
+    }
+    /** 不要泄露内部错误详情 */
+    const status = err.statusCode ?? 500
+    fastify.log.error(error)
+    reply.status(status).send({
+      error: {
+        message: status >= 500 ? "Internal server error" : err.message,
+        type: status === 429 ? "rate_limit_error" : status >= 500 ? "server_error" : "invalid_request_error",
+      },
+    })
   })
 
   /** Admin 认证钩子 */
@@ -104,6 +121,32 @@ async function main() {
     instance.addHook("onRequest", apiAuthHook)
     instance.register(openaiRoutes)
   }, { prefix: "/openai" })
+
+  /** 自动协议路由 — 根路径同时暴露两种 API，客户端无需指定前缀 */
+  await fastify.register(async (instance) => {
+    instance.addHook("onRequest", apiAuthHook)
+    instance.register(anthropicRoutes)
+    instance.register(openaiRoutes)
+
+    /** GET /v1/models — 统一模型发现，同时兼容 OpenAI 和 Anthropic 响应格式 */
+    instance.get("/v1/models", async (request, reply) => {
+      const auth = request.authContext
+      const models = fastify.registry.getAvailableModels(auth?.groupId)
+      const data = models.map(m => ({
+        id: m.id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: m.owned_by,
+      }))
+      return reply.send({
+        object: "list",
+        data,
+        first_id: data[0]?.id ?? "",
+        last_id: data[data.length - 1]?.id ?? "",
+        has_more: false,
+      })
+    })
+  })
 
   await fastify.register(adminRoutes)
   await fastify.register(healthRoutes)
@@ -137,6 +180,8 @@ async function main() {
       if (urlPath === "/") continue
       fastify.get(urlPath, async (_req, reply) => {
         const content = await Bun.file(filePath).bytes()
+        /** 带 hash 的静态资源（如 /assets/index-xxx.js）可永久缓存 */
+        reply.header("Cache-Control", urlPath.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache")
         return reply.type(getContentType(urlPath)).send(content)
       })
     }
@@ -184,6 +229,30 @@ async function main() {
     fastify.log.error(err)
     process.exit(1)
   }
+
+  /** 优雅关闭：确保 SQLite WAL 正确 checkpoint */
+  let shuttingDown = false
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.log(`\nReceived ${signal}, shutting down gracefully...`)
+    /** 10 秒超时强制退出，避免 close 钩子挂起 */
+    const forceTimer = setTimeout(() => {
+      console.error("Graceful shutdown timed out, forcing exit")
+      process.exit(1)
+    }, 10_000)
+    try {
+      await fastify.close()
+      db.close()
+      console.log("Goodbye.")
+    } catch (err) {
+      console.error("Error during shutdown:", err)
+    }
+    clearTimeout(forceTimer)
+    process.exit(0)
+  }
+  process.on("SIGINT", () => shutdown("SIGINT"))
+  process.on("SIGTERM", () => shutdown("SIGTERM"))
 }
 
 main()

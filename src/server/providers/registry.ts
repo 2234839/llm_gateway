@@ -18,47 +18,81 @@ export class ProviderRegistry {
   private providers: Map<string, Provider> = new Map()
   private semaphores: Map<string, Semaphore> = new Map()
   private db: GatewayDB
+  /** 缓存的路由规则 */
+  private cachedRules: ReturnType<GatewayDB["getRouteRules"]> | null = null
+  /** 缓存的 provider 配置（reload 时刷新） */
+  private providerConfigs: Map<string, ProviderConfig> = new Map()
 
   constructor(db: GatewayDB) {
     this.db = db
     this.reload()
   }
 
-  /** 从数据库重新加载所有提供商配置 */
+  /** 从数据库重新加载所有提供商配置（原子替换，避免并发请求看到空状态） */
   reload() {
-    this.providers.clear()
-    this.semaphores.clear()
+    const newProviders = new Map<string, Provider>()
+    const newSemaphores = new Map<string, Semaphore>()
+    const newConfigs = new Map<string, ProviderConfig>()
     const configs = this.db.getProviders()
     for (const config of configs) {
+      newConfigs.set(config.id, config)
       if (!config.enabled) continue
-      this.providers.set(config.id, this.createProvider(config))
+      newProviders.set(config.id, this.createProvider(config))
       if (config.maxConcurrency && config.maxConcurrency > 0) {
-        this.semaphores.set(config.id, new Semaphore(config.maxConcurrency))
+        newSemaphores.set(config.id, new Semaphore(config.maxConcurrency))
       }
     }
+    /** 保留已有信号量的当前并发状态，避免 reload 中断进行中的请求 */
+    for (const [id, newSem] of newSemaphores) {
+      const oldSem = this.semaphores.get(id)
+      if (oldSem && oldSem.max === newSem.max) {
+        newSemaphores.set(id, oldSem)
+      }
+    }
+    this.providers = newProviders
+    this.semaphores = newSemaphores
+    this.cachedRules = null
+    this.providerConfigs = newConfigs
+  }
+
+  /** 使路由规则缓存失效（admin 修改规则后调用） */
+  invalidateRules() {
+    this.cachedRules = null
+    regexCache.clear()
+    picomatchCache.clear()
+  }
+
+  /** 获取路由规则（带缓存） */
+  private getRules() {
+    if (!this.cachedRules) {
+      this.cachedRules = this.db.getRouteRules()
+    }
+    return this.cachedRules
   }
 
   private createProvider(config: ProviderConfig): Provider {
     switch (config.type) {
       case "anthropic":
-        return new AnthropicProvider(config.id, config.baseUrl, config.apiKey, config.customHeaders)
+        return new AnthropicProvider(config.id, config.baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
       case "openai":
       case "azure-openai":
       case "custom":
-        return new OpenAIProvider(config.id, config.type, config.baseUrl, config.apiKey, config.customHeaders)
+        return new OpenAIProvider(config.id, config.type, config.baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
+      default:
+        throw new Error(`Unknown provider type: ${config.type}`)
     }
   }
 
   /** 根据模型名和可选的消息内容匹配路由规则 */
   resolve(model: string, context?: ResolveContext): RouteResult {
-    const rules = this.db.getRouteRules()
+    const rules = this.getRules()
 
     for (const rule of rules) {
       if (rule.enabled === false) continue
 
       /** 模型名匹配：pattern 为空或 * 时不过滤 */
       if (rule.pattern && rule.pattern !== "*") {
-        if (!picomatch(rule.pattern)(model)) continue
+        if (!getCachedPicomatch(rule.pattern)(model)) continue
       }
 
       /** 密钥分组匹配：规则指定了 keyGroups 时，请求的 groupId 必须在列表中 */
@@ -84,12 +118,18 @@ export class ProviderRegistry {
       if (!provider) continue
 
       const targetModel = rule.targetModel || rule.modelMapping?.[model] || model
-      const providerConfig = this.db.getProvider(rule.providerId)
+      const providerConfig = this.providerConfigs.get(rule.providerId)
+      if (!providerConfig) continue
+
+      /** 构建有效 fallback 列表（过滤掉不可用的 provider） */
+      const fallbacks = (rule.fallbacks ?? []).filter(fb => this.providers.has(fb.providerId))
+
       return {
         provider,
         targetModel,
-        providerConfig: providerConfig!,
+        providerConfig,
         rulePattern: rule.pattern || null,
+        fallbacks,
       }
     }
 
@@ -100,6 +140,21 @@ export class ProviderRegistry {
     return this.providers.get(id)
   }
 
+  /** 获取 provider 配置（从缓存，不查 DB） */
+  getProviderConfig(id: string): ProviderConfig | undefined {
+    return this.providerConfigs.get(id)
+  }
+
+  /** 获取所有 provider 配置（从缓存，不查 DB） */
+  getProviderConfigs(): ProviderConfig[] {
+    return [...this.providerConfigs.values()]
+  }
+
+  /** 获取路由规则数量（从缓存，不查 DB） */
+  getRuleCount(): number {
+    return this.getRules().length
+  }
+
   /** 获取指定 provider 的并发信号量，无限制时返回 undefined */
   getSemaphore(providerId: string): Semaphore | undefined {
     return this.semaphores.get(providerId)
@@ -107,9 +162,8 @@ export class ProviderRegistry {
 
   /** 获取所有 provider 的实时并发状态 */
   getConcurrencyStatus(): { id: string; name: string; current: number; max: number }[] {
-    const configs = this.db.getProviders()
     const result: { id: string; name: string; current: number; max: number }[] = []
-    for (const config of configs) {
+    for (const config of this.providerConfigs.values()) {
       if (!config.enabled) continue
       const sem = this.semaphores.get(config.id)
       result.push({
@@ -122,14 +176,27 @@ export class ProviderRegistry {
     return result
   }
 
-  /** 获取所有可用模型列表 */
-  getAvailableModels(): { id: string; owned_by: string }[] {
+  /** 获取可用模型列表：基于路由规则匹配 provider 中的模型，去重返回 */
+  getAvailableModels(groupId?: string): { id: string; owned_by: string }[] {
+    const rules = this.getRules()
+    const seen = new Set<string>()
     const models: { id: string; owned_by: string }[] = []
-    const configs = this.db.getProviders()
 
-    for (const config of configs) {
-      if (!config.enabled) continue
+    for (const rule of rules) {
+      if (rule.enabled === false) continue
+      if (rule.keyGroups && rule.keyGroups.length > 0) {
+        if (!groupId || !rule.keyGroups.includes(groupId)) continue
+      }
+
+      const config = this.providerConfigs.get(rule.providerId)
+      if (!config || !config.enabled) continue
+
+      /** pattern 为空或 * 时，包含该 provider 所有模型 */
+      const isWildcard = !rule.pattern || rule.pattern === "*"
       for (const model of config.models) {
+        if (seen.has(model)) continue
+        if (!isWildcard && !getCachedPicomatch(rule.pattern)(model)) continue
+        seen.add(model)
         models.push({
           id: model,
           owned_by: config.type === "anthropic" ? "anthropic" : config.type,
@@ -138,6 +205,41 @@ export class ProviderRegistry {
     }
 
     return models
+  }
+}
+
+/** 正则编译缓存：key = `${flags}:${pattern}` */
+const regexCache = new Map<string, RegExp | null>()
+
+/** picomatch matcher 缓存：key = pattern */
+const picomatchCache = new Map<string, (input: string) => boolean>()
+
+const MAX_PATTERN_CACHE = 200
+
+/** 获取或创建 picomatch matcher */
+function getCachedPicomatch(pattern: string): (input: string) => boolean {
+  let matcher = picomatchCache.get(pattern)
+  if (!matcher) {
+    if (picomatchCache.size >= MAX_PATTERN_CACHE) picomatchCache.clear()
+    matcher = picomatch(pattern)
+    picomatchCache.set(pattern, matcher)
+  }
+  return matcher
+}
+
+/** 获取或编译正则表达式，缓存编译结果 */
+function getCachedRegex(pattern: string, flags: string): RegExp | null {
+  const key = `${flags}:${pattern}`
+  const cached = regexCache.get(key)
+  if (cached !== undefined) return cached
+  if (regexCache.size >= MAX_PATTERN_CACHE) regexCache.clear()
+  try {
+    const re = new RegExp(pattern, flags)
+    regexCache.set(key, re)
+    return re
+  } catch {
+    regexCache.set(key, null)
+    return null
   }
 }
 
@@ -152,11 +254,8 @@ function matchContent(conditions: ContentMatchCondition[], text: string, content
     if (cond.type === "keyword") {
       return text.includes(cond.pattern)
     }
-    try {
-      return new RegExp(cond.pattern, cond.flags ?? "").test(text)
-    } catch {
-      return false
-    }
+    const re = getCachedRegex(cond.pattern, cond.flags ?? "")
+    return re ? re.test(text) : false
   })
 
   return operator === "or"

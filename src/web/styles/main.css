@@ -224,6 +224,12 @@ body {
   font-family: var(--mono);
 }
 
+.model-tag.model-more {
+  background: var(--surface2);
+  color: var(--text-dim);
+  cursor: help;
+}
+
 code {
   font-family: var(--mono);
   font-size: 12px;
@@ -398,4 +404,78 @@ code {
   text-align: center;
   padding: 40px;
   color: var(--text-dim);
+}
+
+/* Toggle switch — shared by all components */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background: var(--text-dim);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle input:checked + .toggle-slider {
+  background: var(--primary);
+}
+
+.toggle input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+/* ========== 响应式 ========== */
+
+@media (max-width: 768px) {
+  .app { padding: 0 12px; }
+
+  .header {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 0;
+  }
+
+  .nav { order: 3; width: 100%; overflow-x: auto; }
+
+  .stats-bar {
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 8px;
+  }
+
+  .stat-item { padding: 4px 8px; }
+  .stat-sep { display: none; }
+
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid .span-2 { grid-column: span 1; }
+
+  .table { font-size: 12px; display: block; overflow-x: auto; }
+
+  .toolbar { flex-wrap: wrap; gap: 8px; }
 }

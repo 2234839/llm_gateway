@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue"
-import { routeApi, providerApi, type RouteRuleInfo, type ProviderInfo } from "../api"
+import { routeApi, providerApi, keyGroupApi, type RouteRuleInfo, type RouteFallback, type ProviderInfo, type KeyGroupInfo } from "../api"
 import { t } from "../i18n"
 
 const rules = ref<RouteRuleInfo[]>([])
 const providers = ref<ProviderInfo[]>([])
+const keyGroups = ref<KeyGroupInfo[]>([])
 const loading = ref(true)
 const creating = ref(false)
 const editingId = ref<string | null>(null)
+const error = ref("")
 
 const emptyRule: Omit<RouteRuleInfo, "id"> = {
   pattern: "",
@@ -17,6 +19,8 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   priority: 0,
   contentMatch: [],
   excludeMatch: [],
+  fallbacks: [],
+  keyGroups: [],
 }
 
 const form = ref({ ...emptyRule })
@@ -31,16 +35,23 @@ onMounted(load)
 
 async function load() {
   loading.value = true
-  const [r, p] = await Promise.all([routeApi.list(), providerApi.list()])
-  rules.value = r
-  providers.value = p
+  error.value = ""
+  try {
+    const [r, p, g] = await Promise.all([routeApi.list(), providerApi.list(), keyGroupApi.list()])
+    rules.value = r
+    providers.value = p
+    keyGroups.value = g
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Failed to load"
+  }
   loading.value = false
 }
 
 function startCreate() {
   editingId.value = null
   creating.value = true
-  form.value = { ...emptyRule, contentMatch: [], excludeMatch: [] }
+  form.value = { ...emptyRule, contentMatch: [], excludeMatch: [], keyGroups: [], fallbacks: [], modelMapping: {} }
+  syncMappingFromForm()
 }
 
 function startEdit(rule: RouteRuleInfo) {
@@ -54,7 +65,10 @@ function startEdit(rule: RouteRuleInfo) {
     priority: rule.priority,
     contentMatch: rule.contentMatch ? rule.contentMatch.map(c => ({ ...c })) : [],
     excludeMatch: rule.excludeMatch ? rule.excludeMatch.map(c => ({ ...c })) : [],
+    fallbacks: rule.fallbacks ? rule.fallbacks.map(f => ({ ...f })) : [],
+    keyGroups: rule.keyGroups ? [...rule.keyGroups] : [],
   }
+  syncMappingFromForm()
 }
 
 function cancel() {
@@ -63,28 +77,57 @@ function cancel() {
 }
 
 async function save() {
+  /** 保存前将 mapping 条目同步到 form */
+  syncMappingToForm()
   const data = { ...form.value }
+  if (!data.providerId) { error.value = t('route.errorProviderRequired'); return }
   if (!data.contentMatch?.length) data.contentMatch = undefined
   if (!data.excludeMatch?.length) data.excludeMatch = undefined
   if (!data.targetModel) data.targetModel = undefined
   if (!data.pattern) data.pattern = ""
-  if (editingId.value) {
-    await routeApi.update(editingId.value, data)
-  } else {
-    await routeApi.create(data)
+  if (!data.fallbacks?.length) data.fallbacks = undefined
+  /** 验证 fallback 的 providerId */
+  if (data.fallbacks) {
+    for (const fb of data.fallbacks) {
+      if (!fb.providerId) { error.value = t('route.errorFallbackProviderRequired'); return }
+    }
   }
-  cancel()
-  await load()
+  if (!data.keyGroups?.length) data.keyGroups = undefined
+  if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = undefined
+  error.value = ""
+  try {
+    if (editingId.value) {
+      await routeApi.update(editingId.value, data)
+    } else {
+      await routeApi.create(data)
+    }
+    cancel()
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Save failed"
+  }
 }
 
 async function remove(id: string) {
-  await routeApi.delete(id)
-  await load()
+  const rule = rules.value.find(r => r.id === id)
+  if (!confirm(t('route.deleteConfirm', { pattern: rule?.pattern ?? '' }))) return
+  error.value = ""
+  try {
+    await routeApi.delete(id)
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Delete failed"
+  }
 }
 
 async function toggleEnabled(rule: RouteRuleInfo) {
-  await routeApi.update(rule.id, { enabled: rule.enabled === false })
-  await load()
+  error.value = ""
+  try {
+    await routeApi.update(rule.id, { enabled: rule.enabled === false })
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Update failed"
+  }
 }
 
 function providerName(id: string): string {
@@ -110,8 +153,14 @@ async function syncPriorities(reordered: RouteRuleInfo[]) {
     id: rule.id,
     priority: reordered.length - i,
   }))
-  await Promise.all(updates.map(u => routeApi.update(u.id, { priority: u.priority })))
-  await load()
+  error.value = ""
+  try {
+    await routeApi.reorder(updates)
+    await load()
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Reorder failed"
+    await load()
+  }
 }
 
 function addCondition() {
@@ -124,8 +173,8 @@ function removeCondition(index: number) {
   if (!form.value.contentMatch?.length) form.value.contentMatch = undefined
 }
 
-function syncOperator() {
-  const op = form.value.contentMatch?.[0]?.operator ?? "and"
+function syncOperator(event: Event) {
+  const op = (event.target as HTMLSelectElement).value as "and" | "or"
   form.value.contentMatch?.forEach(c => c.operator = op)
 }
 
@@ -139,9 +188,73 @@ function removeExcludeCondition(index: number) {
   if (!form.value.excludeMatch?.length) form.value.excludeMatch = undefined
 }
 
-function syncExcludeOperator() {
-  const op = form.value.excludeMatch?.[0]?.operator ?? "and"
+function syncExcludeOperator(event: Event) {
+  const op = (event.target as HTMLSelectElement).value as "and" | "or"
   form.value.excludeMatch?.forEach(c => c.operator = op)
+}
+
+function addFallback() {
+  if (!form.value.fallbacks) form.value.fallbacks = []
+  form.value.fallbacks.push({ providerId: "" })
+}
+
+function removeFallback(index: number) {
+  form.value.fallbacks?.splice(index, 1)
+  if (!form.value.fallbacks?.length) form.value.fallbacks = undefined
+}
+
+/** 各 fallback provider 的可用模型缓存 */
+const fallbackModelsMap = computed(() => {
+  const map = new Map<string, string[]>()
+  for (const fb of form.value.fallbacks ?? []) {
+    if (fb.providerId) {
+      const models = providers.value.find(p => p.id === fb.providerId)?.models ?? []
+      map.set(fb.providerId, models)
+    }
+  }
+  return map
+})
+
+/** 获取 fallback provider 的可用模型列表 */
+function fallbackProviderModels(providerId: string): string[] {
+  return fallbackModelsMap.value.get(providerId) ?? []
+}
+
+/** 切换 keyGroup 选中状态 */
+function toggleKeyGroup(groupId: string) {
+  if (!form.value.keyGroups) form.value.keyGroups = []
+  const idx = form.value.keyGroups.indexOf(groupId)
+  if (idx >= 0) form.value.keyGroups.splice(idx, 1)
+  else form.value.keyGroups.push(groupId)
+}
+
+/** modelMapping 条目列表（响应式代理） */
+const mappingEntries = ref<{ source: string; target: string }[]>([])
+
+/** 从 form.modelMapping 同步到 entries */
+function syncMappingFromForm() {
+  const map = form.value.modelMapping ?? {}
+  mappingEntries.value = Object.entries(map).map(([source, target]) => ({ source, target }))
+}
+
+/** 添加一条映射 */
+function addMapping() {
+  mappingEntries.value.push({ source: "", target: "" })
+}
+
+/** 删除一条映射 */
+function removeMapping(index: number) {
+  mappingEntries.value.splice(index, 1)
+  syncMappingToForm()
+}
+
+/** 将 entries 同步回 form.modelMapping */
+function syncMappingToForm() {
+  const map: Record<string, string> = {}
+  for (const entry of mappingEntries.value) {
+    if (entry.source) map[entry.source] = entry.target
+  }
+  form.value.modelMapping = map
 }
 </script>
 
@@ -153,6 +266,8 @@ function syncExcludeOperator() {
     </div>
 
     <div v-if="loading" class="loading">{{ t('route.loading') }}</div>
+
+    <p v-if="error" class="error-text">{{ error }}</p>
 
     <div v-else>
       <table class="table" v-if="!creating">
@@ -194,8 +309,18 @@ function syncExcludeOperator() {
                 </template>
               </span>
               <span v-if="(!rule.pattern || rule.pattern === '*') && !rule.contentMatch?.length" class="muted">{{ t('route.matchAll') }}</span>
+              <span v-if="rule.keyGroups?.length" class="match-tag keygroup-label">{{ t('route.keyGroupsLabel') }}</span>
+              <span v-for="kgid in rule.keyGroups" :key="kgid" class="match-tag keygroup">{{ keyGroups.find(g => g.id === kgid)?.name ?? kgid }}</span>
             </td>
-            <td>{{ providerName(rule.providerId) }}</td>
+            <td>
+              <div>{{ providerName(rule.providerId) }}</div>
+              <div v-if="rule.fallbacks?.length" class="fallback-list">
+                <span class="fallback-arrow">&#x21B3;</span>
+                <span v-for="(fb, fi) in rule.fallbacks" :key="fi" class="fallback-tag">
+                  {{ providerName(fb.providerId) }}<template v-if="fb.targetModel"> → {{ fb.targetModel }}</template>
+                </span>
+              </div>
+            </td>
             <td>
               <span v-if="rule.targetModel">{{ rule.targetModel }}</span>
               <span v-else class="muted">{{ t('route.originalModel') }}</span>
@@ -213,6 +338,8 @@ function syncExcludeOperator() {
           </tr>
         </tbody>
       </table>
+
+      <div v-if="rules.length === 0 && !creating" class="empty">{{ t('route.noRules') }}</div>
 
       <div v-if="creating" class="form-card">
         <h3>{{ editingId ? t('route.editTitle') : t('route.addTitle') }}</h3>
@@ -239,6 +366,19 @@ function syncExcludeOperator() {
           </label>
         </div>
 
+        <!-- 模型映射 -->
+        <div class="match-section">
+          <div class="section-label">{{ t('route.modelMappingLabel') }}</div>
+          <p class="section-hint">{{ t('route.modelMappingHint') }}</p>
+          <div v-for="(entry, i) in mappingEntries" :key="i" class="condition-row indented">
+            <input v-model="entry.source" :placeholder="t('route.modelMappingSource')" class="cond-pattern" @input="syncMappingToForm" />
+            <span class="mapping-arrow">→</span>
+            <input v-model="entry.target" :placeholder="t('route.modelMappingTarget')" class="cond-pattern" @input="syncMappingToForm" />
+            <button class="btn-sm btn-danger" type="button" @click="removeMapping(i)">&times;</button>
+          </div>
+          <button class="btn-sm" type="button" @click="addMapping" style="margin-left: 24px">{{ t('route.addMapping') }}</button>
+        </div>
+
         <!-- 匹配条件 -->
         <div class="match-section">
           <div class="section-label">{{ t('route.matchConditionLabel') }}</div>
@@ -262,7 +402,7 @@ function syncExcludeOperator() {
 
           <div v-if="form.contentMatch?.length" class="content-conditions">
             <div v-if="form.contentMatch.length > 1" class="operator-select">
-              <select :value="form.contentMatch[0].operator ?? 'and'" @change="syncOperator()">
+              <select :value="form.contentMatch[0].operator ?? 'and'" @change="syncOperator($event)">
                 <option value="and">{{ t('route.matchAllAnd') }}</option>
                 <option value="or">{{ t('route.matchAnyOr') }}</option>
               </select>
@@ -315,7 +455,7 @@ function syncExcludeOperator() {
 
           <div v-if="form.excludeMatch?.length" class="content-conditions">
             <div v-if="form.excludeMatch.length > 1" class="operator-select">
-              <select :value="form.excludeMatch[0].operator ?? 'and'" @change="syncExcludeOperator()">
+              <select :value="form.excludeMatch[0].operator ?? 'and'" @change="syncExcludeOperator($event)">
                 <option value="and">{{ t('route.matchAllAnd') }}</option>
                 <option value="or">{{ t('route.matchAnyOr') }}</option>
               </select>
@@ -353,6 +493,39 @@ function syncExcludeOperator() {
 
             <button class="btn-sm" type="button" @click="addExcludeCondition" style="margin-left: 24px">{{ t('route.addExclude') }}</button>
           </div>
+        </div>
+
+        <!-- 密钥分组限制 -->
+        <div v-if="keyGroups.length" class="match-section">
+          <div class="section-label">{{ t('route.keyGroupsLabel') }}</div>
+          <p class="section-hint">{{ t('route.keyGroupsHint') }}</p>
+          <div class="key-groups-grid">
+            <label v-for="g in keyGroups" :key="g.id" class="checkbox-label">
+              <input type="checkbox" :checked="form.keyGroups?.includes(g.id)" @change="toggleKeyGroup(g.id)" />
+              {{ g.name }}
+            </label>
+          </div>
+        </div>
+
+        <!-- 故障转移 -->
+        <div class="match-section">
+          <div class="section-label">{{ t('route.fallbackLabel') }}</div>
+          <p class="section-hint">{{ t('route.fallbackHint') }}</p>
+
+          <div v-for="(fb, i) in form.fallbacks" :key="i" class="condition-row indented fallback-row">
+            <select v-model="fb.providerId" class="cond-type">
+              <option value="" disabled>{{ t('route.selectProvider') }}</option>
+              <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+            <select v-if="fallbackProviderModels(fb.providerId).length" v-model="fb.targetModel" class="cond-pattern">
+              <option value="">{{ t('route.useOriginalModel') }}</option>
+              <option v-for="m in fallbackProviderModels(fb.providerId)" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <input v-else v-model="fb.targetModel" :placeholder="t('route.targetModelPlaceholder')" class="cond-pattern" />
+            <button class="btn-sm btn-danger" type="button" @click="removeFallback(i)">&times;</button>
+          </div>
+
+          <button class="btn-sm" type="button" @click="addFallback" style="margin-left: 24px">{{ t('route.addFallback') }}</button>
         </div>
 
         <div class="form-actions">
@@ -496,51 +669,73 @@ function syncExcludeOperator() {
   gap: 8px;
 }
 
-/** Toggle 开关 */
-.toggle {
-  position: relative;
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  cursor: pointer;
-}
-
-.toggle input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-
-.toggle-slider {
-  position: absolute;
-  inset: 0;
-  background: var(--border);
-  border-radius: 10px;
-  transition: background 0.2s;
-}
-
-.toggle-slider::before {
-  content: "";
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  left: 2px;
-  top: 2px;
-  background: var(--text-dim);
-  border-radius: 50%;
-  transition: transform 0.2s, background 0.2s;
-}
-
-.toggle input:checked + .toggle-slider {
-  background: var(--primary);
-}
-
-.toggle input:checked + .toggle-slider::before {
-  transform: translateX(16px);
-  background: #fff;
-}
-
 tr.disabled {
   opacity: 0.45;
+}
+
+.section-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: -8px 0 12px;
+}
+
+.fallback-row {
+  margin-bottom: 6px;
+}
+
+.fallback-list {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.fallback-arrow {
+  margin-right: 4px;
+  color: var(--primary);
+}
+
+.fallback-tag {
+  display: inline-block;
+  background: var(--tag-blue-bg);
+  color: var(--tag-blue);
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-right: 4px;
+  font-size: 11px;
+}
+
+.key-groups-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.match-tag.keygroup-label {
+  background: var(--tag-red-bg);
+  color: var(--tag-red);
+  font-weight: 600;
+}
+
+.match-tag.keygroup {
+  background: var(--tag-green-bg);
+  color: var(--tag-green);
+}
+
+.mapping-arrow {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.error-text {
+  color: var(--err);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.empty {
+  text-align: center;
+  padding: 40px 0;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 </style>

@@ -89,11 +89,18 @@ console.log(`  Embedded ${files.length} files`)
 
 /** Step 3: 编译单文件可执行文件 */
 console.log("\n[3/3] Compiling executable...")
+
+/** 从 package.json 读取版本号 */
+const pkg = JSON.parse(require("fs").readFileSync(join(ROOT, "package.json"), "utf-8"))
+const version = pkg.version ?? "dev"
+process.env.GATEWAY_VERSION = version
+
 const targetFlag = target ? ` --target=${target}` : ""
 const buildCmd = `bun build --compile${targetFlag} --asset-naming="[name].[ext]" src/server/index.ts --outfile "${OUTFILE}"`
+console.log(`  Version: ${version}`)
 console.log(`  Command: ${buildCmd}`)
 try {
-  execSync(buildCmd, { cwd: ROOT, stdio: "inherit" })
+  execSync(buildCmd, { cwd: ROOT, stdio: "inherit", env: { ...process.env, GATEWAY_VERSION: version } })
 } catch (e) {
   console.error("Compile failed!")
   throw e

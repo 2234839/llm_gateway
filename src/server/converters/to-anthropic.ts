@@ -58,6 +58,11 @@ export function convertRequestToAnthropic(body: OpenAIChatCompletionRequest, tar
     result.tool_choice = convertToolChoice(body.tool_choice)
   }
 
+  /** OpenAI user 字段映射到 Anthropic metadata.user_id */
+  if (body.user) {
+    result.metadata = { user_id: body.user }
+  }
+
   return result
 }
 
@@ -80,11 +85,19 @@ function convertUserMessage(msg: OpenAIUserMessage): AnthropicMessage {
             source: { type: "base64", media_type: match[1]!, data: match[2]! },
           })
         }
+      } else if (url.startsWith("http://") || url.startsWith("https://")) {
+        blocks.push({
+          type: "image",
+          source: { type: "url", url },
+        })
       }
+    } else if (part.type !== "text" && part.type !== "image_url") {
+      /** input_audio, refusal 等无法映射到 Anthropic 格式，记录并跳过 */
+      console.warn(`[to-anthropic] skipping unsupported user content part type: ${(part as { type: string }).type}`)
     }
   }
 
-  return { role: "user", content: blocks }
+  return { role: "user", content: blocks.length > 0 ? blocks : [{ type: "text", text: "" }] }
 }
 
 function convertAssistantMessage(msg: OpenAIAssistantMessage): AnthropicMessage {
@@ -94,13 +107,15 @@ function convertAssistantMessage(msg: OpenAIAssistantMessage): AnthropicMessage 
     blocks.push({ type: "text", text: msg.content })
   }
 
-  if (msg.tool_calls) {
+  if (msg.tool_calls && msg.tool_calls.length > 0) {
     for (const tc of msg.tool_calls) {
+      let args: Record<string, unknown> = {}
+      try { args = JSON.parse(tc.function.arguments) ?? {} } catch { /* malformed arguments, use empty object */ }
       blocks.push({
         type: "tool_use",
         id: tc.id,
         name: tc.function.name,
-        input: JSON.parse(tc.function.arguments),
+        input: args,
       })
     }
   }
@@ -109,23 +124,26 @@ function convertAssistantMessage(msg: OpenAIAssistantMessage): AnthropicMessage 
 }
 
 function convertToolMessage(msg: OpenAIToolMessage): AnthropicMessage {
-  /** Anthropic 中 tool_result 放在 user 消息的 content 数组里 */
+  const rawContent = msg.content ?? ""
+  /** 检测从 Anthropic 转换来的错误标记 */
+  const isError = rawContent.startsWith("[ERROR] ")
+  const content = isError ? rawContent.slice(8) : rawContent
   return {
     role: "user",
     content: [{
       type: "tool_result",
       tool_use_id: msg.tool_call_id,
-      content: msg.content,
+      content,
+      ...(isError ? { is_error: true } : {}),
     }],
   }
 }
 
-function convertTool(tool: OpenAIChatCompletionRequest["tools"] extends (infer T)[] | undefined ? T : never): AnthropicTool {
-  const t = tool as { function: { name: string; description?: string; parameters: Record<string, unknown> } }
+function convertTool(tool: { function: { name: string; description?: string; parameters: Record<string, unknown> } }): AnthropicTool {
   return {
-    name: t.function.name,
-    description: t.function.description,
-    input_schema: t.function.parameters,
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters,
   }
 }
 

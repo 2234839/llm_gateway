@@ -1,21 +1,76 @@
 import type { FastifyInstance } from "fastify"
 import type { KeyGroup, ApiKey, ApiKeyWithSecret, ProviderConfig, RouteRule } from "../types.ts"
 import { v4 as uuid } from "uuid"
-import { emitEvent, onEvent, type BusEvent } from "../utils/event-bus.ts"
+import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
-import { createSession, destroySession, extractSessionToken } from "../auth.ts"
+import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
 
-/** 设置 session cookie */
+/** apiKey 脱敏：保留前 4 后 4 位，中间用 *** 替代 */
+function maskApiKey(key: string): string {
+  if (!key || key.length <= 12) return "****"
+  return key.slice(0, 4) + "***" + key.slice(-4)
+}
+
+/** 判断是否为脱敏后的 apiKey（包含 *** 且长度合理） */
+function isMaskedApiKey(key: string): boolean {
+  return key.includes("***")
+}
+
+/** 设置 session cookie（根据请求协议决定 Secure 标志，HTTP 环境下浏览器会拒绝 Secure cookie） */
 function setSessionCookie(reply: import("fastify").FastifyReply, token: string) {
-  reply.header("Set-Cookie", `admin_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`)
+  const secure = reply.request?.protocol === "https" ? "; Secure" : ""
+  reply.header("Set-Cookie", `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=${7 * 24 * 60 * 60}`)
 }
 
 /** 清除 session cookie */
 function clearSessionCookie(reply: import("fastify").FastifyReply) {
-  reply.header("Set-Cookie", "admin_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+  const secure = reply.request?.protocol === "https" ? "; Secure" : ""
+  reply.header("Set-Cookie", `admin_token=; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=0`)
+}
+
+/** 登录速率限制：每个 IP 最多 5 次失败 / 15 分钟窗口 */
+const loginAttempts = new Map<string, { count: number; resetAt: number }>()
+const LOGIN_MAX_ATTEMPTS = 5
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+
+function checkLoginRate(ip: string): boolean {
+  const now = Date.now()
+  /** 惰性清理过期条目：1% 概率或 Map 超过 1000 条时触发 */
+  if (Math.random() < 0.01 || loginAttempts.size > 1000) {
+    for (const [key, val] of loginAttempts) {
+      if (val.resetAt < now) loginAttempts.delete(key)
+    }
+  }
+  const entry = loginAttempts.get(ip)
+  if (!entry || entry.resetAt < now) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS })
+    return true
+  }
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) return false
+  entry.count++
+  return true
 }
 
 export async function adminRoutes(fastify: FastifyInstance) {
+
+  /** 名称映射缓存：避免每次 /admin/logs 请求都做 3 次 DB 全表扫描 */
+  let nameCache: { providerMap: Map<string, string>; keyMap: Map<string, string>; groupMap: Map<string, string> } | null = null
+
+  function getNameMaps() {
+    if (!nameCache) {
+      nameCache = {
+        providerMap: new Map(fastify.db.getProviders().map(p => [p.id, p.name])),
+        keyMap: new Map(fastify.db.getApiKeys().map(k => [k.id, k.name])),
+        groupMap: new Map(fastify.db.getKeyGroups().map(g => [g.id, g.name])),
+      }
+    }
+    return nameCache
+  }
+
+  function invalidateNameCache() {
+    nameCache = null
+  }
+
   // ========== Init & Config ==========
 
   /** 检查管理员是否已初始化 */
@@ -29,8 +84,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ error: "Admin already initialized" })
     }
     const { username, password } = request.body
-    if (!username || !password || password.length < 4) {
-      return reply.status(400).send({ error: "Username and password (min 4 chars) required" })
+    if (!username || !password || password.length < 8) {
+      return reply.status(400).send({ error: "Username and password (min 8 chars) required" })
     }
     await fastify.configManager.initAdmin(username, password)
     /** 初始化成功，直接创建 session 登录 */
@@ -41,6 +96,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   /** 管理员登录 */
   fastify.post<{ Body: { username: string; password: string } }>("/admin/login", async (request, reply) => {
+    const ip = request.ip
+    if (!checkLoginRate(ip)) {
+      return reply.status(429).send({ error: "Too many login attempts. Try again later." })
+    }
     const { username, password } = request.body
     if (!username || !password) {
       return reply.status(400).send({ error: "Username and password are required" })
@@ -49,6 +108,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (!valid) {
       return reply.status(401).send({ error: "Invalid credentials" })
     }
+    /** 登录成功，清除该 IP 的失败计数 */
+    loginAttempts.delete(ip)
     const token = createSession(username)
     setSessionCookie(reply, token)
     return { success: true }
@@ -76,13 +137,16 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.put<{ Body: { authRequired?: boolean; newPassword?: string } }>("/admin/config", async (request, reply) => {
     const { authRequired, newPassword } = request.body
     if (authRequired !== undefined) {
+      if (typeof authRequired !== "boolean") return reply.status(400).send({ error: "authRequired must be a boolean" })
       fastify.configManager.setAuthRequired(authRequired)
     }
     if (newPassword) {
-      if (newPassword.length < 4) {
-        return reply.status(400).send({ error: "Password must be at least 4 characters" })
+      if (newPassword.length < 8) {
+        return reply.status(400).send({ error: "Password must be at least 8 characters" })
       }
       await fastify.configManager.changePassword(newPassword)
+      /** 修改密码后销毁所有现有 session，强制重新登录 */
+      destroyAllSessions()
     }
     return { success: true }
   })
@@ -90,18 +154,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // ========== Providers ==========
 
   fastify.get("/admin/providers", async () => {
-    return fastify.db.getProviders()
+    return fastify.db.getProviders().map(p => ({ ...p, apiKey: maskApiKey(p.apiKey) }))
   })
 
   fastify.post<{ Body: Omit<ProviderConfig, "id"> }>("/admin/providers", async (request, reply) => {
     const body = request.body
+    if (!body.name) return reply.status(400).send({ error: "name is required" })
+    if (!body.baseUrl) return reply.status(400).send({ error: "baseUrl is required" })
+    if (!body.apiKey) return reply.status(400).send({ error: "apiKey is required" })
+    if (!body.type) return reply.status(400).send({ error: "type is required" })
+    const validTypes = ["openai", "anthropic", "azure-openai", "custom"]
+    if (!validTypes.includes(body.type)) return reply.status(400).send({ error: `type must be one of: ${validTypes.join(", ")}` })
+    if (!Array.isArray(body.models) || body.models.length === 0) return reply.status(400).send({ error: "models must be a non-empty array" })
     const provider: ProviderConfig = {
       ...body,
       id: uuid(),
     }
     fastify.db.addProvider(provider)
     fastify.registry.reload()
-    return reply.status(201).send(provider)
+    invalidateNameCache()
+    return reply.status(201).send({ ...provider, apiKey: maskApiKey(provider.apiKey) })
   })
 
   fastify.put<{ Params: { id: string }; Body: Partial<ProviderConfig> }>("/admin/providers/:id", async (request, reply) => {
@@ -110,23 +182,98 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (!existing) {
       return reply.status(404).send({ error: "Provider not found" })
     }
-    fastify.db.updateProvider(id, request.body)
+    const update = { ...request.body }
+    if (update.type) {
+      const validTypes = ["openai", "anthropic", "azure-openai", "custom"]
+      if (!validTypes.includes(update.type)) return reply.status(400).send({ error: `type must be one of: ${validTypes.join(", ")}` })
+    }
+    if (update.models !== undefined && (!Array.isArray(update.models) || update.models.length === 0)) {
+      return reply.status(400).send({ error: "models must be a non-empty array" })
+    }
+    /** 脱敏 apiKey 不覆盖原值 */
+    if (update.apiKey && isMaskedApiKey(update.apiKey)) {
+      delete update.apiKey
+    }
+    fastify.db.updateProvider(id, update)
     fastify.registry.reload()
-    return reply.send({ ...existing, ...request.body, id })
+    invalidateNameCache()
+    const updated = fastify.db.getProvider(id)
+    return reply.send(updated ? { ...updated, apiKey: maskApiKey(updated.apiKey) } : null)
   })
 
   fastify.delete<{ Params: { id: string } }>("/admin/providers/:id", async (request, reply) => {
     const { id } = request.params
+    /** 检查是否有关联的路由规则 */
+    const rules = fastify.db.getRouteRules()
+    const affectedRules = rules.filter(r => r.providerId === id || r.fallbacks?.some(fb => fb.providerId === id))
+    if (affectedRules.length > 0) {
+      return reply.status(400).send({ error: `Cannot delete: ${affectedRules.length} route rule(s) reference this provider. Remove or update those rules first.` })
+    }
     fastify.db.deleteProvider(id)
     fastify.registry.reload()
+    invalidateNameCache()
     return reply.status(204).send()
   })
 
   // ========== Provider Test ==========
 
-  fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; customHeaders?: Record<string, string> } }>("/admin/providers/test", async (request) => {
-    const { baseUrl, apiKey, type, customHeaders } = request.body
+  /** 检查 URL 是否为安全的公网地址（禁止内网 SSRF） */
+  function isSafeUrl(urlStr: string): boolean {
+    let parsed: URL
+    try { parsed = new URL(urlStr) } catch { return false }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false
+    const host = parsed.hostname.toLowerCase()
+    /** 回环域名 */
+    if (host === "localhost" || host.endsWith(".localhost") || host === "localtest.me" || host === "127.0.0.1.nip.io") return false
+    /** IPv6 回环和特殊地址 */
+    if (host === "::1" || host === "0:0:0:0:0:0:0:1" || host === "0:0:0:0:0:ffff:127.0.0.1") return false
+    /** IPv6 映射的 IPv4 地址 */
+    if (host.startsWith("::ffff:")) return false
+    /** 非 IPv4 点分十进制格式的 hostname 全部交给 DNS 解析后判定 */
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) {
+      /** 标准点分十进制 IPv4（正则已保证恰好 4 段） */
+      const parts = host.split(".")
+      const a = Number(parts[0]!), b = Number(parts[1]!), c = Number(parts[2]!), d = Number(parts[3]!)
+      /** 0.x.x.x / 127.x.x.x — 回环/保留 */
+      if (a === 0 || a === 127) return false
+      /** 10.x.x.x — A 类私有 */
+      if (a === 10) return false
+      /** 172.16-31.x.x — B 类私有 */
+      if (a === 172 && b >= 16 && b <= 31) return false
+      /** 192.168.x.x — C 类私有 */
+      if (a === 192 && b === 168) return false
+      /** 169.254.x.x — 链路本地 */
+      if (a === 169 && b === 254) return false
+      /** 100.64-127.x.x — 运营商级 NAT (CGN) */
+      if (a === 100 && b >= 64 && b <= 127) return false
+      /** 198.18-19.x.x — 基准测试保留 */
+      if (a === 198 && (b === 18 || b === 19)) return false
+      /** 224-239.x.x.x — 组播 */
+      if (a >= 224 && a <= 239) return false
+      /** 240-255.x.x.x — 保留 */
+      if (a >= 240) return false
+      /** 255.255.255.255 — 广播 */
+      if (a === 255 && b === 255 && c === 255 && d === 255) return false
+      return true
+    }
+    /** 非 IPv4 数字格式（域名、短 IPv4、十进制 IP、十六进制 IP）全部拒绝 */
+    if (/^\d+$/.test(host)) return false
+    if (/^0x[0-9a-f]+$/i.test(host)) return false
+    /** 含有非标准字符的 hostname（如短 IPv4 "127.1"）也拒绝 */
+    if (/^\d+\.\d*$/.test(host) || /^\d+\.\d+\.\d*$/.test(host)) return false
+    return true
+  }
+
+  /** Provider 连通性测试核心逻辑 */
+  async function doProviderTest(params: { baseUrl: string; apiKey: string; type: string; model?: string; customHeaders?: Record<string, string> }) {
+    const { baseUrl, apiKey, type, model: testModel, customHeaders } = params
+    if (!baseUrl || !apiKey || !type) {
+      return { success: false, statusCode: 400, duration: 0, error: "baseUrl, apiKey, and type are required" }
+    }
     const url = baseUrl.replace(/\/+$/, "")
+    if (!isSafeUrl(url)) {
+      return { success: false, statusCode: 400, duration: 0, error: "URL must be a valid public HTTP/HTTPS address" }
+    }
     const start = performance.now()
 
     const headers: Record<string, string> = {
@@ -136,12 +283,15 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
     let testUrl: string
     let method = "GET"
+    /** 测试请求 body（仅 Anthropic 需要） */
+    let reqBody: string | undefined
 
     if (type === "anthropic") {
       testUrl = `${url}/v1/messages`
       headers["x-api-key"] = apiKey
       headers["anthropic-version"] = "2023-06-01"
       method = "POST"
+      reqBody = JSON.stringify({ model: testModel || "claude-sonnet-4-20250514", max_tokens: 1, messages: [{ role: "user", content: "hi" }] })
     } else if (type === "azure-openai") {
       testUrl = `${url}/openai/deployments?api-version=2024-02-01`
       headers["api-key"] = apiKey
@@ -150,19 +300,42 @@ export async function adminRoutes(fastify: FastifyInstance) {
       headers["Authorization"] = `Bearer ${apiKey}`
     }
 
-    const body = type === "anthropic"
-      ? JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1, messages: [{ role: "user", content: "hi" }] })
-      : undefined
+    try {
+      const resp = await fetch(testUrl, { method, headers, body: reqBody, signal: AbortSignal.timeout(10000) })
+      const duration = Math.round(performance.now() - start)
 
-    const resp = await fetch(testUrl, { method, headers, body, signal: AbortSignal.timeout(10000) })
-    const duration = Math.round(performance.now() - start)
+      if (resp.ok) {
+        return { success: true, statusCode: resp.status, duration }
+      }
 
-    if (resp.ok) {
-      return { success: true, statusCode: resp.status, duration }
+      const errorBody = await resp.text().catch(() => "")
+      return { success: false, statusCode: resp.status, duration, error: errorBody.slice(0, 500) }
+    } catch (err) {
+      const duration = Math.round(performance.now() - start)
+      const message = err instanceof Error ? err.message : "Connection failed"
+      return { success: false, statusCode: 0, duration, error: message }
     }
+  }
 
-    const errorBody = await resp.text().catch(() => "")
-    return { success: false, statusCode: resp.status, duration, error: errorBody.slice(0, 500) }
+  /** 创建前测试（apiKey 由前端传入） */
+  fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; model?: string; customHeaders?: Record<string, string> } }>("/admin/providers/test", async (request) => {
+    return doProviderTest(request.body)
+  })
+
+  /** 按 provider ID 测试（使用数据库中存储的真实 apiKey） */
+  fastify.post<{ Params: { id: string } }>("/admin/providers/:id/test", async (request, reply) => {
+    const { id } = request.params
+    const provider = fastify.db.getProvider(id)
+    if (!provider) {
+      return reply.status(404).send({ error: "Provider not found" })
+    }
+    return doProviderTest({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      type: provider.type,
+      model: provider.models[0] || undefined,
+      customHeaders: provider.customHeaders,
+    })
   })
 
   // ========== Route Rules ==========
@@ -173,44 +346,93 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   fastify.post<{ Body: Omit<RouteRule, "id"> }>("/admin/routes", async (request, reply) => {
     const body = request.body
+    if (!body.providerId) return reply.status(400).send({ error: "providerId is required" })
+    /** 验证 providerId 存在 */
+    if (!fastify.db.getProvider(body.providerId)) {
+      return reply.status(400).send({ error: `Provider "${body.providerId}" not found` })
+    }
+    /** 验证 fallbacks 中的 providerId 存在 */
+    if (body.fallbacks?.length) {
+      for (const fb of body.fallbacks) {
+        if (fb.providerId && !fastify.db.getProvider(fb.providerId)) {
+          return reply.status(400).send({ error: `Fallback provider "${fb.providerId}" not found` })
+        }
+      }
+    }
     const rule: RouteRule = {
       ...body,
       id: uuid(),
     }
     fastify.db.addRouteRule(rule)
+    fastify.registry.invalidateRules()
     return reply.status(201).send(rule)
   })
 
   fastify.put<{ Params: { id: string }; Body: Partial<RouteRule> }>("/admin/routes/:id", async (request, reply) => {
     const { id } = request.params
-    fastify.db.updateRouteRule(id, request.body)
-    return reply.send({ id, ...request.body })
+    const body = request.body
+    if (body.providerId && !fastify.db.getProvider(body.providerId)) {
+      return reply.status(400).send({ error: `Provider "${body.providerId}" not found` })
+    }
+    if (body.fallbacks?.length) {
+      for (const fb of body.fallbacks) {
+        if (fb.providerId && !fastify.db.getProvider(fb.providerId)) {
+          return reply.status(400).send({ error: `Fallback provider "${fb.providerId}" not found` })
+        }
+      }
+    }
+    const updated = fastify.db.updateRouteRule(id, body)
+    if (!updated) {
+      return reply.status(404).send({ error: "Route rule not found" })
+    }
+    fastify.registry.invalidateRules()
+    return reply.send(fastify.db.getRouteRule(id))
   })
 
   fastify.delete<{ Params: { id: string } }>("/admin/routes/:id", async (request, reply) => {
     const { id } = request.params
     fastify.db.deleteRouteRule(id)
+    fastify.registry.invalidateRules()
     return reply.status(204).send()
+  })
+
+  /** 批量更新路由规则优先级 */
+  fastify.put<{ Body: { id: string; priority: number }[] }>("/admin/routes/reorder", async (request, reply) => {
+    const updates = request.body
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return reply.status(400).send({ error: "Expected non-empty array of {id, priority}" })
+    }
+    for (const u of updates) {
+      if (!u.id || typeof u.priority !== "number") {
+        return reply.status(400).send({ error: "Each item must have id (string) and priority (number)" })
+      }
+    }
+    /** 单事务批量更新，避免 N 次独立事务开销 */
+    fastify.db.tx(() => {
+      for (const u of updates) {
+        fastify.db.updateRouteRule(u.id, { priority: u.priority })
+      }
+    })
+    fastify.registry.invalidateRules()
+    return { success: true }
   })
 
   // ========== Key Groups ==========
 
   fastify.get("/admin/key-groups", async () => {
-    const groups = fastify.db.getKeyGroups()
-    return groups.map(g => ({
-      ...g,
-      keyCount: fastify.db.getKeyCountByGroup(g.id),
-    }))
+    return fastify.db.getKeyGroupsWithCount()
   })
 
   fastify.post<{ Body: Omit<KeyGroup, "id" | "createdAt"> }>("/admin/key-groups", async (request, reply) => {
     const body = request.body
+    if (!body.name) return reply.status(400).send({ error: "name is required" })
     const group: KeyGroup = {
       ...body,
       id: uuid(),
       createdAt: new Date().toISOString(),
     }
     fastify.db.addKeyGroup(group)
+    invalidateNameCache()
     return reply.status(201).send(group)
   })
 
@@ -220,7 +442,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (!existing) {
       return reply.status(404).send({ error: "Key group not found" })
     }
+    if (request.body.name !== undefined && !request.body.name) {
+      return reply.status(400).send({ error: "name must not be empty" })
+    }
     fastify.db.updateKeyGroup(id, request.body)
+    invalidateAllKeyCache()
+    invalidateNameCache()
     return fastify.db.getKeyGroup(id)
   })
 
@@ -231,6 +458,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ error: `Cannot delete: group has ${keyCount} API keys` })
     }
     fastify.db.deleteKeyGroup(id)
+    invalidateNameCache()
     return { success: true }
   })
 
@@ -265,6 +493,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       description: body.description ?? "",
     }
     fastify.db.addApiKey(key)
+    invalidateNameCache()
     /** 返回时包含原始密钥（仅此一次） */
     const result: ApiKeyWithSecret = { ...key, rawKey }
     return reply.status(201).send(result)
@@ -277,59 +506,96 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return reply.status(404).send({ error: "API key not found" })
     }
     /** 不允许通过 update 修改 keyHash 和 keyPrefix */
-    const update = { ...request.body }
-    delete (update as any).keyHash
-    delete (update as any).keyPrefix
+    const { keyHash: _kh, keyPrefix: _kp, ...update } = request.body as Record<string, unknown>
+    /** 验证 groupId 存在 */
+    if (update.groupId && !fastify.db.getKeyGroup(update.groupId as string)) {
+      return reply.status(400).send({ error: `Key group "${update.groupId}" not found` })
+    }
     fastify.db.updateApiKey(id, update)
+    invalidateKeyCache(id)
+    invalidateNameCache()
     return fastify.db.getApiKey(id)
   })
 
   fastify.delete<{ Params: { id: string } }>("/admin/keys/:id", async (request, reply) => {
+    invalidateKeyCache(request.params.id)
     fastify.db.deleteApiKey(request.params.id)
+    invalidateNameCache()
     return { success: true }
   })
 
   // ========== Logs ==========
 
-  fastify.get<{ Querystring: { limit?: string; offset?: string; model?: string; providerId?: string; apiKeyId?: string; groupId?: string } }>("/admin/logs", async (request) => {
-    const { limit, offset, model, providerId, apiKeyId, groupId } = request.query
-    return fastify.db.getLogs({
-      limit: limit ? parseInt(limit) : 100,
-      offset: offset ? parseInt(offset) : 0,
+  fastify.get<{ Querystring: { limit?: string; offset?: string; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string } }>("/admin/logs", async (request) => {
+    const { limit, offset, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime } = request.query
+    const parsedLimit = limit ? parseInt(limit) : 100
+    const parsedOffset = offset ? parseInt(offset) : 0
+    const logs = fastify.db.getLogs({
+      limit: Number.isNaN(parsedLimit) ? 100 : Math.max(1, Math.min(parsedLimit, 500)),
+      offset: Number.isNaN(parsedOffset) ? 0 : Math.max(0, parsedOffset),
       model: model ?? undefined,
       providerId: providerId ?? undefined,
       apiKeyId: apiKeyId ?? undefined,
       groupId: groupId ?? undefined,
+      status: status ?? undefined,
+      sort: sort ?? undefined,
+      startTime: startTime ?? undefined,
+      endTime: endTime ?? undefined,
     })
+    /** 附加 provider/key/group 名称（使用缓存） */
+    const { providerMap, keyMap, groupMap } = getNameMaps()
+    return logs.map(log => ({
+      ...log,
+      providerName: providerMap.get(log.providerId) ?? log.providerId,
+      keyName: log.apiKeyId ? (keyMap.get(log.apiKeyId) ?? null) : null,
+      groupName: log.groupId ? (groupMap.get(log.groupId) ?? null) : null,
+    }))
   })
 
-  fastify.get("/admin/stats", async () => {
-    return fastify.db.getLogStats()
+  /** 获取单条日志详情（包含 input/output content） */
+  fastify.get<{ Params: { id: string } }>("/admin/logs/:id", async (request, reply) => {
+    const id = parseInt(request.params.id, 10)
+    if (Number.isNaN(id)) return reply.status(400).send({ error: "Invalid log id" })
+    const log = fastify.db.getLogDetail(id)
+    if (!log) return reply.status(404).send({ error: "Log not found" })
+    const { providerMap, keyMap, groupMap } = getNameMaps()
+    return {
+      ...log,
+      providerName: providerMap.get(log.providerId) ?? log.providerId,
+      keyName: log.apiKeyId ? (keyMap.get(log.apiKeyId) ?? null) : null,
+      groupName: log.groupId ? (groupMap.get(log.groupId) ?? null) : null,
+    }
+  })
+
+  fastify.get<{ Querystring: { apiKeyId?: string; groupId?: string } }>("/admin/stats", async (request) => {
+    const { apiKeyId, groupId } = request.query
+    return fastify.db.getLogStats({ apiKeyId, groupId })
   })
 
   // ========== Token 统计 ==========
 
   fastify.get("/admin/token-stats", async () => {
     return {
-      summary: fastify.db.getTokenStats(),
-      byProvider: fastify.db.getTokenStatsByProvider(),
-      byModel: fastify.db.getTokenStatsByModel(),
+      summary: fastify.statsCache.getTokenStats(),
+      byProvider: fastify.statsCache.getTokensByProvider(),
+      byModel: fastify.statsCache.getTokensByModel(),
     }
   })
 
   fastify.get<{ Querystring: { hours?: string } }>("/admin/token-stats/hourly", async (request) => {
-    const hours = parseInt(request.query.hours ?? "24")
+    const parsed = parseInt(request.query.hours ?? "24")
+    const hours = Number.isNaN(parsed) ? 24 : parsed
     return fastify.db.getTokenStatsByHour(hours)
   })
 
   /** 按密钥分组统计 Token */
   fastify.get("/admin/token-stats/by-group", async () => {
-    return fastify.db.getTokenStatsByGroup()
+    return fastify.statsCache.getTokensByGroup()
   })
 
   /** 按密钥统计 Token */
   fastify.get("/admin/token-stats/by-key", async () => {
-    return fastify.db.getTokenStatsByKey()
+    return fastify.statsCache.getTokensByKey()
   })
 
   // ========== SSE 实时事件流 ==========
@@ -387,6 +653,23 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (concurrencySnapshots.length > maxSnapshots) concurrencySnapshots.shift()
   }
 
+  /** request_stats 推送防抖：避免每个请求结束都触发 4 个聚合查询 */
+  let statsTimer: ReturnType<typeof setTimeout> | null = null
+  function scheduleStatsPush() {
+    if (statsTimer) return
+    statsTimer = setTimeout(() => {
+      statsTimer = null
+      const requests = fastify.statsCache.getLogStats()
+      emitEvent({
+        type: "request_stats",
+        requests,
+        byProvider: fastify.statsCache.getByProvider(),
+        byModel: fastify.statsCache.getByModel(),
+        tokenStats: fastify.statsCache.getTokenStats(),
+      })
+    }, 3000)
+  }
+
   /** 聚合并发状态：按 provider 聚合，包含模型维度和两层并发 */
   function buildConcurrencyPayload() {
     const providerStatus = fastify.registry.getConcurrencyStatus()
@@ -417,11 +700,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
   /** 事件监听：维护活跃请求表，并发变化时记录快照 */
   onEvent((event: BusEvent) => {
     if (event.type === "request_start") {
-      /** 从路由规则反查 providerId */
-      const providers = fastify.db.getProviders()
-      const provider = providers.find(p => p.name === event.provider)
       activeRequests.set(event.requestId, {
-        providerId: provider?.id ?? "",
+        providerId: event.providerId ?? "",
         providerName: event.provider,
         model: event.model,
         targetModel: event.targetModel,
@@ -429,16 +709,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
       recordSnapshot()
     } else if (event.type === "request_end") {
       activeRequests.delete(event.requestId)
+      /** 增量更新 total 计数器（避免全表 COUNT/SUM） */
+      fastify.statsCache.recordRequest(event.tokenUsage)
+      /** 使统计缓存失效 */
+      fastify.statsCache.onRequestEnd()
       recordSnapshot()
-      /** 请求结束后推送最新统计数据 */
-      const requests = fastify.db.getLogStats()
-      emitEvent({
-        type: "request_stats",
-        requests,
-        byProvider: fastify.db.getLogStatsByProvider(),
-        byModel: fastify.db.getLogStatsByModel(),
-        tokenStats: fastify.db.getTokenStats(),
-      })
+      /** 防抖推送统计数据 */
+      scheduleStatsPush()
     } else if (event.type === "upstream_start") {
       upstreamRequests.set(event.requestId, event.providerId)
       recordSnapshot()
@@ -448,41 +725,91 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
   })
 
+  /** SSE 最大连接数，超出时拒绝新连接 */
+  const MAX_SSE_CONNECTIONS = 20
+  let sseConnectionCount = 0
+
   fastify.get("/admin/events", async (request, reply) => {
+    if (sseConnectionCount >= MAX_SSE_CONNECTIONS) {
+      return reply.status(503).send({ error: "Too many SSE connections" })
+    }
+
+    let timer: ReturnType<typeof setInterval> | undefined
+    let unsubscribe: (() => void) | undefined
+    /** 背压标记：write 返回 false 时暂停写入，drain 时恢复 */
+    let buffered = false
+    /** 防止 cleanup 重复触发（error + close 可能连续触发） */
+    let cleaned = false
+
+    sseConnectionCount++
+
+    /** 清理 SSE 资源 */
+    function cleanup() {
+      if (cleaned) return
+      cleaned = true
+      if (timer) { clearInterval(timer); timer = undefined }
+      if (unsubscribe) { unsubscribe(); unsubscribe = undefined }
+      buffered = false
+      sseConnectionCount--
+    }
+
+    /** 安全写入：检查背压，缓冲满时丢弃后续数据 */
+    function safeWrite(data: string): boolean {
+      if (buffered || !raw.writable) return false
+      const ok = raw.write(data)
+      if (!ok) {
+        buffered = true
+        raw.once("drain", () => { buffered = false })
+      }
+      return ok
+    }
+
     reply.hijack()
     const raw = reply.raw
+
+    /** 处理底层连接错误（如 ECONNRESET） */
+    request.raw.on("error", cleanup)
+
     raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     })
-    raw.write("data: {\"type\":\"connected\"}\n\n")
+    /** 设置浏览器 SSE 重连间隔为 5 秒，避免断连后频繁重试 */
+    safeWrite("retry: 5000\n")
+    safeWrite("data: {\"type\":\"connected\"}\n\n")
 
     /** 推送历史并发快照，前端刷新后可恢复图表 */
     if (concurrencySnapshots.length > 0) {
-      raw.write(`data: ${JSON.stringify({ type: "concurrency_history", snapshots: concurrencySnapshots })}\n\n`)
+      safeWrite(`data: ${JSON.stringify({ type: "concurrency_history", snapshots: concurrencySnapshots })}\n\n`)
     }
 
     /** 推送当前并发状态 */
     const enriched = buildConcurrencyPayload()
-    raw.write(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
+    safeWrite(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
 
     /** 并发状态定时推送（每 2 秒） */
-    const timer = setInterval(() => {
-      const enriched = buildConcurrencyPayload()
-      raw.write(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
+    timer = setInterval(() => {
+      try {
+        if (!raw.writable) { cleanup(); return }
+        const enriched = buildConcurrencyPayload()
+        safeWrite(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
+      } catch {
+        cleanup()
+      }
     }, 2000)
 
-    /** 监听请求事件并转发 */
-    const unsubscribe = onEvent((event: BusEvent) => {
-      raw.write(`data: ${JSON.stringify(event)}\n\n`)
+    /** 监听请求事件并转发（使用预序列化，避免每个连接重复 JSON.stringify） */
+    unsubscribe = onSerializedEvent((data) => {
+      try {
+        safeWrite(data)
+      } catch {
+        cleanup()
+      }
     })
 
     /** 客户端断开时清理 */
-    request.raw.on("close", () => {
-      clearInterval(timer)
-      unsubscribe()
-    })
+    request.raw.on("close", cleanup)
   })
 }

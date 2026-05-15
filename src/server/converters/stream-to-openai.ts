@@ -12,6 +12,7 @@ export async function streamAnthropicToOpenAI(
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (inputTokens: number, outputTokens: number, cacheCreationTokens: number, cacheReadTokens: number) => void,
+  onStreamError?: (err: string) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -29,10 +30,13 @@ export async function streamAnthropicToOpenAI(
   let cachedCacheCreation = 0
   let cachedCacheRead = 0
   let started = false
+  let finished = false
   let currentToolCallIndex = 0
   /** 当前工具调用累积器：name -> 累积的 arguments JSON */
   let currentToolName = ""
   let currentToolArgs = ""
+  /** 当前是否在 thinking 块中 */
+  let inThinkingBlock = false
 
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
@@ -54,17 +58,22 @@ export async function streamAnthropicToOpenAI(
   }
 
   function writeUsage(promptTokens: number, completionTokens: number) {
+    const usage: Record<string, unknown> = {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    }
+    if (cachedCacheCreation > 0 || cachedCacheRead > 0) {
+      usage.cache_creation_input_tokens = cachedCacheCreation
+      usage.cache_read_input_tokens = cachedCacheRead
+    }
     const chunk = {
       id: chatId,
       object: "chat.completion.chunk",
       created,
       model: originalModel,
       choices: [],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-      },
+      usage,
     }
     raw.write(formatSSEData(chunk))
   }
@@ -73,6 +82,11 @@ export async function streamAnthropicToOpenAI(
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      /** 客户端已断连，取消上游读取释放连接 */
+      if (!raw.writable) {
+        reader.cancel().catch(() => {})
+        break
+      }
 
       buffer += decoder.decode(value, { stream: true })
       const { events, remaining } = parseSSEBuffer(buffer)
@@ -109,6 +123,9 @@ export async function streamAnthropicToOpenAI(
                 }],
               })
               currentToolCallIndex++
+            } else if (block && typeof block === "object" && "type" in block && block.type === "thinking") {
+              inThinkingBlock = true
+              writeChunk({ content: "[thinking] " })
             }
             break
           }
@@ -118,18 +135,21 @@ export async function streamAnthropicToOpenAI(
             if (delta.type === "text_delta") {
               writeChunk({ content: delta.text })
               onText?.(delta.text)
-              outputTokens++
+            } else if (delta.type === "thinking_delta") {
+              /** thinking 内容作为文本输出（与非流式保持一致） */
+              writeChunk({ content: delta.thinking })
             } else if (delta.type === "input_json_delta") {
               currentToolArgs += delta.partial_json
-              writeChunk({
-                tool_calls: [{
-                  index: currentToolCallIndex - 1,
-                  function: { arguments: delta.partial_json },
-                }],
-              })
-              outputTokens++
+              if (currentToolCallIndex > 0) {
+                writeChunk({
+                  tool_calls: [{
+                    index: currentToolCallIndex - 1,
+                    function: { arguments: delta.partial_json },
+                  }],
+                })
+              }
             }
-            /** thinking_delta 和 signature_delta 在 OpenAI 格式中无对应，跳过 */
+            /** signature_delta 在 OpenAI 格式中无对应，跳过 */
             break
           }
 
@@ -139,16 +159,22 @@ export async function streamAnthropicToOpenAI(
               currentToolName = ""
               currentToolArgs = ""
             }
+            if (inThinkingBlock) {
+              writeChunk({ content: " [/thinking]\n" })
+              inThinkingBlock = false
+            }
             break
 
           case "message_delta": {
+            if (finished) break
+            finished = true
             const stopReason = anthropicEvent.delta.stop_reason
             const finishReason = mapStopReason(stopReason)
             outputTokens = anthropicEvent.usage?.output_tokens ?? outputTokens
             writeChunk({}, finishReason)
 
-            /** 发送 usage chunk */
-            writeUsage(0, outputTokens)
+            /** 发送 usage chunk（prompt_tokens 从 message_start 缓存） */
+            writeUsage(cachedInputTokens, outputTokens)
             break
           }
 
@@ -161,6 +187,11 @@ export async function streamAnthropicToOpenAI(
             break
 
           case "error": {
+            if (inThinkingBlock) {
+              writeChunk({ content: " [/thinking]\n" })
+              inThinkingBlock = false
+            }
+            finished = true
             writeChunk({ content: `[Error] ${anthropicEvent.error.message}` }, "stop")
             raw.write(formatSSEDone())
             break
@@ -169,12 +200,24 @@ export async function streamAnthropicToOpenAI(
       }
     }
 
-    if (started && raw.writable) {
+    /** message_stop 已写入 [DONE]，此处仅在流意外中断时兜底 */
+    if (started && !finished && raw.writable) {
+      raw.write(formatSSEDone())
+    }
+  } catch (err) {
+    /** 上游流式传输中断，释放 reader 锁并通知调用方 */
+    reader.cancel().catch(() => {})
+    const errMsg = "Stream interrupted: " + (err as Error).message
+    console.error(`[stream-to-openai] Stream interrupted: ${(err as Error).message}`)
+    onStreamError?.(errMsg)
+    if (raw.writable) {
+      const errorData = JSON.stringify({ error: { message: errMsg, type: "server_error" } })
+      raw.write(`data: ${errorData}\n\n`)
       raw.write(formatSSEDone())
     }
   } finally {
     onTokenUsage?.(cachedInputTokens, outputTokens, cachedCacheCreation, cachedCacheRead)
-    raw.end()
+    if (raw.writable) raw.end()
   }
 }
 
@@ -187,6 +230,10 @@ function mapStopReason(reason: string | null): OpenAIFinishReason {
     case "tool_use":
       return "tool_calls"
     case "stop_sequence":
+      return "stop"
+    case "refusal":
+      return "content_filter"
+    case "pause_turn":
       return "stop"
     default:
       return "stop"

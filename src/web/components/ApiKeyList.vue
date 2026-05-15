@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue"
-import { apiKeyApi, keyGroupApi, type KeyGroupInfo, type ApiKeyInfo } from "../api"
+import { apiKeyApi, keyGroupApi, tokenApi, type KeyGroupInfo, type ApiKeyInfo, type TokenStats } from "../api"
 import { t } from "../i18n"
 
 /** ========== Key Groups ========== */
@@ -9,6 +9,12 @@ const groups = ref<KeyGroupInfo[]>([])
 const keys = ref<ApiKeyInfo[]>([])
 const loading = ref(false)
 const error = ref("")
+
+/** 分组 Token 用量：groupId -> { total, today } */
+const groupTokenMap = ref<Map<string, { total: number; today: number }>>(new Map())
+
+/** 每个 Key 的 Token 用量：keyId -> { total: TokenStats, today: TokenStats } */
+const keyTokenMap = ref<Map<string, { total: TokenStats; today: TokenStats }>>(new Map())
 
 /** 分组表单状态 */
 const groupEditing = ref<KeyGroupInfo | null>(null)
@@ -49,11 +55,26 @@ async function load() {
   try {
     loading.value = true
     error.value = ""
-    const [g, k] = await Promise.all([keyGroupApi.list(), apiKeyApi.list()])
+    const [g, k, tokenByGroup, tokenByKey] = await Promise.all([keyGroupApi.list(), apiKeyApi.list(), tokenApi.byGroup(), tokenApi.byKey()])
     groups.value = g
     keys.value = k
-  } catch (e: any) {
-    error.value = e.message || "Failed to load"
+    const map = new Map<string, { total: number; today: number }>()
+    for (const row of tokenByGroup) {
+      const t = row.total
+      const td = row.today
+      map.set(row.groupId, {
+        total: t.inputTokens + t.outputTokens + t.cacheCreationTokens + t.cacheReadTokens,
+        today: td.inputTokens + td.outputTokens + td.cacheCreationTokens + td.cacheReadTokens,
+      })
+    }
+    groupTokenMap.value = map
+    const kmap = new Map<string, { total: TokenStats; today: TokenStats }>()
+    for (const row of tokenByKey) {
+      kmap.set(row.keyId, { total: row.total, today: row.today })
+    }
+    keyTokenMap.value = kmap
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Failed to load"
   } finally {
     loading.value = false
   }
@@ -87,15 +108,17 @@ function cancelGroup() {
 async function saveGroup() {
   try {
     error.value = ""
+    /** v-model.number 清空输入后会变成空字符串，需规范化为 0 */
+    const data = { ...groupForm.value, dailyTokenLimit: Number(groupForm.value.dailyTokenLimit) || 0, monthlyTokenLimit: Number(groupForm.value.monthlyTokenLimit) || 0, rpmLimit: Number(groupForm.value.rpmLimit) || 0 }
     if (groupCreating.value) {
-      await keyGroupApi.create(groupForm.value)
+      await keyGroupApi.create(data)
     } else if (groupEditing.value) {
-      await keyGroupApi.update(groupEditing.value.id, groupForm.value)
+      await keyGroupApi.update(groupEditing.value.id, data)
     }
     cancelGroup()
     await load()
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -106,8 +129,8 @@ async function removeGroup(id: string) {
     error.value = ""
     await keyGroupApi.delete(id)
     await load()
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -143,7 +166,8 @@ async function saveKey() {
   try {
     error.value = ""
     if (keyCreating.value) {
-      const result = await apiKeyApi.create(keyForm.value)
+      const data = { ...keyForm.value, dailyTokenLimit: Number(keyForm.value.dailyTokenLimit) || 0, monthlyTokenLimit: Number(keyForm.value.monthlyTokenLimit) || 0, rpmLimit: Number(keyForm.value.rpmLimit) || 0 }
+      const result = await apiKeyApi.create(data)
       /** 创建后展示原始密钥 */
       createdKeySecret.value = (result as ApiKeyInfo & { rawKey: string }).rawKey
       cancelKey()
@@ -152,16 +176,16 @@ async function saveKey() {
       await apiKeyApi.update(keyEditing.value.id, {
         name: keyForm.value.name,
         groupId: keyForm.value.groupId,
-        dailyTokenLimit: keyForm.value.dailyTokenLimit,
-        monthlyTokenLimit: keyForm.value.monthlyTokenLimit,
-        rpmLimit: keyForm.value.rpmLimit,
+        dailyTokenLimit: Number(keyForm.value.dailyTokenLimit) || 0,
+        monthlyTokenLimit: Number(keyForm.value.monthlyTokenLimit) || 0,
+        rpmLimit: Number(keyForm.value.rpmLimit) || 0,
         description: keyForm.value.description,
       })
       cancelKey()
       await load()
     }
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -172,8 +196,8 @@ async function removeKey(id: string) {
     error.value = ""
     await apiKeyApi.delete(id)
     await load()
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -182,8 +206,8 @@ async function toggleKeyEnabled(k: ApiKeyInfo) {
     error.value = ""
     await apiKeyApi.update(k.id, { enabled: !k.enabled })
     await load()
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -196,8 +220,8 @@ async function copySecret() {
   try {
     error.value = ""
     await navigator.clipboard.writeText(createdKeySecret.value)
-  } catch (e: any) {
-    error.value = e.message || "Operation failed"
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : "Operation failed"
   }
 }
 
@@ -218,6 +242,27 @@ function formatTime(iso: string | null): string {
   if (!iso) return "-"
   const d = new Date(iso)
   return d.toLocaleString()
+}
+
+import { formatNumber } from "../format"
+
+/** 格式化 token 数字（0 值显示为 -） */
+function formatTokens(n: number): string {
+  return n > 0 ? formatNumber(n) : "-"
+}
+
+/** 格式化密钥 token 用量（安全访问 Map） */
+function formatKeyTokens(keyId: string): string {
+  const entry = keyTokenMap.value.get(keyId)
+  if (!entry) return "-"
+  const total = entry.total.inputTokens + entry.total.outputTokens + entry.total.cacheCreationTokens + entry.total.cacheReadTokens
+  return formatTokens(total)
+}
+
+/** 计算配额使用百分比，返回 0-100（无限额返回 -1） */
+function quotaPercent(used: number, limit: number): number {
+  if (limit <= 0) return -1
+  return Math.min(Math.round(used / limit * 100), 100)
 }
 </script>
 
@@ -243,12 +288,13 @@ function formatTime(iso: string | null): string {
               <th>{{ t("keys.monthlyLimitCol") }}</th>
               <th>{{ t("keys.rpmLimitCol") }}</th>
               <th>{{ t("keys.keyCountCol") }}</th>
+              <th>{{ t("keys.tokensCol") }}</th>
               <th>{{ t("keys.actionsCol") }}</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="groups.length === 0">
-              <td colspan="7" class="muted">{{ t("keys.noGroups") }}</td>
+              <td colspan="8" class="muted">{{ t("keys.noGroups") }}</td>
             </tr>
             <tr v-for="g in groups" :key="g.id">
               <td>{{ g.name }}</td>
@@ -257,6 +303,14 @@ function formatTime(iso: string | null): string {
               <td>{{ formatLimit(g.monthlyTokenLimit) }}</td>
               <td>{{ formatLimit(g.rpmLimit) }}</td>
               <td>{{ g.keyCount }}</td>
+              <td>
+                <div class="quota-cell">
+                  <span class="mono">{{ formatTokens(groupTokenMap.get(g.id)?.total ?? 0) }}</span>
+                  <div v-if="quotaPercent(groupTokenMap.get(g.id)?.today ?? 0, g.dailyTokenLimit) >= 0" class="quota-bar" :title="`${quotaPercent(groupTokenMap.get(g.id)?.today ?? 0, g.dailyTokenLimit)}%`">
+                    <div :class="['quota-fill', { warn: quotaPercent(groupTokenMap.get(g.id)?.today ?? 0, g.dailyTokenLimit) >= 80, danger: quotaPercent(groupTokenMap.get(g.id)?.today ?? 0, g.dailyTokenLimit) >= 95 }]" :style="{ width: quotaPercent(groupTokenMap.get(g.id)?.today ?? 0, g.dailyTokenLimit) + '%' }"></div>
+                  </div>
+                </div>
+              </td>
               <td>
                 <div class="actions-cell">
                   <button class="btn-sm" @click="startEditGroup(g)">{{ t("keys.edit") }}</button>
@@ -313,14 +367,16 @@ function formatTime(iso: string | null): string {
               <th>{{ t("keys.groupCol") }}</th>
               <th>{{ t("keys.statusCol") }}</th>
               <th>{{ t("keys.dailyLimitCol") }}</th>
+              <th>{{ t("keys.monthlyLimitCol") }}</th>
+              <th>{{ t("keys.rpmLimitCol") }}</th>
+              <th>{{ t("keys.tokenUsageCol") }}</th>
               <th>{{ t("keys.lastUsedCol") }}</th>
-              <th>{{ t("keys.createdAtCol") }}</th>
               <th>{{ t("keys.actionsCol") }}</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="keys.length === 0">
-              <td colspan="8" class="muted">{{ t("keys.noKeys") }}</td>
+              <td colspan="10" class="muted">{{ t("keys.noKeys") }}</td>
             </tr>
             <tr v-for="k in keys" :key="k.id" :class="{ disabled: !k.enabled }">
               <td>{{ k.name }}</td>
@@ -333,8 +389,10 @@ function formatTime(iso: string | null): string {
                 </label>
               </td>
               <td>{{ formatLimit(k.dailyTokenLimit) }}</td>
+              <td>{{ formatLimit(k.monthlyTokenLimit) }}</td>
+              <td>{{ formatLimit(k.rpmLimit) }}</td>
+              <td class="mono">{{ formatKeyTokens(k.id) }}</td>
               <td>{{ formatTime(k.lastUsedAt) }}</td>
-              <td>{{ formatTime(k.createdAt) }}</td>
               <td>
                 <div class="actions-cell">
                   <button class="btn-sm" @click="startEditKey(k)">{{ t("keys.edit") }}</button>
@@ -416,49 +474,6 @@ function formatTime(iso: string | null): string {
   gap: 8px;
 }
 
-/** Toggle 开关 */
-.toggle {
-  position: relative;
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  cursor: pointer;
-}
-
-.toggle input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-
-.toggle-slider {
-  position: absolute;
-  inset: 0;
-  background: var(--border);
-  border-radius: 10px;
-  transition: background 0.2s;
-}
-
-.toggle-slider::before {
-  content: "";
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  left: 2px;
-  top: 2px;
-  background: var(--text-dim);
-  border-radius: 50%;
-  transition: transform 0.2s, background 0.2s;
-}
-
-.toggle input:checked + .toggle-slider {
-  background: var(--primary);
-}
-
-.toggle input:checked + .toggle-slider::before {
-  transform: translateX(16px);
-  background: #fff;
-}
 
 tr.disabled {
   opacity: 0.45;
@@ -506,5 +521,34 @@ tr.disabled {
   padding: 8px 12px;
   border-radius: 4px;
   margin-bottom: 12px;
+}
+
+.quota-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 80px;
+}
+
+.quota-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.quota-fill {
+  height: 100%;
+  background: var(--ok, #22c55e);
+  border-radius: 2px;
+  transition: width 0.3s, background 0.3s;
+}
+
+.quota-fill.warn {
+  background: var(--warn, #f59e0b);
+}
+
+.quota-fill.danger {
+  background: var(--err, #ef4444);
 }
 </style>

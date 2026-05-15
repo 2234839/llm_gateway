@@ -38,3 +38,4 @@ data/
 src/server/embed-assets.ts
 llm-gateway
 llm-gateway-*
+.claude/scheduled_tasks.lock

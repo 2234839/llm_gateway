@@ -46,7 +46,9 @@ export interface AnthropicTextBlock {
 
 export interface AnthropicImageBlock {
   type: "image"
-  source: { type: "base64"; media_type: string; data: string }
+  source:
+    | { type: "base64"; media_type: string; data: string }
+    | { type: "url"; url: string }
 }
 
 export interface AnthropicToolUseBlock {
@@ -59,7 +61,7 @@ export interface AnthropicToolUseBlock {
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
-  content: string | AnthropicTextBlock[]
+  content: string | (AnthropicTextBlock | AnthropicImageBlock)[]
   is_error?: boolean
 }
 
@@ -152,12 +154,21 @@ export interface OpenAIChatCompletionRequest {
   max_completion_tokens?: number
   temperature?: number
   top_p?: number
+  /** OpenAI: presence_penalty */
+  presence_penalty?: number
+  /** OpenAI: frequency_penalty */
+  frequency_penalty?: number
+  seed?: number
   stream?: boolean
   stop?: string | string[]
   tools?: OpenAITool[]
   tool_choice?: OpenAIToolChoice
   n?: number
   stream_options?: { include_usage: boolean }
+  response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: unknown }
+  logprobs?: boolean
+  top_logprobs?: number
+  user?: string
 }
 
 export type OpenAIChatMessage =
@@ -185,13 +196,14 @@ export interface OpenAIAssistantMessage {
 export interface OpenAIToolMessage {
   role: "tool"
   tool_call_id: string
-  content: string
+  content?: string
 }
 
 export interface OpenAIContentPart {
-  type: "text" | "image_url"
+  type: "text" | "image_url" | "input_audio"
   text?: string
   image_url?: { url: string }
+  input_audio?: { data: string; format: string }
 }
 
 export interface OpenAIToolCall {
@@ -243,6 +255,10 @@ export interface OpenAIUsage {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  /** Anthropic 扩展：cache 写入 token 数 */
+  cache_creation_input_tokens?: number
+  /** Anthropic 扩展：cache 读取 token 数 */
+  cache_read_input_tokens?: number
 }
 
 // ========== OpenAI SSE 流式事件类型 ==========
@@ -284,6 +300,8 @@ export interface ProviderConfig {
   customHeaders?: Record<string, string>
   /** 最大并发请求数，0 或不设置表示不限制 */
   maxConcurrency?: number
+  /** 请求超时毫秒数，0 或不设置使用默认 300000 (5分钟) */
+  requestTimeout?: number
 }
 
 /** 内容匹配条件 */
@@ -314,6 +332,15 @@ export interface RouteRule {
   enabled?: boolean
   /** 限定匹配的密钥分组 ID 列表，空/缺省=匹配所有 */
   keyGroups?: string[]
+  /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
+  fallbacks?: RouteFallback[]
+}
+
+/** 路由规则的故障转移备选 */
+export interface RouteFallback {
+  providerId: string
+  /** 转发目标模型名，不填则用主规则的 targetModel 或原始模型名 */
+  targetModel?: string
 }
 
 export interface GatewayConfig {
@@ -322,6 +349,8 @@ export interface GatewayConfig {
   enableRequestLog: boolean
   /** 保留带内容的日志条数（提示词+响应），超出后清理旧记录的 content 字段，默认 1000 */
   logContentRetention: number
+  /** 日志行数上限，超出后删除最旧的记录，默认 100000 */
+  maxLogRows: number
   /** 是否要求 API 请求必须携带有效 Key */
   authRequired: boolean
 }
@@ -350,6 +379,8 @@ export interface RequestLogEntry {
   error: string | null
   inputContent: string | null
   outputContent: string | null
+  /** fallback 尝试记录，JSON 数组：[{ providerId, providerName, targetModel, statusCode, error }] */
+  fallbackAttempts: string | null
 }
 
 /** Token 用量统计快照 */
@@ -379,6 +410,8 @@ export interface RouteResult {
   providerConfig: ProviderConfig
   /** 命中的路由规则 pattern，兜底规则时为 null */
   rulePattern: string | null
+  /** 故障转移备选列表 */
+  fallbacks: RouteFallback[]
 }
 
 // ========== Anthropic 错误响应格式 ==========
@@ -440,4 +473,15 @@ export interface AuthContext {
   groupId: string
   groupName: string
   keyName: string
+  /** 密钥级限额 */
+  keyLimits: { dailyTokenLimit: number; monthlyTokenLimit: number; rpmLimit: number }
+  /** 分组级限额 */
+  groupLimits: { dailyTokenLimit: number; monthlyTokenLimit: number; rpmLimit: number }
+}
+
+/** 扩展 FastifyRequest 类型，避免 (request as any).authContext */
+declare module "fastify" {
+  interface FastifyRequest {
+    authContext: AuthContext | null
+  }
 }

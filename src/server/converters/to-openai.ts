@@ -56,6 +56,11 @@ export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetMod
     result.stream_options = { include_usage: true }
   }
 
+  /** Anthropic metadata.user_id 映射到 OpenAI user */
+  if (body.metadata?.user_id) {
+    result.user = body.metadata.user_id
+  }
+
   return result
 }
 
@@ -88,15 +93,25 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
         userParts.push({ type: "text", text: block.text })
         break
       case "image":
-        userParts.push({
-          type: "image_url",
-          image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
-        })
+        if (block.source.type === "base64") {
+          userParts.push({
+            type: "image_url",
+            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+          })
+        } else {
+          userParts.push({
+            type: "image_url",
+            image_url: { url: block.source.url },
+          })
+        }
         break
       case "tool_result":
         toolResults.push(block)
         break
-      /** thinking, redacted_thinking, tool_use 不应出现在 user 消息中，跳过 */
+      default:
+        /** thinking, redacted_thinking, input_audio 等无法映射到 OpenAI 格式，记录并跳过 */
+        console.warn(`[to-openai] skipping unsupported user content block type: ${(block as { type: string }).type}`)
+        break
     }
   }
 
@@ -107,8 +122,9 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
 
   /** tool_result 拆分为独立的 role: "tool" 消息 */
   for (const tr of toolResults) {
-    const content = typeof tr.content === "string" ? tr.content : tr.content.map(b => b.text).join("")
-    results.push({ role: "tool", tool_call_id: tr.tool_use_id, content })
+    const raw = tr.content
+    const content = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map(b => "text" in b ? b.text : "[image]").join("") : ""
+    results.push({ role: "tool", tool_call_id: tr.tool_use_id, content: tr.is_error ? `[ERROR] ${content}` : content })
   }
 
   return results
@@ -123,6 +139,10 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
       case "text":
         textParts.push(block.text)
         break
+      case "thinking":
+        /** thinking 块在 OpenAI 格式中无对应，用折叠标记保留 */
+        textParts.push(`[thinking] ${block.thinking} [/thinking]`)
+        break
       case "tool_use": {
         const tb = block as AnthropicToolUseBlock
         toolCalls.push({
@@ -132,7 +152,7 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
         })
         break
       }
-      /** thinking, redacted_thinking 在 OpenAI 格式中无对应，跳过 */
+      /** redacted_thinking 无法还原，跳过 */
     }
   }
 
@@ -170,5 +190,7 @@ function convertToolChoice(choice: AnthropicMessagesRequest["tool_choice"]): Ope
       return "none"
     case "tool":
       return { type: "function", function: { name: choice.name } }
+    default:
+      return undefined
   }
 }

@@ -21,6 +21,7 @@ export async function streamOpenAIToAnthropic(
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number) => void,
+  onStreamError?: (err: string) => void,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -36,6 +37,7 @@ export async function streamOpenAIToAnthropic(
   let hasOpenBlock = false
   const toolCallMap = new Map<number, ToolCallState>()
   let outputTokens = 0
+  let realInputTokens = inputTokens
   let started = false
   let finished = false
 
@@ -60,7 +62,7 @@ export async function streamOpenAIToAnthropic(
         model: originalModel,
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: 1 },
+        usage: { input_tokens: realInputTokens, output_tokens: 1 },
       },
     })
   }
@@ -111,7 +113,7 @@ export async function streamOpenAIToAnthropic(
     })
   }
 
-  function finish(stopReason: AnthropicStopReason) {
+  function finish(stopReason: AnthropicStopReason, error?: { type: string; message: string }) {
     if (finished) return
     finished = true
     closeCurrentBlock()
@@ -120,11 +122,17 @@ export async function streamOpenAIToAnthropic(
       openTextBlock()
     }
     closeCurrentBlock()
-    /** 刷出所有工具调用摘要 */
+    /** 刷出所有工具调用摘要（仅已成功启动的） */
     if (onToolCall) {
       for (const [, state] of toolCallMap) {
-        onToolCall(state.name, state.args)
+        if (state.started && state.name) {
+          onToolCall(state.name, state.args)
+        }
       }
+    }
+    /** error 事件必须在 message_stop 之前发送，否则客户端可能忽略 */
+    if (error) {
+      writeEvent("error", { type: "error", error })
     }
     writeEvent("message_delta", {
       type: "message_delta",
@@ -138,6 +146,11 @@ export async function streamOpenAIToAnthropic(
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      /** 客户端已断连，取消上游读取释放连接 */
+      if (!raw.writable) {
+        reader.cancel().catch(() => {})
+        break
+      }
 
       buffer += decoder.decode(value, { stream: true })
       const { events, remaining } = parseSSEBuffer(buffer)
@@ -147,12 +160,19 @@ export async function streamOpenAIToAnthropic(
         const chunk = parseOpenAIChunk(event)
         if (!chunk || chunk === "DONE") {
           if (chunk === "DONE") {
-            finish(outputTokens > 0 ? "end_turn" : "end_turn")
+            finish("end_turn")
           }
           continue
         }
 
         const choice = chunk.choices?.[0]
+
+        /** OpenAI usage 可能在没有 choices 的独立 chunk 中到达 */
+        if (chunk.usage) {
+          outputTokens = chunk.usage.completion_tokens ?? outputTokens
+          if (chunk.usage.prompt_tokens) realInputTokens = chunk.usage.prompt_tokens
+        }
+
         if (!choice) continue
 
         startMessage()
@@ -175,13 +195,24 @@ export async function streamOpenAIToAnthropic(
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             const idx = tc.index
+            const existing = toolCallMap.get(idx)
             if (tc.id && tc.function?.name) {
               /** 新工具调用开始 */
               openToolBlock(idx, tc.id, tc.function.name)
+            } else if (tc.id && !existing) {
+              /** id 先到但 name 未到，创建占位状态（延迟到 name 到达时 openToolBlock） */
+              toolCallMap.set(idx, { id: tc.id, name: "", claudeIndex: -1, started: false, args: "" })
+            }
+
+            /** name 补充到达 */
+            if (tc.function?.name && existing && !existing.started) {
+              existing.name = tc.function.name
+              existing.started = true
+              openToolBlock(idx, existing.id, existing.name)
             }
 
             const state = toolCallMap.get(idx)
-            if (state && tc.function?.arguments) {
+            if (state?.started && tc.function?.arguments) {
               state.args += tc.function.arguments
               writeEvent("content_block_delta", {
                 type: "content_block_delta",
@@ -196,23 +227,24 @@ export async function streamOpenAIToAnthropic(
         /** 流结束 */
         if (choice.finish_reason) {
           finish(mapFinishReason(choice.finish_reason))
-          break
-        }
-
-        /** OpenAI usage（最后一个 chunk） */
-        if (chunk.usage) {
-          outputTokens = chunk.usage.completion_tokens || outputTokens
+          return
         }
       }
     }
 
     /** 如果流正常结束但没收到 finish_reason，主动结束 */
-    if (started && raw.writable) {
-      finish("end_turn")
-    }
+    if (raw.writable) finish("end_turn")
+  } catch (err) {
+    /** 上游流式传输中断，释放 reader 锁并通知调用方 */
+    reader.cancel().catch(() => {})
+    const errMsg = "Stream interrupted: " + (err as Error).message
+    console.error(`[stream-to-anthropic] Stream interrupted: ${(err as Error).message}`)
+    onStreamError?.(errMsg)
+    if (!started && raw.writable) startMessage()
+    if (raw.writable) finish("end_turn", { type: "api_error", message: errMsg })
   } finally {
-    onTokenUsage?.(inputTokens, outputTokens)
-    raw.end()
+    onTokenUsage?.(realInputTokens, outputTokens)
+    if (raw.writable) raw.end()
   }
 }
 
@@ -233,6 +265,8 @@ function mapFinishReason(reason: string): AnthropicStopReason {
       return "max_tokens"
     case "tool_calls":
       return "tool_use"
+    case "content_filter":
+      return "refusal"
     default:
       return "end_turn"
   }
