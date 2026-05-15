@@ -4,6 +4,16 @@ A unified LLM API proxy gateway with **content-aware routing** and **bidirection
 
 [**中文文档**](docs/README.zh-CN.md)
 
+## One Binary. Zero Dependencies.
+
+Download a single executable from [GitHub Releases](https://github.com/2234839/llm_gateway/releases) — no runtime, no Node.js, no Docker, no config files. Just run it:
+
+```bash
+./llm-gateway
+```
+
+That's it. Open `http://localhost:3827` and you have a full admin dashboard, real-time monitoring, and a ready-to-use LLM proxy.
+
 ## Why LLM Gateway
 
 Other gateways do account rotation and billing. LLM Gateway does something different — it understands **what you're asking** and routes accordingly.

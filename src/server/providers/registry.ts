@@ -22,6 +22,10 @@ export class ProviderRegistry {
   private cachedRules: ReturnType<GatewayDB["getRouteRules"]> | null = null
   /** 缓存的 provider 配置（reload 时刷新） */
   private providerConfigs: Map<string, ProviderConfig> = new Map()
+  /** 可用模型列表缓存：groupId|undefined -> { result, ts } */
+  private modelsCache = new Map<string, { result: { id: string; owned_by: string }[]; ts: number }>()
+  /** 模型缓存 TTL：30 秒 */
+  private static MODELS_CACHE_TTL = 30_000
 
   constructor(db: GatewayDB) {
     this.db = db
@@ -53,11 +57,13 @@ export class ProviderRegistry {
     this.semaphores = newSemaphores
     this.cachedRules = null
     this.providerConfigs = newConfigs
+    this.modelsCache.clear()
   }
 
   /** 使路由规则缓存失效（admin 修改规则后调用） */
   invalidateRules() {
     this.cachedRules = null
+    this.modelsCache.clear()
     regexCache.clear()
     picomatchCache.clear()
   }
@@ -133,7 +139,20 @@ export class ProviderRegistry {
       }
     }
 
-    throw new Error(`No route rule matched for model: ${model}`)
+    /** 无匹配规则时，给出更友好的错误提示 */
+    const enabledCount = rules.filter(r => r.enabled !== false).length
+    const totalProviders = this.providers.size
+    const hints: string[] = [`No route rule matched for model: ${model}`]
+    if (enabledCount === 0) {
+      hints.push("No enabled route rules found")
+    } else if (totalProviders === 0) {
+      hints.push("No enabled providers found")
+    }
+    const available = this.getAvailableModels(context?.groupId)
+    if (available.length > 0) {
+      hints.push(`Available models: ${available.slice(0, 10).map(m => m.id).join(", ")}${available.length > 10 ? " ..." : ""}`)
+    }
+    throw new Error(hints.join(". "))
   }
 
   getProvider(id: string): Provider | undefined {
@@ -176,8 +195,12 @@ export class ProviderRegistry {
     return result
   }
 
-  /** 获取可用模型列表：基于路由规则匹配 provider 中的模型，去重返回 */
+  /** 获取可用模型列表：基于路由规则匹配 provider 中的模型，去重返回（带 TTL 缓存） */
   getAvailableModels(groupId?: string): { id: string; owned_by: string }[] {
+    const cacheKey = groupId ?? ""
+    const cached = this.modelsCache.get(cacheKey)
+    if (cached && Date.now() - cached.ts < ProviderRegistry.MODELS_CACHE_TTL) return cached.result
+
     const rules = this.getRules()
     const seen = new Set<string>()
     const models: { id: string; owned_by: string }[] = []
@@ -203,7 +226,7 @@ export class ProviderRegistry {
         })
       }
     }
-
+    this.modelsCache.set(cacheKey, { result: models, ts: Date.now() })
     return models
   }
 }

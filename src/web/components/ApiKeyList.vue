@@ -217,11 +217,22 @@ function closeSecretModal() {
 
 async function copySecret() {
   if (!createdKeySecret.value) return
+  error.value = ""
   try {
-    error.value = ""
     await navigator.clipboard.writeText(createdKeySecret.value)
-  } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : "Operation failed"
+  } catch {
+    /** Clipboard API 不可用时回退到 select + copy */
+    const ta = document.createElement("textarea")
+    ta.value = createdKeySecret.value
+    ta.style.position = "fixed"
+    ta.style.opacity = "0"
+    document.body.appendChild(ta)
+    try {
+      ta.select()
+      document.execCommand("copy")
+    } finally {
+      document.body.removeChild(ta)
+    }
   }
 }
 
@@ -356,7 +367,7 @@ function quotaPercent(used: number, limit: number): number {
       <section class="section">
         <div class="toolbar">
           <h2>{{ t("keys.keyTitle") }}</h2>
-          <button class="btn btn-primary" :disabled="groups.length === 0" @click="startCreateKey">{{ t("keys.addKey") }}</button>
+          <button class="btn btn-primary" :disabled="groups.length === 0" :title="groups.length === 0 ? t('keys.createGroupFirst') : undefined" @click="startCreateKey">{{ t("keys.addKey") }}</button>
         </div>
 
         <table class="table" v-if="!keyCreating && !keyEditing">

@@ -83,3 +83,8 @@ git push origin v0.2.0
 **build.ts 接受的 target 参数**: `bun-linux-x64`, `bun-linux-arm64`, `bun-windows-x64`, `bun-darwin-x64`, `bun-darwin-arm64`
 
 本地构建指定平台: `bun run scripts/build.ts bun-linux-x64`
+
+## 文档规范
+
+- **多语言同步**: 项目文档包含英文版 `README.md` 和中文版 `docs/README.zh-CN.md`。更新任一文档时，**必须同步更新另一语言版本**，保持内容一致。
+- **i18n 同步**: 前端国际化文件 `src/web/i18n/zh.ts` 和 `src/web/i18n/en.ts` 也必须同步维护，新增键时两文件都要添加。

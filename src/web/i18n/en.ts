@@ -16,6 +16,7 @@ export default {
     editGroupTitle: "Edit Group",
     keyTitle: "API Keys",
     addKey: "New Key",
+    createGroupFirst: "Please create a group first",
     addKeyTitle: "New Key",
     editKeyTitle: "Edit Key",
     nameCol: "Name",

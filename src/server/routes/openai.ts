@@ -112,9 +112,9 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       const contentTypes = extractOpenAIContentTypes(body)
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
 
-      /** 附加路由调试 header */
-      reply.header("x-gateway-provider", providerConfig.name)
-      reply.header("x-gateway-model", tm)
+      /** 附加路由调试 header（RFC 7230 要求 header 值为可见 ASCII 字符） */
+      reply.header("x-gateway-provider", encodeURIComponent(providerConfig.name))
+      reply.header("x-gateway-model", encodeURIComponent(tm))
 
       /** 构建尝试列表：主 provider + fallbacks */
       const candidates: { provider: Provider; providerConfig: ProviderConfig; targetModel: string }[] = [

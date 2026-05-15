@@ -55,7 +55,7 @@ async function load() {
   loading.value = false
 }
 
-/** 并行检查所有启用 provider 的连通性 */
+/** 并行检查所有启用 provider 的连通性（最多 5 个并发） */
 async function checkAllHealth() {
   const enabled = providers.value.filter(p => p.enabled)
   /** 清理已不存在的 provider 的健康检查结果 */
@@ -63,12 +63,22 @@ async function checkAllHealth() {
   for (const id of healthMap.value.keys()) {
     if (!activeIds.has(id)) healthMap.value.delete(id)
   }
-  const checks = enabled.map(async (p) => {
+  const CONCURRENCY = 5
+  let idx = 0
+  async function runNext(): Promise<void> {
+    if (idx >= enabled.length) return
+    const p = enabled[idx++]
     healthMap.value.set(p.id, { success: false, statusCode: 0, duration: 0, checking: true })
-    const result = await providerApi.testById(p.id)
-    healthMap.value.set(p.id, { ...result, checking: false })
-  })
-  await Promise.allSettled(checks)
+    try {
+      const result = await providerApi.testById(p.id)
+      healthMap.value.set(p.id, { ...result, checking: false })
+    } catch {
+      healthMap.value.set(p.id, { success: false, statusCode: 0, duration: 0, checking: false })
+    }
+    await runNext()
+  }
+  const workers = Array.from({ length: Math.min(CONCURRENCY, enabled.length) }, () => runNext())
+  await Promise.allSettled(workers)
 }
 
 function startEdit(p: ProviderInfo) {

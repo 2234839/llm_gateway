@@ -104,9 +104,10 @@ const tokenTrendOptions = [
 
 /** 输出速率历史（tokens/s），与并发共享时间轴 */
 const outputRateHistory: number[] = []
-/** 输出速率滑动窗口：每个并发采样周期内的 (outputTokens, durationMs) */
+/** 当前采样窗口内累积的输出 token 数 */
 let windowOutputTokens = 0
-let windowDurationMs = 0
+/** 上一次 appendChartPoint 的时间戳（用于计算实际经过时间） */
+let lastChartPointTime = 0
 /** EMA 平滑后的当前输出速率 */
 let smoothedRate = 0
 /** EMA 更新系数：新数据权重 */
@@ -293,11 +294,14 @@ function appendChartPoint() {
     if (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
   }
 
-  /** EMA 平滑计算输出速率 */
-  if (windowDurationMs > 0) {
-    const instantRate = windowOutputTokens / (windowDurationMs / 1000)
+  /** EMA 平滑计算输出速率：用实际时间间隔而非请求耗时之和 */
+  const nowMs = Date.now()
+  const elapsedMs = lastChartPointTime > 0 ? nowMs - lastChartPointTime : 0
+  lastChartPointTime = nowMs
+  if (elapsedMs > 0 && windowOutputTokens > 0) {
+    const instantRate = windowOutputTokens / (elapsedMs / 1000)
     smoothedRate = smoothedRate === 0 ? instantRate : EMA_ALPHA * instantRate + (1 - EMA_ALPHA) * smoothedRate
-  } else {
+  } else if (windowOutputTokens === 0) {
     /** 无新数据时衰减，不直接归零 */
     smoothedRate *= EMA_DECAY
     if (smoothedRate < 0.5) smoothedRate = 0
@@ -305,7 +309,6 @@ function appendChartPoint() {
   outputRateHistory.push(Math.round(smoothedRate))
   if (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
   windowOutputTokens = 0
-  windowDurationMs = 0
 
   renderConcurrencyChart()
 }
@@ -322,13 +325,13 @@ function renderConcurrencyChart() {
   /** 过滤掉全部为 0 的 provider，避免空柱子占据宽度 */
   const activeEntries = entries.filter(([_, e]) => e.gatewayPoints.some(v => v > 0))
 
-  /** 构建 datasets：每个 provider 两层 bar + 总并发折线 + 输出速率折线 */
+  /** 构建 datasets：所有 provider 的 upstream 在底层堆叠，queued 在上层堆叠，形成一根柱子 */
   const barDatasets: Record<string, unknown>[] = []
 
+  /** 先放所有 upstream（底层，实色） */
   for (const [_, entry] of activeEntries) {
     const i = barDatasets.length
     const color = colors[i % colors.length]
-    /** 底层：LLM 并发（实色） */
     barDatasets.push({
       label: entry.name,
       data: [...entry.upstreamPoints],
@@ -336,10 +339,14 @@ function renderConcurrencyChart() {
       borderColor: color,
       borderWidth: 0,
       yAxisID: "y",
-      stack: entry.name,
+      stack: "concurrency",
       order: 2,
     })
-    /** 上层：排队中（半透明，gateway - upstream） */
+  }
+  /** 再放所有 queued（上层，半透明） */
+  for (const [_, entry] of activeEntries) {
+    const i = barDatasets.length - activeEntries.length
+    const color = colors[i % colors.length]
     barDatasets.push({
       label: `${entry.name} (${t("dashboard.queuedConcurrency")})`,
       data: entry.gatewayPoints.map((g, idx) => Math.max(0, g - (entry.upstreamPoints[idx] ?? 0))),
@@ -347,7 +354,7 @@ function renderConcurrencyChart() {
       borderColor: color + "80",
       borderWidth: 1,
       yAxisID: "y",
-      stack: entry.name,
+      stack: "concurrency",
       order: 2,
     })
   }
@@ -480,7 +487,7 @@ function connectSSE() {
   disconnectSSE()
   /** 重连时重置速率窗口，避免用旧累积值计算尖峰 */
   windowOutputTokens = 0
-  windowDurationMs = 0
+  lastChartPointTime = 0
   smoothedRate = 0
   resetHeartbeat()
 
@@ -551,7 +558,6 @@ function connectSSE() {
       /** 累加到输出速率窗口 */
       if (event.tokenUsage) {
         windowOutputTokens += event.tokenUsage.outputTokens ?? 0
-        windowDurationMs += event.durationMs ?? 0
       }
       scheduleTokenTrendRefresh()
     } else if (event.type === "request_stats") {

@@ -538,11 +538,82 @@ function syncMappingToForm() {
 </template>
 
 <style scoped>
+/** 表单内输入框/下拉框统一样式 */
+.form-card input[type="text"],
+.form-card input:not([type]) {
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+
+.form-card input[type="text"]:focus,
+.form-card input:not([type]):focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.form-card select {
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
+}
+
+.form-card select:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.form-card .btn-sm {
+  padding: 5px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.form-card .btn-sm:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.form-card .btn-sm.btn-danger {
+  color: var(--danger);
+  border-color: transparent;
+  background: transparent;
+  padding: 5px 8px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.form-card .btn-sm.btn-danger:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
 .match-section {
   margin-top: 16px;
-  padding: 12px;
-  background: var(--surface);
-  border-radius: 6px;
+  padding: 16px;
+  background: var(--bg);
+  border-radius: 8px;
   border: 1px solid var(--border);
 }
 
@@ -568,29 +639,47 @@ function syncMappingToForm() {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 14px;
+  font-size: 13px;
   cursor: pointer;
+  color: var(--text-dim);
 }
 
 .checkbox-label input[type="checkbox"] {
   margin: 0;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  cursor: pointer;
 }
 
 .cond-type {
-  width: 120px;
+  width: 140px;
+  min-width: 140px;
 }
 
 .cond-pattern {
   flex: 1;
+  min-width: 0;
 }
 
 .cond-flags {
   width: 80px;
 }
 
-.operator-select {
-  margin-bottom: 8px;
-  margin-left: 24px;
+.operator-select select {
+  padding: 4px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
 }
 
 .content-conditions {
@@ -647,15 +736,16 @@ function syncMappingToForm() {
   background: none;
   border: none;
   cursor: pointer;
-  padding: 2px 4px;
+  padding: 4px 6px;
   font-size: 10px;
   color: var(--text-dim);
-  border-radius: 3px;
+  border-radius: 4px;
+  transition: all 0.15s;
 }
 
 .btn-icon:hover:not(:disabled) {
   background: var(--surface2);
-  color: inherit;
+  color: var(--text);
 }
 
 .btn-icon:disabled {
@@ -677,6 +767,7 @@ tr.disabled {
   font-size: 12px;
   color: var(--text-dim);
   margin: -8px 0 12px;
+  opacity: 0.7;
 }
 
 .fallback-row {
@@ -708,6 +799,7 @@ tr.disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+  padding-left: 4px;
 }
 
 .match-tag.keygroup-label {
@@ -724,6 +816,8 @@ tr.disabled {
 .mapping-arrow {
   color: var(--text-dim);
   font-weight: 600;
+  font-size: 16px;
+  opacity: 0.5;
 }
 
 .error-text {

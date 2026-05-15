@@ -16,6 +16,7 @@ export default {
     editGroupTitle: "编辑分组",
     keyTitle: "API 密钥",
     addKey: "新建密钥",
+    createGroupFirst: "请先创建分组",
     addKeyTitle: "新建密钥",
     editKeyTitle: "编辑密钥",
     nameCol: "名称",

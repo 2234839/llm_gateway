@@ -4,6 +4,16 @@
 
 [**English Documentation**](../README.md)
 
+## 单文件部署，开箱即用
+
+从 [GitHub Releases](https://github.com/2234839/llm_gateway/releases) 下载一个可执行文件，无需安装 Node.js、无需 Docker、无需配置文件，直接运行：
+
+```bash
+./llm-gateway
+```
+
+打开 `http://localhost:3827` 即可使用完整的管理后台、实时监控和 LLM 代理服务。
+
 ## 为什么选择 LLM Gateway
 
 其他网关做账号轮转和计费。LLM Gateway 做的事情不同——它理解**你在问什么**，并据此路由。
