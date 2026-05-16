@@ -7,7 +7,7 @@ import ApiKeyList from "./components/ApiKeyList.vue"
 import RequestLog from "./components/RequestLog.vue"
 import { t, currentLocale, setLocale } from "./i18n"
 import { initApi, configApi, authApi, ApiAuthError, setOnAuthError } from "./api"
-import type { GatewayConfigInfo } from "./api"
+import type { GatewayConfigInfo, CorsConfigInfo } from "./api"
 
 /** 应用状态：loading -> init | login | main */
 type AppState = "loading" | "init" | "login" | "main"
@@ -26,6 +26,20 @@ const changePasswordMode = ref(false)
 const changePasswordForm = reactive({ newPassword: "", confirmPassword: "" })
 const changePasswordError = ref("")
 const changePasswordSuccess = ref(false)
+
+/** CORS 配置编辑状态 */
+const corsEditMode = ref(false)
+const corsForm = reactive<{
+  originMode: "all" | "custom"
+  origins: string
+  methods: string
+  allowedHeaders: string
+}>({
+  originMode: "all",
+  origins: "",
+  methods: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+  allowedHeaders: "Content-Type, Authorization, X-Requested-With",
+})
 
 const activeTab = ref("dashboard")
 const appVersion = __APP_VERSION__
@@ -82,6 +96,28 @@ function toggleTheme() {
 
 function applyTheme() {
   document.documentElement.dataset.theme = isDark.value ? "dark" : "light"
+}
+
+/** 同步 gatewayConfig.cors 到表单 */
+watch(() => gatewayConfig.value?.cors, (cors) => {
+  if (cors) {
+    corsForm.originMode = cors.origin === true ? "all" : "custom"
+    corsForm.origins = Array.isArray(cors.origin) ? cors.origin.join(", ") : ""
+    corsForm.methods = cors.methods.join(", ")
+    corsForm.allowedHeaders = cors.allowedHeaders.join(", ")
+  }
+}, { immediate: true })
+
+async function handleSaveCors() {
+  const cors: CorsConfigInfo = {
+    origin: corsForm.originMode === "all" ? true : corsForm.origins.split(",").map(s => s.trim()).filter(Boolean),
+    methods: corsForm.methods.split(",").map(s => s.trim()).filter(Boolean),
+    allowedHeaders: corsForm.allowedHeaders.split(",").map(s => s.trim()).filter(Boolean),
+  }
+  if (Array.isArray(cors.origin) && cors.origin.length === 0) cors.origin = true
+  await configApi.update({ gateway: { cors } })
+  if (gatewayConfig.value) gatewayConfig.value.cors = cors
+  corsEditMode.value = false
 }
 
 function toggleLocale() {
@@ -344,6 +380,33 @@ async function handleChangePassword() {
                 <span class="toggle-slider"></span>
               </label>
             </div>
+            <div class="settings-item">
+              <span>{{ t('settings.corsTitle') }}</span>
+              <button class="btn-sm" @click="corsEditMode = !corsEditMode">
+                {{ corsEditMode ? t('provider.cancel') : t('settings.corsEditBtn') }}
+              </button>
+            </div>
+            <div v-if="corsEditMode" class="settings-cors-form">
+              <div class="cors-field">
+                <label>{{ t('settings.corsOrigin') }}</label>
+                <div class="cors-radio-group">
+                  <label><input type="radio" v-model="corsForm.originMode" value="all" /> {{ t('settings.corsOriginAll') }}</label>
+                  <label><input type="radio" v-model="corsForm.originMode" value="custom" /> {{ t('settings.corsOriginCustom') }}</label>
+                </div>
+                <input v-if="corsForm.originMode === 'custom'" v-model="corsForm.origins" :placeholder="t('settings.corsOriginPlaceholder')" />
+              </div>
+              <div class="cors-field">
+                <label>{{ t('settings.corsMethods') }}</label>
+                <input v-model="corsForm.methods" :placeholder="t('settings.corsMethodsPlaceholder')" />
+              </div>
+              <div class="cors-field">
+                <label>{{ t('settings.corsHeaders') }}</label>
+                <input v-model="corsForm.allowedHeaders" :placeholder="t('settings.corsHeadersPlaceholder')" />
+              </div>
+              <div class="cors-actions">
+                <button class="btn-sm btn-primary" @click="handleSaveCors">{{ t('provider.save') }}</button>
+              </div>
+            </div>
             <div v-if="!changePasswordMode" class="settings-item">
               <span>{{ t('settings.changePassword') }}</span>
               <button class="btn-sm" @click="changePasswordMode = true; changePasswordSuccess = false">{{ t('settings.changeBtn') }}</button>
@@ -565,6 +628,58 @@ async function handleChangePassword() {
   color: var(--err);
   font-size: 12px;
   margin-top: 2px;
+}
+
+.settings-cors-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.cors-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cors-field > label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.cors-radio-group {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.cors-radio-group label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.cors-field input[type="text"] {
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.cors-field input[type="text"]:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.cors-actions {
+  display: flex;
+  gap: 6px;
 }
 
 

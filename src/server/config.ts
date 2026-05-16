@@ -16,6 +16,12 @@ export interface AppConfig {
   gateway: GatewayConfig
 }
 
+const DEFAULT_CORS: import("./types.ts").CorsConfig = {
+  origin: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+}
+
 const DEFAULT_APP_CONFIG: AppConfig = {
   authRequired: false,
   gateway: {
@@ -25,6 +31,7 @@ const DEFAULT_APP_CONFIG: AppConfig = {
     logContentRetention: 1000,
     maxLogRows: 100000,
     authRequired: false,
+    cors: DEFAULT_CORS,
   },
 }
 
@@ -57,7 +64,13 @@ export class ConfigManager {
     return {
       ...DEFAULT_APP_CONFIG,
       ...parsed,
-      gateway: { ...DEFAULT_APP_CONFIG.gateway, ...parsed.gateway },
+      gateway: {
+        ...DEFAULT_APP_CONFIG.gateway,
+        ...parsed.gateway,
+        cors: parsed.gateway?.cors
+          ? { ...DEFAULT_CORS, ...parsed.gateway.cors }
+          : DEFAULT_CORS,
+      },
     }
   }
 

@@ -148,10 +148,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
   /** 获取网关配置 */
   fastify.get("/admin/config", async () => {
     const config = fastify.configManager.get()
+    const gatewayConfig = fastify.db.getConfig()
     return {
       authRequired: config.authRequired,
       adminInitialized: !!config.admin?.username,
       adminUsername: config.admin?.username ?? null,
+      cors: gatewayConfig.cors ?? null,
     }
   })
 
@@ -167,7 +169,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
     if (gateway) {
       /** 白名单校验：只允许已知的 GatewayConfig 字段 */
-      const allowedKeys = new Set(["port", "logLevel", "enableRequestLog", "logContentRetention", "maxLogRows", "authRequired"])
+      const allowedKeys = new Set(["port", "logLevel", "enableRequestLog", "logContentRetention", "maxLogRows", "authRequired", "cors"])
       const unknownKeys = Object.keys(gateway).filter(k => !allowedKeys.has(k))
       if (unknownKeys.length > 0) return reply.status(400).send({ error: `Unknown gateway config fields: ${unknownKeys.join(", ")}` })
       if (gateway.port !== undefined && (typeof gateway.port !== "number" || gateway.port < 1 || gateway.port > 65535)) return reply.status(400).send({ error: "port must be 1-65535" })
@@ -175,10 +177,29 @@ export async function adminRoutes(fastify: FastifyInstance) {
       if (gateway.enableRequestLog !== undefined && typeof gateway.enableRequestLog !== "boolean") return reply.status(400).send({ error: "enableRequestLog must be a boolean" })
       if (gateway.logContentRetention !== undefined && (typeof gateway.logContentRetention !== "number" || gateway.logContentRetention < 0)) return reply.status(400).send({ error: "logContentRetention must be a non-negative number" })
       if (gateway.maxLogRows !== undefined && (typeof gateway.maxLogRows !== "number" || gateway.maxLogRows < 1000)) return reply.status(400).send({ error: "maxLogRows must be >= 1000" })
+      /** CORS 配置验证 */
+      if (gateway.cors !== undefined) {
+        const c = gateway.cors
+        if (typeof c !== "object" || c === null) return reply.status(400).send({ error: "cors must be an object" })
+        if (c.origin !== undefined) {
+          if (c.origin !== true && !Array.isArray(c.origin)) return reply.status(400).send({ error: "cors.origin must be true or an array of strings" })
+          if (Array.isArray(c.origin) && c.origin.some(o => typeof o !== "string")) return reply.status(400).send({ error: "cors.origin must contain only strings" })
+        }
+        if (c.methods !== undefined) {
+          if (!Array.isArray(c.methods) || c.methods.some(m => typeof m !== "string")) return reply.status(400).send({ error: "cors.methods must be an array of strings" })
+        }
+        if (c.allowedHeaders !== undefined) {
+          if (!Array.isArray(c.allowedHeaders) || c.allowedHeaders.some(h => typeof h !== "string")) return reply.status(400).send({ error: "cors.allowedHeaders must be an array of strings" })
+        }
+      }
       fastify.configManager.updateGateway(gateway)
       /** 同步 gateway 配置到 DB */
       const dbConfig = fastify.db.getConfig()
       fastify.db.saveConfig({ ...dbConfig, ...gateway })
+      /** 更新运行时 CORS 配置 */
+      if (gateway.cors) {
+        fastify.runtimeCors.config = fastify.db.getConfig().cors!
+      }
     }
     if (newPassword) {
       await fastify.configManager.changePassword(newPassword)

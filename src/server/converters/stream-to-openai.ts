@@ -20,6 +20,7 @@ export async function streamAnthropicToOpenAI(
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": raw.req?.headers.origin ?? "*",
   })
   raw.flushHeaders()
   raw.socket?.setNoDelay(true)
@@ -219,7 +220,15 @@ export async function streamAnthropicToOpenAI(
     }
 
     /** message_stop 已写入 [DONE]，此处仅在流意外中断时兜底 */
-    if (started && !finished && raw.writable) {
+    if (!started && raw.writable) {
+      /** 空流：从未收到有效 SSE 事件，发送 error 而非静默结束 */
+      const errMsg = "Empty response body from upstream"
+      console.error(`[stream-to-openai] ${errMsg}`)
+      onStreamError?.(errMsg)
+      const errorData = JSON.stringify({ error: { message: errMsg, type: "server_error" } })
+      raw.write(`data: ${errorData}\n\n`)
+      raw.write(formatSSEDone())
+    } else if (started && !finished && raw.writable) {
       raw.write(formatSSEDone())
     }
   } catch (err) {

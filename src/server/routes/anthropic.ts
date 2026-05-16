@@ -305,7 +305,17 @@ async function handleAnthropicUpstream(
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
 
-    const respBody = await upstream.json()
+    /** 检查空响应体，避免 JSON 解析失败 */
+    const respText = await upstream.text()
+    if (!respText) {
+      return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
+    let respBody: unknown
+    try {
+      respBody = JSON.parse(respText)
+    } catch {
+      return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
     const respUsage = (respBody as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
     const iT = respUsage?.input_tokens ?? 0
     const oT = respUsage?.output_tokens ?? 0
@@ -347,7 +357,16 @@ async function handleAnthropicUpstream(
     return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
   }
 
-  const openaiResp = await upstream.json() as Record<string, unknown>
+  const respText = await upstream.text()
+  if (!respText) {
+    return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
+  let openaiResp: Record<string, unknown>
+  try {
+    openaiResp = JSON.parse(respText) as Record<string, unknown>
+  } catch {
+    return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
   const converted = convertResponseToAnthropic(
     openaiResp as unknown as import("../types.ts").OpenAIChatCompletionResponse,
     body.model,
@@ -387,6 +406,7 @@ function streamPassthrough(
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": raw.req?.headers.origin ?? "*",
   })
   raw.flushHeaders()
   raw.socket?.setNoDelay(true)
@@ -400,6 +420,8 @@ function streamPassthrough(
   let sseBuffer = ""
   /** token 用量累积：message_start 提供 input+cache，message_delta 覆盖为最终值 */
   let collectedUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
+  /** 是否收到过有效 SSE 事件（用于检测空流） */
+  let hasReceivedEvent = false
 
   /** 客户端断连时主动取消上游 reader（无需等下一个 chunk） */
   if (signal) {
@@ -409,6 +431,16 @@ function streamPassthrough(
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
+        /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
+        if (!hasReceivedEvent) {
+          const errMsg = "Empty response body from upstream"
+          console.error(`[anthropic] ${errMsg}`)
+          onStreamError?.(errMsg)
+          if (raw.writable) {
+            const errorEvent = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: errMsg } })}\n\n`
+            raw.write(errorEvent)
+          }
+        }
         onTokenUsage?.(collectedUsage)
         raw.end()
         return
@@ -434,6 +466,8 @@ function streamPassthrough(
         if (!line.startsWith("data: ")) continue
         try {
           const obj = JSON.parse(line.slice(6))
+          if (!obj.type) continue
+          hasReceivedEvent = true
           if (obj.type === "message_start") {
             const usage = obj.message?.usage
             if (usage) {

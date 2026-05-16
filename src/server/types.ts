@@ -347,6 +347,16 @@ export interface RouteFallback {
   targetModel?: string
 }
 
+/** CORS 跨域配置 */
+export interface CorsConfig {
+  /** 允许的来源：true = 允许所有（反射请求来源），字符串数组 = 指定白名单 */
+  origin: true | string[]
+  /** 允许的 HTTP 方法 */
+  methods: string[]
+  /** 允许的请求头 */
+  allowedHeaders: string[]
+}
+
 export interface GatewayConfig {
   port: number
   logLevel: "debug" | "info" | "warn" | "error"
@@ -357,6 +367,8 @@ export interface GatewayConfig {
   maxLogRows: number
   /** 是否要求 API 请求必须携带有效 Key */
   authRequired: boolean
+  /** CORS 跨域配置，undefined 时使用默认值（允许所有来源） */
+  cors?: CorsConfig
 }
 
 // ========== 请求日志类型 ==========

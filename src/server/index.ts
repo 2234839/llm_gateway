@@ -67,6 +67,7 @@ declare module "fastify" {
     configManager: ConfigManager
     statsCache: StatsCache
     closeSSEConnections: () => void
+    runtimeCors: { config: import("./types.ts").CorsConfig }
   }
   interface FastifyRequest {
     authContext: import("./types.ts").AuthContext | null
@@ -92,7 +93,25 @@ async function main() {
   fastify.decorate("configManager", configManager)
   fastify.decorate("statsCache", new StatsCache(db))
 
-  await fastify.register(cors, { origin: true })
+  /** 运行时 CORS 配置（可被 admin API 动态更新） */
+  const runtimeCors: { config: import("./types.ts").CorsConfig } = {
+    config: config.cors ?? {
+      origin: true,
+      methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    },
+  }
+  fastify.decorate("runtimeCors", runtimeCors)
+
+  await fastify.register(cors, {
+    delegator: (_req, callback) => {
+      callback(null, {
+        origin: runtimeCors.config.origin,
+        methods: runtimeCors.config.methods,
+        allowedHeaders: runtimeCors.config.allowedHeaders,
+      })
+    },
+  })
 
   /** 全局错误处理器：捕获未处理的异常，返回统一格式 */
   fastify.setErrorHandler((error, _request, reply) => {

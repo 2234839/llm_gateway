@@ -3,6 +3,12 @@ import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey } from "./types.ts"
 
+const DEFAULT_CORS: import("./types.ts").CorsConfig = {
+  origin: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+}
+
 const DEFAULT_CONFIG: GatewayConfig = {
   port: 3827,
   logLevel: "info",
@@ -10,6 +16,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
   logContentRetention: 1000,
   maxLogRows: 100000,
   authRequired: false,
+  cors: DEFAULT_CORS,
 }
 
 export class GatewayDB {
@@ -247,7 +254,12 @@ export class GatewayDB {
   getConfig(): GatewayConfig {
     const row = this.stmt("SELECT value FROM config WHERE key = 'gateway'").get() as { value: string } | null
     if (!row) return { ...DEFAULT_CONFIG }
-    return { ...DEFAULT_CONFIG, ...JSON.parse(row.value) }
+    const parsed = JSON.parse(row.value)
+    return {
+      ...DEFAULT_CONFIG,
+      ...parsed,
+      cors: parsed.cors ? { ...DEFAULT_CORS, ...parsed.cors } : DEFAULT_CORS,
+    }
   }
 
   saveConfig(config: GatewayConfig) {

@@ -306,7 +306,16 @@ async function handleOpenAIUpstream(
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
-    const resp = await upstream.json() as Record<string, unknown>
+    const respText = await upstream.text()
+    if (!respText) {
+      return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
+    let resp: Record<string, unknown>
+    try {
+      resp = JSON.parse(respText) as Record<string, unknown>
+    } catch {
+      return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+    }
     const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } }).usage
     const iT = respUsage?.prompt_tokens ?? 0
     const oT = respUsage?.completion_tokens ?? 0
@@ -347,7 +356,16 @@ async function handleOpenAIUpstream(
     return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
   }
 
-  const anthropicResp = await upstream.json() as Record<string, unknown>
+  const respText = await upstream.text()
+  if (!respText) {
+    return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
+  let anthropicResp: Record<string, unknown>
+  try {
+    anthropicResp = JSON.parse(respText) as Record<string, unknown>
+  } catch {
+    return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+  }
   const anthroUsage = (anthropicResp as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
   const iT = anthroUsage?.input_tokens ?? 0
   const oT = anthroUsage?.output_tokens ?? 0
@@ -380,6 +398,7 @@ function streamPassthroughOpenAI(
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": raw.req?.headers.origin ?? "*",
   })
   raw.flushHeaders()
   raw.socket?.setNoDelay(true)
@@ -396,12 +415,24 @@ function streamPassthroughOpenAI(
   let hasUsageReport = false
   /** 手动计数 output delta 块数，作为无 usage 报告时的 fallback */
   let outputChunks = 0
+  /** 是否收到过有效 SSE 事件（用于检测空流） */
+  let hasReceivedEvent = false
 
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
-        /** 如果上游未返回 usage（不支持 stream_options），用 delta 块计数作为近似 output token */
-        if (!hasUsageReport && outputChunks > 0) {
+        /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
+        if (!hasReceivedEvent) {
+          const errMsg = "Empty response body from upstream"
+          console.error(`[openai] ${errMsg}`)
+          onStreamError?.(errMsg)
+          if (raw.writable) {
+            const errorData = JSON.stringify({ error: { message: errMsg, type: "server_error" } })
+            raw.write(`data: ${errorData}\n\n`)
+            raw.write("data: [DONE]\n\n")
+          }
+        } else if (!hasUsageReport && outputChunks > 0) {
+          /** 如果上游未返回 usage（不支持 stream_options），用 delta 块计数作为近似 output token */
           onTokenUsage?.(estimatedInputTokens ?? 0, outputChunks, 0)
         }
         onEnd?.()
@@ -426,6 +457,8 @@ function streamPassthroughOpenAI(
         if (!line.startsWith("data: ") || line === "data: [DONE]") continue
         try {
           const obj = JSON.parse(line.slice(6))
+          if (!obj.id && !obj.choices?.length && !obj.usage) continue
+          hasReceivedEvent = true
           const delta = obj.choices?.[0]?.delta
           if (delta?.content) { onText?.(delta.content); outputChunks++ }
           if (delta?.tool_calls) {

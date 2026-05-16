@@ -242,7 +242,15 @@ export async function streamOpenAIToAnthropic(
     }
 
     /** 如果流正常结束但没收到 finish_reason，主动结束 */
-    if (raw.writable) finish("end_turn")
+    if (raw.writable) {
+      if (!started) {
+        /** 空流：从未收到有效 SSE 事件，发送 error 而非空消息 */
+        startMessage()
+        finish("end_turn", { type: "api_error", message: "Empty response body from upstream" })
+      } else {
+        finish("end_turn")
+      }
+    }
   } catch (err) {
     /** 上游流式传输中断，释放 reader 锁并通知调用方 */
     reader.cancel().catch(() => {})

@@ -172,10 +172,17 @@ export interface InitCheckResult {
   initialized: boolean
 }
 
+export interface CorsConfigInfo {
+  origin: true | string[]
+  methods: string[]
+  allowedHeaders: string[]
+}
+
 export interface GatewayConfigInfo {
   authRequired: boolean
   adminInitialized: boolean
   adminUsername: string | null
+  cors: CorsConfigInfo | null
 }
 
 export const providerApi = {
@@ -267,7 +274,7 @@ export const authApi = {
 
 export const configApi = {
   get: () => api<GatewayConfigInfo>("/admin/config"),
-  update: (data: { authRequired?: boolean; newPassword?: string }) => api<{ success: boolean }>("/admin/config", { method: "PUT", body: JSON.stringify(data) }),
+  update: (data: { authRequired?: boolean; newPassword?: string; gateway?: { cors?: CorsConfigInfo } }) => api<{ success: boolean }>("/admin/config", { method: "PUT", body: JSON.stringify(data) }),
 }
 
 // ========== SSE 事件类型 ==========
