@@ -45,8 +45,9 @@ export async function streamAnthropicToOpenAI(
   let buffer = ""
 
   /** 客户端断连时主动取消上游 reader */
+  const onAbort = () => reader.cancel().catch(() => {})
   if (signal) {
-    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+    signal.addEventListener("abort", onAbort, { once: true })
   }
 
   function writeChunk(delta: Record<string, unknown>, finishReason: OpenAIFinishReason = null) {
@@ -243,6 +244,7 @@ export async function streamAnthropicToOpenAI(
       raw.write(formatSSEDone())
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort)
     onTokenUsage?.(cachedInputTokens, outputTokens, cachedCacheCreation, cachedCacheRead)
     if (raw.writable) raw.end()
   }

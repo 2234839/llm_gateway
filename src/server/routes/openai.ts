@@ -143,21 +143,16 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
-        /** 客户端断连时中断信号量等待 + 上游 fetch + 流式读取 */
-        const ac = new AbortController()
-        const onClose = () => ac.abort()
-        request.raw.once("close", onClose)
+        /** 使用 Fastify 的 request.signal：客户端断连时 Fastify 自动 abort，比 request.raw.close 更可靠（Bun 下 close 事件不可靠） */
+        const clientSignal = request.signal
         try {
-          await semaphore?.acquire(ac.signal)
+          await semaphore?.acquire(clientSignal)
         } catch {
-          request.raw.removeListener("close", onClose)
           return
         }
-        /** 信号量获取成功后不立即移除监听 — ac.signal 贯穿 fetch + 流式传输阶段 */
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
-          const result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, ac.signal)
-          request.raw.removeListener("close", onClose)
+          const result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
             /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */
@@ -193,7 +188,6 @@ export async function openaiRoutes(fastify: FastifyInstance) {
             return reply.send(convertErrorToOpenAI(result.errorMsg ?? "Upstream error", statusCode))
           }
         } catch (err) {
-          request.raw.removeListener("close", onClose)
           /** handleOpenAIUpstream 抛出异常（如网络错误），释放信号量 */
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           semaphore?.release()
@@ -406,8 +400,9 @@ function streamPassthroughOpenAI(
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
   /** 客户端断连时主动取消上游 reader */
+  const onReaderAbort = () => reader.cancel().catch(() => {})
   if (signal) {
-    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+    signal.addEventListener("abort", onReaderAbort, { once: true })
   }
   /** SSE 行缓冲区，处理跨 chunk 的行分割 */
   let sseBuffer = ""
@@ -421,6 +416,8 @@ function streamPassthroughOpenAI(
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
+        /** 流结束，清理 abort 监听器 */
+        signal?.removeEventListener("abort", onReaderAbort)
         /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
         if (!hasReceivedEvent) {
           const errMsg = "Empty response body from upstream"
@@ -441,6 +438,7 @@ function streamPassthroughOpenAI(
       }
       /** 客户端已断连，取消上游读取 */
       if (!raw.writable) {
+        signal?.removeEventListener("abort", onReaderAbort)
         reader.cancel().catch(() => {})
         return
       }
@@ -474,7 +472,8 @@ function streamPassthroughOpenAI(
       }
       return pump()
     }).catch((err) => {
-      /** 上游流式传输中断，发送 SSE error 事件并关闭连接 */
+      /** 上游流式传输中断，清理 abort 监听器 */
+      signal?.removeEventListener("abort", onReaderAbort)
       const errMsg = "Stream interrupted: " + (err as Error).message
       console.error(`[openai] Stream interrupted: ${(err as Error).message}`)
       onStreamError?.(errMsg)

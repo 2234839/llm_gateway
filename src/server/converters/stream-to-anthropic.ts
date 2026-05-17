@@ -48,8 +48,9 @@ export async function streamOpenAIToAnthropic(
   let buffer = ""
 
   /** 客户端断连时主动取消上游 reader */
+  const onAbort = () => reader.cancel().catch(() => {})
   if (signal) {
-    signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true })
+    signal.addEventListener("abort", onAbort, { once: true })
   }
 
   function writeEvent(event: string, data: unknown) {
@@ -245,6 +246,10 @@ export async function streamOpenAIToAnthropic(
     if (raw.writable) {
       if (!started) {
         /** 空流：从未收到有效 SSE 事件，发送 error 而非空消息 */
+        if (buffer) {
+          console.error(`[stream-to-anthropic] empty stream but buffer has residue: ${JSON.stringify(buffer.slice(0, 200))}`)
+        }
+        onStreamError?.("Empty response body from upstream")
         startMessage()
         finish("end_turn", { type: "api_error", message: "Empty response body from upstream" })
       } else {
@@ -260,6 +265,7 @@ export async function streamOpenAIToAnthropic(
     if (!started && raw.writable) startMessage()
     if (raw.writable) finish("end_turn", { type: "api_error", message: errMsg })
   } finally {
+    signal?.removeEventListener("abort", onAbort)
     onTokenUsage?.(realInputTokens, outputTokens, cacheReadTokens)
     if (raw.writable) raw.end()
   }

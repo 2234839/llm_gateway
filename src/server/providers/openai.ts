@@ -80,7 +80,13 @@ export class OpenAIProvider implements Provider {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeout)
     /** 外部 signal（客户端断连）同时中断 fetch */
-    if (signal) signal.addEventListener("abort", () => controller.abort(), { once: true })
+    const onSignalAbort = () => controller.abort()
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(timer)
+      }
+      signal.addEventListener("abort", onSignalAbort, { once: true })
+    }
     const finalHeaders = { ...this.buildHeaders(), ...headers }
     finalHeaders["Content-Type"] = "application/json"
     if (this.type === "azure-openai") {
@@ -98,9 +104,12 @@ export class OpenAIProvider implements Provider {
         decompress: false,
       } as RequestInit & { decompress: boolean })
       clearTimeout(timer)
+      /** fetch 完成后清理 abort 监听器，避免泄漏（signal 生命周期远长于单次 fetch） */
+      signal?.removeEventListener("abort", onSignalAbort)
       return resp
     } catch (err) {
       clearTimeout(timer)
+      signal?.removeEventListener("abort", onSignalAbort)
       wrapNetworkError(err, this.id)
     }
   }

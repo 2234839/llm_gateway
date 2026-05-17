@@ -67,7 +67,13 @@ export class AnthropicProvider implements Provider {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeout)
     /** 外部 signal（客户端断连）同时中断 fetch */
-    if (signal) signal.addEventListener("abort", () => controller.abort(), { once: true })
+    const onSignalAbort = () => controller.abort()
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(timer)
+      }
+      signal.addEventListener("abort", onSignalAbort, { once: true })
+    }
     try {
       const resp = await fetch(url, {
         method: "POST",
@@ -78,9 +84,11 @@ export class AnthropicProvider implements Provider {
         decompress: false,
       } as RequestInit & { decompress: boolean })
       clearTimeout(timer)
+      signal?.removeEventListener("abort", onSignalAbort)
       return resp
     } catch (err) {
       clearTimeout(timer)
+      signal?.removeEventListener("abort", onSignalAbort)
       wrapNetworkError(err, this.id)
     }
   }
