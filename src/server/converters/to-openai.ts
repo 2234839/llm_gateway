@@ -124,12 +124,7 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
     }
   }
 
-  /** 保留非 tool_result 的 user 内容 */
-  if (userParts.length > 0) {
-    results.push({ role: "user", content: userParts })
-  }
-
-  /** tool_result 拆分为独立的 role: "tool" 消息 */
+  /** tool_result 拆分为独立的 role: "tool" 消息（必须在 user 文本之前，OpenAI 要求紧跟 assistant tool_calls） */
   for (const tr of toolResults) {
     const raw = tr.content
     const content = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map(b => {
@@ -139,6 +134,11 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
       return `[image: ${img.source.media_type ?? "unknown"}, ${img.source.data?.length ?? 0} bytes]`
     }).join("\n") : ""
     results.push({ role: "tool", tool_call_id: tr.tool_use_id, content: tr.is_error ? `[ERROR] ${content}` : content })
+  }
+
+  /** 保留非 tool_result 的 user 内容（放在 tool_result 之后） */
+  if (userParts.length > 0) {
+    results.push({ role: "user", content: userParts })
   }
 
   return results
