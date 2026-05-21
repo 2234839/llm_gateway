@@ -63,6 +63,15 @@ export function convertRequestToAnthropic(body: OpenAIChatCompletionRequest, tar
     result.metadata = { user_id: body.user }
   }
 
+  /** 透传思考模式参数（DeepSeek / GLM 等模型支持） */
+  if (body.thinking) {
+    result.thinking = { type: body.thinking.type }
+  }
+  /** OpenAI reasoning_effort → Anthropic output_config.effort */
+  if (body.reasoning_effort) {
+    result.output_config = { effort: body.reasoning_effort }
+  }
+
   return result
 }
 
@@ -102,6 +111,11 @@ function convertUserMessage(msg: OpenAIUserMessage): AnthropicMessage {
 
 function convertAssistantMessage(msg: OpenAIAssistantMessage): AnthropicMessage {
   const blocks: AnthropicContentBlock[] = []
+
+  /** reasoning_content 映射为 thinking block（DeepSeek / OpenAI reasoning 扩展） */
+  if (msg.reasoning_content) {
+    blocks.push({ type: "thinking", thinking: msg.reasoning_content })
+  }
 
   if (msg.content) {
     blocks.push({ type: "text", text: msg.content })

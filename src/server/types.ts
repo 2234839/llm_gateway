@@ -14,6 +14,8 @@ export interface AnthropicMessagesRequest {
   tools?: AnthropicTool[]
   tool_choice?: AnthropicToolChoice
   thinking?: AnthropicThinkingConfig
+  /** 思考强度控制（DeepSeek Anthropic 格式: output_config.effort） */
+  output_config?: { effort?: string }
   metadata?: { user_id?: string }
 }
 
@@ -93,8 +95,8 @@ export type AnthropicToolChoice =
   | { type: "none" }
 
 export interface AnthropicThinkingConfig {
-  type: "enabled"
-  budget_tokens: number
+  type: "enabled" | "disabled"
+  budget_tokens?: number
 }
 
 // ========== Anthropic 响应类型 ==========
@@ -169,6 +171,12 @@ export interface OpenAIChatCompletionRequest {
   logprobs?: boolean
   top_logprobs?: number
   user?: string
+  /** 思考模式控制（DeepSeek / GLM 等模型支持） */
+  thinking?: { type: "enabled" | "disabled" }
+  /** 思考强度控制（DeepSeek / GLM 等模型支持） */
+  reasoning_effort?: string
+  /** Anthropic 格式的思考输出配置（GLM 等支持 Anthropic 格式的模型） */
+  output_config?: { effort?: string }
 }
 
 export type OpenAIChatMessage =

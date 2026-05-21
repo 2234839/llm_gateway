@@ -61,6 +61,15 @@ export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetMod
     result.user = body.metadata.user_id
   }
 
+  /** 透传思考模式参数（DeepSeek / GLM 等模型支持） */
+  if (body.thinking) {
+    result.thinking = { type: body.thinking.type }
+  }
+  /** Anthropic output_config.effort → OpenAI reasoning_effort */
+  if (body.output_config?.effort) {
+    result.reasoning_effort = body.output_config.effort
+  }
+
   return result
 }
 
