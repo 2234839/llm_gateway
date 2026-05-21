@@ -13,6 +13,9 @@ export function convertResponseToOpenAI(
   let content: string | null = null
   const toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = []
 
+  /** 合并 thinking 块内容到 reasoning_content 字段 */
+  let reasoningContent: string | null = null
+
   for (const block of resp.content ?? []) {
     if (block.type === "text") {
       content = (content ?? "") + block.text
@@ -26,7 +29,7 @@ export function convertResponseToOpenAI(
         },
       })
     } else if (block.type === "thinking") {
-      content = (content ?? "") + `[thinking] ${block.thinking} [/thinking]\n`
+      reasoningContent = (reasoningContent ?? "") + block.thinking
     } else if (block.type !== "redacted_thinking") {
       console.warn(`[resp-to-openai] skipping unsupported content block type: ${(block as { type: string }).type}`)
     }
@@ -35,6 +38,9 @@ export function convertResponseToOpenAI(
   const message: OpenAIChatCompletionResponse["choices"][number]["message"] = {
     role: "assistant",
     content,
+  }
+  if (reasoningContent) {
+    message.reasoning_content = reasoningContent
   }
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls

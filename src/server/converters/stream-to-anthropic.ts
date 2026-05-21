@@ -70,7 +70,7 @@ export async function streamOpenAIToAnthropic(
   }
 
   /** 当前打开的 block 类型，用于判断是否需要切换 */
-  let currentBlockType: "text" | "tool_use" | null = null
+  let currentBlockType: "text" | "tool_use" | "thinking" | null = null
 
   function openTextBlock() {
     if (hasOpenBlock && currentBlockType === "text") {
@@ -78,7 +78,7 @@ export async function streamOpenAIToAnthropic(
       return
     }
     if (hasOpenBlock) {
-      /** 当前是 tool_use block，先关闭 */
+      /** 当前是其他 block，先关闭 */
       closeCurrentBlock()
     }
     currentContentIndex++
@@ -88,6 +88,23 @@ export async function streamOpenAIToAnthropic(
       type: "content_block_start",
       index: currentContentIndex,
       content_block: { type: "text", text: "" },
+    })
+  }
+
+  function openThinkingBlock() {
+    if (hasOpenBlock && currentBlockType === "thinking") {
+      return
+    }
+    if (hasOpenBlock) {
+      closeCurrentBlock()
+    }
+    currentContentIndex++
+    hasOpenBlock = true
+    currentBlockType = "thinking"
+    writeEvent("content_block_start", {
+      type: "content_block_start",
+      index: currentContentIndex,
+      content_block: { type: "thinking", thinking: "" },
     })
   }
 
@@ -191,6 +208,18 @@ export async function streamOpenAIToAnthropic(
             delta: { type: "text_delta", text: delta.content },
           })
           onText?.(delta.content)
+          outputTokens++
+        }
+
+        /** reasoning_content（DeepSeek/OpenAI reasoning 扩展）映射为 thinking block */
+        if (delta.reasoning_content) {
+          openThinkingBlock()
+          writeEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: currentContentIndex,
+            delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+          })
+          onText?.(delta.reasoning_content)
           outputTokens++
         }
 

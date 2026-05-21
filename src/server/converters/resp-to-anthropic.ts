@@ -34,6 +34,11 @@ export function convertResponseToAnthropic(
 
   const content: AnthropicResponseContentBlock[] = []
 
+  /** reasoning_content 映射为 thinking block（DeepSeek/OpenAI reasoning 扩展） */
+  if (choice.message.reasoning_content) {
+    content.push({ type: "thinking", thinking: choice.message.reasoning_content })
+  }
+
   if (choice.message.content) {
     content.push({ type: "text", text: choice.message.content })
   }

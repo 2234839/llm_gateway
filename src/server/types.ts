@@ -190,6 +190,8 @@ export interface OpenAIUserMessage {
 export interface OpenAIAssistantMessage {
   role: "assistant"
   content?: string | null
+  /** DeepSeek / OpenAI reasoning 扩展：思维链内容 */
+  reasoning_content?: string | null
   tool_calls?: OpenAIToolCall[]
 }
 
@@ -240,6 +242,8 @@ export interface OpenAIChatCompletionResponse {
     message: {
       role: "assistant"
       content: string | null
+      /** DeepSeek / OpenAI reasoning 扩展：思维链内容 */
+      reasoning_content?: string | null
       tool_calls?: OpenAIToolCall[]
       refusal?: string | null
     }
@@ -277,6 +281,8 @@ export interface OpenAIStreamChunk {
     delta: {
       role?: string
       content?: string | null
+      /** DeepSeek / OpenAI reasoning 扩展：流式思维链内容 */
+      reasoning_content?: string | null
       tool_calls?: {
         index: number
         id?: string

@@ -128,9 +128,8 @@ export async function streamAnthropicToOpenAI(
               currentToolCallIndex++
             } else if (block && typeof block === "object" && "type" in block && block.type === "thinking") {
               inThinkingBlock = true
-              const marker = "[thinking] "
-              writeChunk({ content: marker })
-              onText?.(marker)
+              /** thinking 内容通过 reasoning_content 字段输出（DeepSeek/OpenAI reasoning 扩展） */
+              writeChunk({ reasoning_content: "" })
             }
             break
           }
@@ -141,8 +140,8 @@ export async function streamAnthropicToOpenAI(
               writeChunk({ content: delta.text })
               onText?.(delta.text)
             } else if (delta.type === "thinking_delta") {
-              /** thinking 内容作为文本输出（与非流式保持一致） */
-              writeChunk({ content: delta.thinking })
+              /** thinking 内容映射到 reasoning_content（DeepSeek/OpenAI reasoning 扩展） */
+              writeChunk({ reasoning_content: delta.thinking })
               onText?.(delta.thinking)
             } else if (delta.type === "input_json_delta") {
               currentToolArgs += delta.partial_json
@@ -166,9 +165,6 @@ export async function streamAnthropicToOpenAI(
               currentToolArgs = ""
             }
             if (inThinkingBlock) {
-              const endMarker = " [/thinking]\n"
-              writeChunk({ content: endMarker })
-              onText?.(endMarker)
               inThinkingBlock = false
             }
             break
@@ -201,7 +197,6 @@ export async function streamAnthropicToOpenAI(
 
           case "error": {
             if (inThinkingBlock) {
-              writeChunk({ content: " [/thinking]\n" })
               inThinkingBlock = false
             }
             finished = true

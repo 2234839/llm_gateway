@@ -138,6 +138,8 @@ function convertUserContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMe
 function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIChatMessage[] {
   const textParts: string[] = []
   const toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = []
+  /** 合并所有 thinking 块的内容，映射到 DeepSeek/OpenAI 的 reasoning_content 字段 */
+  const thinkingParts: string[] = []
 
   for (const block of blocks) {
     switch (block.type) {
@@ -145,8 +147,7 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
         textParts.push(block.text)
         break
       case "thinking":
-        /** thinking 块在 OpenAI 格式中无对应，用折叠标记保留 */
-        textParts.push(`[thinking] ${block.thinking} [/thinking]`)
+        thinkingParts.push(block.thinking)
         break
       case "tool_use": {
         const tb = block as AnthropicToolUseBlock
@@ -157,13 +158,17 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
         })
         break
       }
-      /** redacted_thinking 无法还原，跳过 */
+      /** redacted_thinking 无法映射，跳过 */
     }
   }
 
   const msg: OpenAIChatMessage = {
     role: "assistant",
     content: textParts.length > 0 ? textParts.join("") : null,
+  }
+
+  if (thinkingParts.length > 0) {
+    (msg as { reasoning_content?: string }).reasoning_content = thinkingParts.join("")
   }
 
   if (toolCalls.length > 0) {
