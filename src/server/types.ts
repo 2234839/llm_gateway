@@ -200,6 +200,8 @@ export interface OpenAIAssistantMessage {
   content?: string | null
   /** DeepSeek / OpenAI reasoning 扩展：思维链内容 */
   reasoning_content?: string | null
+  /** DeepSeek AnthropicFB 要求回传的 thinking signature */
+  reasoning_signature?: string
   tool_calls?: OpenAIToolCall[]
 }
 
@@ -252,6 +254,8 @@ export interface OpenAIChatCompletionResponse {
       content: string | null
       /** DeepSeek / OpenAI reasoning 扩展：思维链内容 */
       reasoning_content?: string | null
+      /** DeepSeek AnthropicFB 要求回传的 thinking signature */
+      reasoning_signature?: string
       tool_calls?: OpenAIToolCall[]
       refusal?: string | null
     }

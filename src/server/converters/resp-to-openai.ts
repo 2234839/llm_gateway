@@ -15,6 +15,7 @@ export function convertResponseToOpenAI(
 
   /** 合并 thinking 块内容到 reasoning_content 字段 */
   let reasoningContent: string | null = null
+  let thinkingSignature: string | undefined
 
   for (const block of resp.content ?? []) {
     if (block.type === "text") {
@@ -30,6 +31,9 @@ export function convertResponseToOpenAI(
       })
     } else if (block.type === "thinking") {
       reasoningContent = (reasoningContent ?? "") + block.thinking
+      /** 保留 thinking signature（DeepSeek AnthropicFB 要求回传） */
+      const sig = (block as { signature?: string }).signature
+      if (sig) thinkingSignature = sig
     } else if (block.type !== "redacted_thinking") {
       console.warn(`[resp-to-openai] skipping unsupported content block type: ${(block as { type: string }).type}`)
     }
@@ -41,6 +45,9 @@ export function convertResponseToOpenAI(
   }
   if (reasoningContent) {
     message.reasoning_content = reasoningContent
+  }
+  if (thinkingSignature) {
+    message.reasoning_signature = thinkingSignature
   }
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls

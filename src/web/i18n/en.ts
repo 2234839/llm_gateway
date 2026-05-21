@@ -315,5 +315,6 @@ export default {
     clearFilter: "Clear",
     noLogs: "No logs found",
     contentPruned: "Request content has been pruned to save storage",
+    autoRefresh: "Auto Refresh",
   },
 }

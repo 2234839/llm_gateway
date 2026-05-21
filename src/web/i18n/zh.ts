@@ -315,5 +315,6 @@ export default {
     clearFilter: "清除",
     noLogs: "暂无日志",
     contentPruned: "请求内容已清理以节省存储空间",
+    autoRefresh: "自动刷新",
   },
 }

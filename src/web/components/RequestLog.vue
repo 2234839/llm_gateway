@@ -56,6 +56,8 @@ function sortIndicator(field: string): string {
   return sortDir.value === "desc" ? " ▼" : " ▲"
 }
 
+/** 自动刷新开关（默认关闭，用户手动勾选后启用） */
+const autoRefresh = ref(false)
 /** SSE 实时刷新 */
 let sseUnsubscribe: (() => void) | null = null
 /** 防抖：避免短时间内多个请求结束触发频繁刷新 */
@@ -74,8 +76,9 @@ function disconnectSSE() {
   if (sseUnsubscribe) { sseUnsubscribe(); sseUnsubscribe = null }
 }
 
-/** 仅在第一页且无筛选条件时自动刷新 */
+/** 仅在自动刷新开启 + 第一页 + 无筛选条件时刷新 */
 function scheduleRefresh() {
+  if (!autoRefresh.value) return
   if (offset.value > 0 || filterModel.value || filterStatus.value || filterProvider.value || filterKey.value || filterGroup.value || filterFallback.value || filterStartTime.value || filterEndTime.value) return
   if (refreshTimer) return
   refreshTimer = setTimeout(() => {
@@ -84,13 +87,23 @@ function scheduleRefresh() {
   }, 2000)
 }
 
+/** 自动刷新开关变化时连接/断开 SSE */
+function onAutoRefreshChange() {
+  if (autoRefresh.value) {
+    connectSSE()
+  } else {
+    disconnectSSE()
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
+  }
+}
+
 onMounted(async () => {
   const [p, k, g] = await Promise.all([providerApi.list(), apiKeyApi.list(), keyGroupApi.list()])
   providers.value = p
   apiKeys.value = k
   keyGroups.value = g
   await load()
-  connectSSE()
+  /** 默认不连接 SSE，用户勾选自动刷新后才连接 */
 })
 
 onUnmounted(() => {
@@ -105,9 +118,9 @@ onDeactivated(() => {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
 })
 
-/** KeepAlive activate：恢复 SSE */
+/** KeepAlive activate：恢复 SSE（仅自动刷新开启时） */
 onActivated(() => {
-  connectSSE()
+  if (autoRefresh.value) connectSSE()
 })
 
 async function load() {
@@ -300,6 +313,10 @@ async function copyContent(text: string) {
     <div class="toolbar">
       <h2>{{ t('log.title') }}</h2>
       <button class="btn" @click="load">{{ t('log.refresh') }}</button>
+      <label class="filter-checkbox auto-refresh-toggle">
+        <input type="checkbox" v-model="autoRefresh" @change="onAutoRefreshChange" />
+        {{ t('log.autoRefresh') }}
+      </label>
     </div>
 
     <!-- 筛选栏 -->
@@ -489,6 +506,10 @@ async function copyContent(text: string) {
 }
 .filter-checkbox input {
   accent-color: var(--primary);
+}
+
+.auto-refresh-toggle {
+  margin-left: auto;
 }
 
 .filter-time {

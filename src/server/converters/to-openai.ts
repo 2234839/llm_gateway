@@ -65,9 +65,9 @@ export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetMod
   if (body.thinking) {
     result.thinking = { type: body.thinking.type }
   }
-  /** Anthropic output_config.effort → OpenAI reasoning_effort */
+  /** Anthropic output_config.effort → OpenAI reasoning_effort（xhigh 映射为 high） */
   if (body.output_config?.effort) {
-    result.reasoning_effort = body.output_config.effort
+    result.reasoning_effort = body.output_config.effort === "xhigh" ? "high" : body.output_config.effort
   }
 
   return result

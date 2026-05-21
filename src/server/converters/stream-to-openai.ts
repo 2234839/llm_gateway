@@ -38,6 +38,8 @@ export async function streamAnthropicToOpenAI(
   let currentToolArgs = ""
   /** 当前是否在 thinking 块中 */
   let inThinkingBlock = false
+  /** 当前 thinking 块的 signature（DeepSeek AnthropicFB 要求回传） */
+  let thinkingSignature = ""
 
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
@@ -143,6 +145,10 @@ export async function streamAnthropicToOpenAI(
               /** thinking 内容映射到 reasoning_content（DeepSeek/OpenAI reasoning 扩展） */
               writeChunk({ reasoning_content: delta.thinking })
               onText?.(delta.thinking)
+            } else if (delta.type === "signature_delta") {
+              /** 保存 thinking signature，写入流供客户端回传（DeepSeek AnthropicFB 要求） */
+              thinkingSignature = delta.signature
+              writeChunk({ thinking_signature: delta.signature })
             } else if (delta.type === "input_json_delta") {
               currentToolArgs += delta.partial_json
               if (currentToolCallIndex > 0) {
