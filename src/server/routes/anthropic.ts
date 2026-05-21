@@ -7,6 +7,7 @@ import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropic
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
 import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
+import { createDisconnectSignal } from "../utils/disconnect.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -135,8 +136,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         }
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
-        /** 使用 Fastify 的 request.signal：客户端断连时 Fastify 自动 abort，比 request.raw.close 更可靠（Bun 下 close 事件不可靠） */
-        const clientSignal = request.signal
+        /** 基于 TCP socket close 的断连信号，比 request.signal 可靠（Bun 下 request.signal 在请求体消费后会误 abort） */
+        const clientSignal = createDisconnectSignal(request)
         try {
           await semaphore?.acquire(clientSignal)
         } catch {
@@ -144,6 +145,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         }
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
+          
           const result = await handleAnthropicUpstream(currentProvider, currentTarget, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
@@ -158,12 +160,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
             cacheCreationTokens = result.cacheCreationTokens
             cacheReadTokens = result.cacheReadTokens
             outputText = result.outputText ?? outputText
-            if (result.streamHijacked) {
-              /** 流式传输仍在进行，延迟释放信号量到流结束时 */
-              reply.raw.once("close", () => semaphore?.release())
-            } else {
-              semaphore?.release()
-            }
+            /** 上游已接受请求，释放信号量（不延迟到流结束，避免 Bun 下 close 事件不可靠导致信号量泄漏） */
+            semaphore?.release()
             return
           }
           /** 请求失败，释放信号量 */
@@ -289,7 +287,7 @@ async function handleAnthropicUpstream(
         oTokens = tu.outputTokens
         ccTokens = tu.cacheCreationTokens
         crTokens = tu.cacheReadTokens
-      }, onStreamError, signal)
+      }, onStreamError)
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
@@ -341,7 +339,7 @@ async function handleAnthropicUpstream(
       iTokens = finalInput
       oTokens = finalOutput
       crTokens = finalCr
-    }, onStreamError, signal)
+    }, onStreamError)
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
@@ -393,7 +391,6 @@ function streamPassthrough(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (usage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }) => void,
   onStreamError?: (err: string) => void,
-  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -417,17 +414,9 @@ function streamPassthrough(
   /** 是否收到过有效 SSE 事件（用于检测空流） */
   let hasReceivedEvent = false
 
-  /** 客户端断连时主动取消上游 reader（无需等下一个 chunk） */
-  const onReaderAbort = () => reader.cancel().catch(() => {})
-  if (signal) {
-    signal.addEventListener("abort", onReaderAbort, { once: true })
-  }
-
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
-        /** 流结束，清理 abort 监听器 */
-        signal?.removeEventListener("abort", onReaderAbort)
         /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
         if (!hasReceivedEvent) {
           const errMsg = "Empty response body from upstream"
@@ -444,7 +433,6 @@ function streamPassthrough(
       }
       /** 客户端已断连，取消上游读取 */
       if (!raw.writable) {
-        signal?.removeEventListener("abort", onReaderAbort)
         reader.cancel().catch(() => {})
         return
       }
@@ -498,7 +486,6 @@ function streamPassthrough(
       return pump()
     }).catch((err) => {
       /** 上游流式传输中断，发送 SSE error 事件并关闭连接 */
-      signal?.removeEventListener("abort", onReaderAbort)
       const errMsg = "Stream interrupted: " + (err as Error).message
       console.error(`[anthropic] Stream interrupted: ${(err as Error).message}`)
       onStreamError?.(errMsg)

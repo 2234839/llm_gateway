@@ -7,6 +7,7 @@ import { extractOpenAIText, extractOpenAIResponseSummary, extractOpenAIContentTy
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
 import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
+import { createDisconnectSignal } from "../utils/disconnect.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -143,8 +144,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
-        /** 使用 Fastify 的 request.signal：客户端断连时 Fastify 自动 abort，比 request.raw.close 更可靠（Bun 下 close 事件不可靠） */
-        const clientSignal = request.signal
+        /** 基于 TCP socket close 的断连信号，比 request.signal 可靠（Bun 下 request.signal 在请求体消费后会误 abort） */
+        const clientSignal = createDisconnectSignal(request)
         try {
           await semaphore?.acquire(clientSignal)
         } catch {
@@ -166,12 +167,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
             cacheCreationTokens = result.cacheCreationTokens
             cacheReadTokens = result.cacheReadTokens
             outputText = result.outputText ?? outputText
-            if (result.streamHijacked) {
-              /** 流式传输仍在进行，延迟释放信号量到流结束时 */
-              reply.raw.once("close", () => semaphore?.release())
-            } else {
-              semaphore?.release()
-            }
+            /** 上游已接受请求，释放信号量（不延迟到流结束，避免 Bun 下 close 事件不可靠导致信号量泄漏） */
+            semaphore?.release()
             return
           }
           /** 请求失败，释放信号量 */
@@ -291,7 +288,7 @@ async function handleOpenAIUpstream(
         iTokens = i
         oTokens = o
         crTokens = cr
-      }, onStreamError, estimateOpenAIInputTokens(body), signal)
+      }, onStreamError, estimateOpenAIInputTokens(body))
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
@@ -340,7 +337,7 @@ async function handleOpenAIUpstream(
       oTokens = o
       ccTokens = cc
       crTokens = cr
-    }, onStreamError, signal)
+    }, onStreamError)
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
@@ -385,7 +382,6 @@ function streamPassthroughOpenAI(
   onTokenUsage?: (inputTokens: number, outputTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
   estimatedInputTokens?: number,
-  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -399,11 +395,6 @@ function streamPassthroughOpenAI(
 
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
-  /** 客户端断连时主动取消上游 reader */
-  const onReaderAbort = () => reader.cancel().catch(() => {})
-  if (signal) {
-    signal.addEventListener("abort", onReaderAbort, { once: true })
-  }
   /** SSE 行缓冲区，处理跨 chunk 的行分割 */
   let sseBuffer = ""
   /** 跟踪是否收到过 usage 报告（部分 provider 不支持 stream_options） */
@@ -416,8 +407,6 @@ function streamPassthroughOpenAI(
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
-        /** 流结束，清理 abort 监听器 */
-        signal?.removeEventListener("abort", onReaderAbort)
         /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
         if (!hasReceivedEvent) {
           const errMsg = "Empty response body from upstream"
@@ -438,7 +427,6 @@ function streamPassthroughOpenAI(
       }
       /** 客户端已断连，取消上游读取 */
       if (!raw.writable) {
-        signal?.removeEventListener("abort", onReaderAbort)
         reader.cancel().catch(() => {})
         return
       }
@@ -472,8 +460,7 @@ function streamPassthroughOpenAI(
       }
       return pump()
     }).catch((err) => {
-      /** 上游流式传输中断，清理 abort 监听器 */
-      signal?.removeEventListener("abort", onReaderAbort)
+      /** 上游流式传输中断 */
       const errMsg = "Stream interrupted: " + (err as Error).message
       console.error(`[openai] Stream interrupted: ${(err as Error).message}`)
       onStreamError?.(errMsg)

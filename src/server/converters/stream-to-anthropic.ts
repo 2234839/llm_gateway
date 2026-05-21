@@ -22,7 +22,6 @@ export async function streamOpenAIToAnthropic(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
-  signal?: AbortSignal,
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -46,12 +45,6 @@ export async function streamOpenAIToAnthropic(
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
-
-  /** 客户端断连时主动取消上游 reader */
-  const onAbort = () => reader.cancel().catch(() => {})
-  if (signal) {
-    signal.addEventListener("abort", onAbort, { once: true })
-  }
 
   function writeEvent(event: string, data: unknown) {
     raw.write(formatSSE(event, data))
@@ -265,7 +258,6 @@ export async function streamOpenAIToAnthropic(
     if (!started && raw.writable) startMessage()
     if (raw.writable) finish("end_turn", { type: "api_error", message: errMsg })
   } finally {
-    signal?.removeEventListener("abort", onAbort)
     onTokenUsage?.(realInputTokens, outputTokens, cacheReadTokens)
     if (raw.writable) raw.end()
   }
