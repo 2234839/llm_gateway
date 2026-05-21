@@ -1,6 +1,6 @@
 {
   "name": "llm-gateway",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "type": "module",
   "scripts": {
     "dev": "bun run scripts/dev.ts",
