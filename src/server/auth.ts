@@ -162,6 +162,11 @@ export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
       })
     }
 
+    /** 迁移：历史密钥没有 key_secret，用请求中的 rawKey 回补 */
+    if (!keyRecord.keySecret) {
+      db.updateApiKey(keyRecord.id, { keySecret: rawKey })
+    }
+
     /** 解析分组 */
     const group = db.getKeyGroup(keyRecord.groupId)
 
