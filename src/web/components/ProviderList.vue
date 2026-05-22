@@ -25,6 +25,9 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
 
 const form = ref({ ...emptyProvider })
 
+/** 控制 apiKey 输入框的显示/隐藏 */
+const showApiKey = ref(false)
+
 /** 测试连通性状态 */
 const testing = ref(false)
 const testResult = ref<ProviderTestResult | null>(null)
@@ -84,8 +87,7 @@ async function checkAllHealth() {
 
 function startEdit(p: ProviderInfo) {
   editing.value = p
-  /** apiKey 已脱敏，编辑时清空并用 placeholder 提示 */
-  form.value = { ...p, apiKey: "", customHeaders: { ...(p.customHeaders ?? {}) } }
+  form.value = { ...p, customHeaders: { ...(p.customHeaders ?? {}) } }
   creating.value = false
   testResult.value = null
   modelInput.value = ""
@@ -304,7 +306,12 @@ function removeHeader(index: number) {
           </label>
           <label class="span-2">
             {{ t('provider.apiKeyLabel') }}
-            <input v-model="form.apiKey" type="password" :placeholder="editing ? t('provider.apiKeyEditHint') : t('provider.apiKeyPlaceholder')" />
+            <div class="apikey-input-row">
+              <input v-model="form.apiKey" :type="showApiKey ? 'text' : 'password'" :placeholder="editing ? t('provider.apiKeyEditHint') : t('provider.apiKeyPlaceholder')" />
+              <button type="button" class="btn-icon" @click="showApiKey = !showApiKey">
+                {{ showApiKey ? '🙈' : '👁️' }}
+              </button>
+            </div>
           </label>
           <label class="span-2">
             {{ t('provider.modelLabel') }}
@@ -481,6 +488,16 @@ function removeHeader(index: number) {
 }
 
 .header-value {
+  flex: 1;
+}
+
+.apikey-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.apikey-input-row input {
   flex: 1;
 }
 

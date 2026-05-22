@@ -145,7 +145,7 @@ export default {
     urlLabel: "接口地址",
     apiKeyLabel: "API 密钥",
     apiKeyPlaceholder: "sk-...",
-    apiKeyEditHint: "留空则不修改",
+    apiKeyEditHint: "修改 API 密钥",
     modelLabel: "模型",
     modelInputPlaceholder: "输入模型名称",
     concurrencyLabel: "并发限制",

@@ -145,7 +145,7 @@ export default {
     urlLabel: "Base URL",
     apiKeyLabel: "API Key",
     apiKeyPlaceholder: "sk-...",
-    apiKeyEditHint: "Leave empty to keep current",
+    apiKeyEditHint: "Edit API key",
     modelLabel: "Models",
     modelInputPlaceholder: "Enter model name",
     concurrencyLabel: "Concurrency Limit",
