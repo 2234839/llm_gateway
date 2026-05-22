@@ -63,7 +63,7 @@
 - 覆盖请求体、SSE 流式响应、非流式响应
 - 同协议请求直接透传原始字节，零转换开销
 - 兼容官方 SDK，客户端无需改动
-- 兼容 OpenAI 兼容服务商，包括 **Kimi（Moonshot）**、**DeepSeek**
+- 兼容 OpenAI 兼容服务商，包括 **Kimi（Moonshot）**、**DeepSeek**、**GLM（智谱）**
 
 **团队管理**
 - 网关级 API Key（不是你的服务商密钥）

@@ -63,7 +63,7 @@ Rules are evaluated top-down. First match wins. Each rule can have fallback prov
 - Covers request body, streaming SSE, and non-streaming responses
 - Same-protocol requests pass through as raw bytes — zero conversion overhead
 - Works with official SDKs, no client changes needed
-- Compatible with OpenAI-compatible providers including **Kimi (Moonshot)**, **DeepSeek**
+- Compatible with OpenAI-compatible providers including **Kimi (Moonshot)**, **DeepSeek**, **GLM (Zhipu)**
 
 **Team Management**
 - Gateway-level API keys (not your provider keys)
