@@ -206,6 +206,11 @@ export class GatewayDB {
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_group_id ON api_keys(group_id)`)
 
+    /** 兼容已有数据库：api_keys 添加 key_secret 列 */
+    try {
+      this.db.run("ALTER TABLE api_keys ADD COLUMN key_secret TEXT DEFAULT ''")
+    } catch { /* 列已存在 */ }
+
     /** 兼容已有数据库：添加新列 */
     try {
       this.db.run("ALTER TABLE route_rules ADD COLUMN key_groups TEXT DEFAULT NULL")
@@ -756,8 +761,8 @@ export class GatewayDB {
 
   addApiKey(key: ApiKey) {
     this.stmt(
-      "INSERT INTO api_keys (id, name, key_hash, key_prefix, group_id, enabled, daily_token_limit, monthly_token_limit, rpm_limit, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(key.id, key.name, key.keyHash, key.keyPrefix, key.groupId, key.enabled ? 1 : 0, key.dailyTokenLimit, key.monthlyTokenLimit, key.rpmLimit, key.description)
+      "INSERT INTO api_keys (id, name, key_hash, key_prefix, key_secret, group_id, enabled, daily_token_limit, monthly_token_limit, rpm_limit, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(key.id, key.name, key.keyHash, key.keyPrefix, key.keySecret, key.groupId, key.enabled ? 1 : 0, key.dailyTokenLimit, key.monthlyTokenLimit, key.rpmLimit, key.description)
   }
 
   updateApiKey(id: string, key: Partial<ApiKey>) {
@@ -766,8 +771,8 @@ export class GatewayDB {
       if (!existing) return
       const updated = { ...existing, ...key, id }
       this.stmt(
-        "UPDATE api_keys SET name=?, key_hash=?, key_prefix=?, group_id=?, enabled=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=?, description=? WHERE id=?"
-      ).run(updated.name, updated.keyHash, updated.keyPrefix, updated.groupId, updated.enabled ? 1 : 0, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, updated.description, id)
+        "UPDATE api_keys SET name=?, key_hash=?, key_prefix=?, key_secret=?, group_id=?, enabled=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=?, description=? WHERE id=?"
+      ).run(updated.name, updated.keyHash, updated.keyPrefix, updated.keySecret, updated.groupId, updated.enabled ? 1 : 0, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, updated.description, id)
     })
   }
 
@@ -805,6 +810,7 @@ export class GatewayDB {
       name: row.name as string,
       keyHash: row.key_hash as string,
       keyPrefix: row.key_prefix as string,
+      keySecret: (row.key_secret as string) || "",
       groupId: row.group_id as string,
       enabled: (row.enabled as number) === 1,
       dailyTokenLimit: (row.daily_token_limit as number) || 0,

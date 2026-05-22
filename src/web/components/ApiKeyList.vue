@@ -49,8 +49,32 @@ const emptyKey = {
 
 const keyForm = ref({ ...emptyKey })
 
-/** 新建密钥后展示原始密钥 */
-const createdKeySecret = ref<string | null>(null)
+/** 控制每行密钥的显示/隐藏状态：keyId -> boolean */
+const showSecretMap = ref<Map<string, boolean>>(new Map())
+
+function toggleShowSecret(id: string) {
+  const map = new Map(showSecretMap.value)
+  map.set(id, !map.get(id))
+  showSecretMap.value = map
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const ta = document.createElement("textarea")
+    ta.value = text
+    ta.style.position = "fixed"
+    ta.style.opacity = "0"
+    document.body.appendChild(ta)
+    try {
+      ta.select()
+      document.execCommand("copy")
+    } finally {
+      document.body.removeChild(ta)
+    }
+  }
+}
 
 /** SSE 驱动的用量刷新：3 秒节流 */
 let tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null
@@ -194,9 +218,7 @@ async function saveKey() {
     keySaving.value = true
     if (keyCreating.value) {
       const data = { ...keyForm.value, dailyTokenLimit: Number(keyForm.value.dailyTokenLimit) || 0, monthlyTokenLimit: Number(keyForm.value.monthlyTokenLimit) || 0, rpmLimit: Number(keyForm.value.rpmLimit) || 0 }
-      const result = await apiKeyApi.create(data)
-      /** 创建后展示原始密钥 */
-      createdKeySecret.value = (result as ApiKeyInfo & { rawKey: string }).rawKey
+      await apiKeyApi.create(data)
       cancelKey()
       await load()
     } else if (keyEditing.value) {
@@ -236,31 +258,6 @@ async function toggleKeyEnabled(k: ApiKeyInfo) {
     await load()
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Operation failed"
-  }
-}
-
-function closeSecretModal() {
-  createdKeySecret.value = null
-}
-
-async function copySecret() {
-  if (!createdKeySecret.value) return
-  error.value = ""
-  try {
-    await navigator.clipboard.writeText(createdKeySecret.value)
-  } catch {
-    /** Clipboard API 不可用时回退到 select + copy */
-    const ta = document.createElement("textarea")
-    ta.value = createdKeySecret.value
-    ta.style.position = "fixed"
-    ta.style.opacity = "0"
-    document.body.appendChild(ta)
-    try {
-      ta.select()
-      document.execCommand("copy")
-    } finally {
-      document.body.removeChild(ta)
-    }
   }
 }
 
@@ -402,7 +399,7 @@ function quotaPercent(used: number, limit: number): number {
           <thead>
             <tr>
               <th>{{ t("keys.nameCol") }}</th>
-              <th>{{ t("keys.prefixCol") }}</th>
+              <th>{{ t("keys.secretCol") }}</th>
               <th>{{ t("keys.groupCol") }}</th>
               <th>{{ t("keys.statusCol") }}</th>
               <th>{{ t("keys.dailyLimitCol") }}</th>
@@ -419,7 +416,15 @@ function quotaPercent(used: number, limit: number): number {
             </tr>
             <tr v-for="k in keys" :key="k.id" :class="{ disabled: !k.enabled }">
               <td>{{ k.name }}</td>
-              <td><code class="mono">{{ k.keyPrefix }}</code></td>
+              <td>
+                <div class="secret-cell">
+                  <code class="mono">{{ showSecretMap.get(k.id) ? k.keySecret : k.keyPrefix + '***' }}</code>
+                  <button class="btn-icon" :title="showSecretMap.get(k.id) ? t('keys.hide') : t('keys.show')" @click="toggleShowSecret(k.id)">
+                    {{ showSecretMap.get(k.id) ? '🙈' : '👁️' }}
+                  </button>
+                  <button class="btn-icon" :title="t('keys.copy')" @click="copyToClipboard(k.keySecret)">📋</button>
+                </div>
+              </td>
               <td>{{ groupName(k.groupId) }}</td>
               <td>
                 <label class="toggle" :title="k.enabled ? t('keys.enabled') : t('keys.disabled')">
@@ -480,20 +485,6 @@ function quotaPercent(used: number, limit: number): number {
         </div>
       </section>
 
-      <!-- ========== Secret Modal ========== -->
-      <div v-if="createdKeySecret" class="modal-overlay" @click.self="closeSecretModal">
-        <div class="modal-card">
-          <h3>{{ t("keys.keyCreatedTitle") }}</h3>
-          <p class="warning-text">{{ t("keys.keyCreatedWarning") }}</p>
-          <div class="secret-row">
-            <input :value="createdKeySecret" readonly class="mono secret-input" @focus="($event.target as HTMLInputElement).select()" />
-            <button class="btn btn-primary" @click="copySecret">{{ t("keys.copy") }}</button>
-          </div>
-          <div class="form-actions">
-            <button class="btn" @click="closeSecretModal">{{ t("keys.close") }}</button>
-          </div>
-        </div>
-      </div>
     </template>
   </div>
 </template>
@@ -513,45 +504,37 @@ function quotaPercent(used: number, limit: number): number {
   gap: 8px;
 }
 
+.secret-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 200px;
+}
+
+.secret-cell code {
+  flex: 1;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-icon {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 14px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.btn-icon:hover {
+  opacity: 1;
+}
 
 tr.disabled {
   opacity: 0.45;
-}
-
-/** Secret modal */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-
-.modal-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 24px;
-  width: 560px;
-  max-width: 90vw;
-}
-
-.warning-text {
-  color: var(--test-fail);
-  font-size: 14px;
-  margin: 8px 0 16px;
-}
-
-.secret-row {
-  display: flex;
-  gap: 8px;
-}
-
-.secret-input {
-  flex: 1;
-  font-size: 13px;
 }
 
 .error-banner {

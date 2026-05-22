@@ -482,6 +482,8 @@ export interface ApiKey {
   keyHash: string
   /** 前 8 字符，用于展示：sk-a1b2c... */
   keyPrefix: string
+  /** 完整原始密钥，前端可直接查看 */
+  keySecret: string
   groupId: string
   enabled: boolean
   /** 每日 Token 限额，0 = 不限 */

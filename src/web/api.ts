@@ -158,6 +158,8 @@ export interface ApiKeyInfo {
   id: string
   name: string
   keyPrefix: string
+  /** 完整原始密钥 */
+  keySecret: string
   groupId: string
   enabled: boolean
   dailyTokenLimit: number

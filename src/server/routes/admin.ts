@@ -1,20 +1,9 @@
 import type { FastifyInstance } from "fastify"
-import type { KeyGroup, ApiKey, ApiKeyWithSecret, ProviderConfig, RouteRule } from "../types.ts"
+import type { KeyGroup, ApiKey, ProviderConfig, RouteRule } from "../types.ts"
 import { v4 as uuid } from "uuid"
 import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
 import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
-
-/** apiKey 脱敏：保留前 4 后 4 位，中间用 *** 替代 */
-function maskApiKey(key: string): string {
-  if (!key || key.length <= 12) return "****"
-  return key.slice(0, 4) + "***" + key.slice(-4)
-}
-
-/** 判断是否为脱敏后的 apiKey（包含 *** 且长度合理） */
-function isMaskedApiKey(key: string): boolean {
-  return key.includes("***")
-}
 
 /** 设置 session cookie（根据请求协议决定 Secure 标志，HTTP 环境下浏览器会拒绝 Secure cookie） */
 function setSessionCookie(reply: import("fastify").FastifyReply, token: string) {
@@ -212,7 +201,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // ========== Providers ==========
 
   fastify.get("/admin/providers", async () => {
-    return fastify.db.getProviders().map(p => ({ ...p, apiKey: maskApiKey(p.apiKey) }))
+    return fastify.db.getProviders()
   })
 
   fastify.post<{ Body: Omit<ProviderConfig, "id"> }>("/admin/providers", async (request, reply) => {
@@ -235,7 +224,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     fastify.db.addProvider(provider)
     fastify.registry.reload()
     invalidateNameCache()
-    return reply.status(201).send({ ...provider, apiKey: maskApiKey(provider.apiKey) })
+    return reply.status(201).send(provider)
   })
 
   fastify.put<{ Params: { id: string }; Body: Partial<ProviderConfig> }>("/admin/providers/:id", async (request, reply) => {
@@ -258,15 +247,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (update.enabled !== undefined && typeof update.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
     if (update.maxConcurrency !== undefined && (typeof update.maxConcurrency !== "number" || update.maxConcurrency < 0)) return reply.status(400).send({ error: "maxConcurrency must be a non-negative number" })
     if (update.requestTimeout !== undefined && (typeof update.requestTimeout !== "number" || update.requestTimeout < 0)) return reply.status(400).send({ error: "requestTimeout must be a non-negative number" })
-    /** 脱敏 apiKey 不覆盖原值 */
-    if (update.apiKey && isMaskedApiKey(update.apiKey)) {
-      delete update.apiKey
-    }
     fastify.db.updateProvider(id, update)
     fastify.registry.reload()
     invalidateNameCache()
-    const updated = fastify.db.getProvider(id)
-    return reply.send(updated ? { ...updated, apiKey: maskApiKey(updated.apiKey) } : null)
+    return fastify.db.getProvider(id)
   })
 
   fastify.delete<{ Params: { id: string } }>("/admin/providers/:id", async (request, reply) => {
@@ -561,6 +545,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       name: body.name,
       keyHash: hash,
       keyPrefix: prefix,
+      keySecret: rawKey,
       groupId: body.groupId,
       enabled: true,
       dailyTokenLimit: body.dailyTokenLimit ?? 0,
@@ -572,9 +557,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
     fastify.db.addApiKey(key)
     invalidateNameCache()
-    /** 返回时包含原始密钥（仅此一次） */
-    const result: ApiKeyWithSecret = { ...key, rawKey }
-    return reply.status(201).send(result)
+    return reply.status(201).send(key)
   })
 
   fastify.put<{ Params: { id: string }; Body: Partial<ApiKey> }>("/admin/keys/:id", async (request, reply) => {
