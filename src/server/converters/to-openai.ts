@@ -149,6 +149,8 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
   const toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = []
   /** 合并所有 thinking 块的内容，映射到 DeepSeek/OpenAI 的 reasoning_content 字段 */
   const thinkingParts: string[] = []
+  /** 保留 thinking signature（DeepSeek AnthropicFB 要求回传） */
+  let thinkingSignature: string | undefined
 
   for (const block of blocks) {
     switch (block.type) {
@@ -157,6 +159,9 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
         break
       case "thinking":
         thinkingParts.push(block.thinking)
+        if ((block as { signature?: string }).signature) {
+          thinkingSignature = (block as { signature?: string }).signature
+        }
         break
       case "tool_use": {
         const tb = block as AnthropicToolUseBlock
@@ -178,6 +183,9 @@ function convertAssistantContentBlocks(blocks: AnthropicContentBlock[]): OpenAIC
 
   if (thinkingParts.length > 0) {
     (msg as { reasoning_content?: string }).reasoning_content = thinkingParts.join("")
+  }
+  if (thinkingSignature) {
+    (msg as { reasoning_signature?: string }).reasoning_signature = thinkingSignature
   }
 
   if (toolCalls.length > 0) {
