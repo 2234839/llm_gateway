@@ -458,9 +458,9 @@ function streamPassthrough(
         raw.write(line + "\n")
         /** 空行 = SSE 事件结束边界，立即 flush */
         if (line === "") raw.flushHeaders()
-        if (!line.startsWith("data: ")) continue
+        if (!line.startsWith("data:")) continue
         try {
-          const obj = JSON.parse(line.slice(6))
+          const obj = JSON.parse(line.slice(5).trim())
           if (!obj.type) continue
           hasReceivedEvent = true
           if (obj.type === "message_start") {

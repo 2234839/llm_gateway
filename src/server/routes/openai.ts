@@ -446,9 +446,10 @@ function streamPassthroughOpenAI(
         raw.write(line + "\n")
         /** 空行 = SSE 事件结束边界，立即 flush */
         if (line === "") raw.flushHeaders()
-        if (!line.startsWith("data: ") || line === "data: [DONE]") continue
+        const dataLine = line.startsWith("data:") ? line.slice(5).trim() : ""
+        if (!dataLine || dataLine === "[DONE]") continue
         try {
-          const obj = JSON.parse(line.slice(6))
+          const obj = JSON.parse(dataLine)
           if (!obj.id && !obj.choices?.length && !obj.usage) continue
           hasReceivedEvent = true
           const delta = obj.choices?.[0]?.delta
