@@ -320,8 +320,10 @@ async function handleAnthropicUpstream(
 
   if (isStream) {
     const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {}, signal)
+    console.log(`[anthropic] upstream stream response status: ${upstream.status}, content-type: ${upstream.headers.get("content-type")}`)
     if (!upstream.ok) {
       const errBody = await upstream.text()
+      console.error(`[anthropic] upstream stream error (${upstream.status}): ${errBody.slice(0, 500)}`)
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
 
@@ -329,6 +331,7 @@ async function handleAnthropicUpstream(
     let oTokens = 0
     let crTokens = 0
     if (!upstream.body) {
+      console.error(`[anthropic] upstream stream has no body (status: ${upstream.status})`)
       return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
     reply.hijack()

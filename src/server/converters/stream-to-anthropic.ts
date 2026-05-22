@@ -161,6 +161,7 @@ export async function streamOpenAIToAnthropic(
     writeEvent("message_stop", { type: "message_stop" })
   }
 
+  let chunkCount = 0
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -171,7 +172,12 @@ export async function streamOpenAIToAnthropic(
         break
       }
 
-      buffer += decoder.decode(value, { stream: true })
+      const decoded = decoder.decode(value, { stream: true })
+      chunkCount++
+      if (chunkCount <= 3) {
+        console.log(`[stream-to-anthropic] chunk #${chunkCount} raw: ${JSON.stringify(decoded.slice(0, 300))}`)
+      }
+      buffer += decoded
       const { events, remaining } = parseSSEBuffer(buffer)
       buffer = remaining
 
@@ -268,9 +274,7 @@ export async function streamOpenAIToAnthropic(
     if (raw.writable) {
       if (!started) {
         /** 空流：从未收到有效 SSE 事件，发送 error 而非空消息 */
-        if (buffer) {
-          console.error(`[stream-to-anthropic] empty stream but buffer has residue: ${JSON.stringify(buffer.slice(0, 200))}`)
-        }
+        console.error(`[stream-to-anthropic] empty stream after ${chunkCount} chunks. buffer residue: ${JSON.stringify(buffer.slice(0, 500))}`)
         onStreamError?.("Empty response body from upstream")
         startMessage()
         finish("end_turn", { type: "api_error", message: "Empty response body from upstream" })
