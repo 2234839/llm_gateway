@@ -35,10 +35,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     reply.header("x-gateway-request-id", gatewayRequestId)
 
     /** 提取上游 headers（需要透传的） */
-    const upstreamHeaders: Record<string, string> = {}
-    const h = request.headers
-    if (h["anthropic-version"]) upstreamHeaders["anthropic-version"] = h["anthropic-version"] as string
-    if (h["anthropic-beta"]) upstreamHeaders["anthropic-beta"] = h["anthropic-beta"] as string
+    const upstreamHeaders = extractClientHeaders(request.headers)
 
     let providerId = ""
     let targetModel = ""
@@ -539,6 +536,33 @@ function extractLastAnthropicUserMessage(body: AnthropicMessagesRequest): string
   return null
 }
 
+
+/** 从客户端请求头中提取需要透传给上游的 headers
+ * 排除网关自己管理的字段（host、content-length、authorization 等）
+ */
+function extractClientHeaders(headers: import("fastify").FastifyRequest["headers"]): Record<string, string> {
+  const result: Record<string, string> = {}
+  const skipHeaders = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "content-type",
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "accept-encoding",
+  ])
+  for (const [key, value] of Object.entries(headers)) {
+    if (!value) continue
+    if (skipHeaders.has(key.toLowerCase())) continue
+    if (typeof value === "string") {
+      result[key] = value
+    } else if (Array.isArray(value)) {
+      result[key] = value.join(", ")
+    }
+  }
+  return result
+}
 
 /** 粗略估算输入 token 数 */
 function estimateInputTokens(body: AnthropicMessagesRequest): number {

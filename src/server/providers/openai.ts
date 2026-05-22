@@ -51,8 +51,8 @@ export class OpenAIProvider implements Provider {
 
   async sendRequest(body: Record<string, unknown>, headers: Record<string, string> = {}, signal?: AbortSignal): Promise<Response> {
     const url = `${this.baseUrl}/chat/completions`
-    /** 合并顺序：内置 < per-request < 强制保护字段 */
-    const finalHeaders = { ...this.buildHeaders(), ...headers }
+    /** 合并顺序：内置 < per-request < customHeaders（配置优先级最高）< 强制保护字段 */
+    const finalHeaders = { ...this.buildHeaders(), ...headers, ...this.customHeaders }
     finalHeaders["Content-Type"] = "application/json"
     if (this.type === "azure-openai") {
       finalHeaders["api-key"] = this.apiKey
@@ -77,7 +77,8 @@ export class OpenAIProvider implements Provider {
 
   async sendStreamRequest(body: Record<string, unknown>, headers: Record<string, string> = {}, signal?: AbortSignal): Promise<Response> {
     const url = `${this.baseUrl}/chat/completions`
-    const finalHeaders = { ...this.buildHeaders(), ...headers }
+    /** 合并顺序：内置 < per-request < customHeaders（配置优先级最高）< 强制保护字段 */
+    const finalHeaders = { ...this.buildHeaders(), ...headers, ...this.customHeaders }
     finalHeaders["Content-Type"] = "application/json"
     if (this.type === "azure-openai") {
       finalHeaders["api-key"] = this.apiKey

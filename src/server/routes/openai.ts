@@ -271,10 +271,13 @@ async function handleOpenAIUpstream(
   streamHijacked?: boolean
 }> {
   try {
+  /** 提取需要透传的客户端 headers */
+  const clientHeaders = extractClientHeaders(reply.request.headers)
+
   if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
     /** OpenAI 兼容提供商 — 透传 */
     if (isStream) {
-      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, {}, signal)
+      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, clientHeaders, signal)
       if (!upstream.ok) {
         const errBody = await upstream.text()
         return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -292,7 +295,7 @@ async function handleOpenAIUpstream(
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest({ ...body, model: targetModel }, {}, signal)
+    const upstream = await provider.sendRequest({ ...body, model: targetModel }, clientHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -320,6 +323,9 @@ async function handleOpenAIUpstream(
   /** Anthropic 提供商 — 转换格式 */
   const anthropicBody = convertRequestToAnthropic(body, targetModel)
   const upstreamHeaders: Record<string, string> = { "anthropic-version": "2023-06-01" }
+  /** 透传 User-Agent，让上游识别客户端类型 */
+  const reqHeaders = reply.request.headers
+  if (reqHeaders["user-agent"]) upstreamHeaders["User-Agent"] = reqHeaders["user-agent"] as string
 
   if (isStream) {
     const upstream = await provider.sendStreamRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
@@ -491,6 +497,33 @@ function estimateOpenAIInputTokens(body: OpenAIChatCompletionRequest): number {
     }
   }
   return Math.ceil(chars / 4)
+}
+
+/** 从客户端请求头中提取需要透传给上游的 headers
+ * 排除网关自己管理的字段（host、content-length、authorization 等）
+ */
+function extractClientHeaders(headers: import("fastify").FastifyRequest["headers"]): Record<string, string> {
+  const result: Record<string, string> = {}
+  const skipHeaders = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "content-type",
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "accept-encoding",
+  ])
+  for (const [key, value] of Object.entries(headers)) {
+    if (!value) continue
+    if (skipHeaders.has(key.toLowerCase())) continue
+    if (typeof value === "string") {
+      result[key] = value
+    } else if (Array.isArray(value)) {
+      result[key] = value.join(", ")
+    }
+  }
+  return result
 }
 
 /** 提取最后一条 user 消息的文本 */

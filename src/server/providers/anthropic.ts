@@ -37,8 +37,8 @@ export class AnthropicProvider implements Provider {
       headers["anthropic-beta"] = extraHeaders["anthropic-beta"]
     }
 
-    /** 合并顺序：内置 < customHeaders < per-request（除 Content-Type 和认证 key 不被覆盖） */
-    const merged = { ...headers, ...this.customHeaders, ...extraHeaders }
+    /** 合并顺序：内置 < per-request < customHeaders（配置优先级最高，除 Content-Type 和认证 key 外） */
+    const merged = { ...headers, ...extraHeaders, ...this.customHeaders }
     merged["Content-Type"] = "application/json"
     merged["x-api-key"] = this.apiKey
     return merged
