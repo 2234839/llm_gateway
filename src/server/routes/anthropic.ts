@@ -551,6 +551,7 @@ function extractClientHeaders(headers: import("fastify").FastifyRequest["headers
     "x-api-key",
     "api-key",
     "accept-encoding",
+    "accept",
   ])
   for (const [key, value] of Object.entries(headers)) {
     if (!value) continue
