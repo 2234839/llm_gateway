@@ -269,13 +269,16 @@ async function handleAnthropicUpstream(
     /** Anthropic 直连 — 透传 */
     if (isStream) {
       const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, upstreamHeaders, signal)
+      console.log(`[anthropic] anthropic direct stream status: ${upstream.status}, body: ${upstream.body ? "present" : "null"}, content-type: ${upstream.headers.get("content-type")}`)
       if (!upstream.ok) {
         const errBody = await upstream.text()
+        console.error(`[anthropic] anthropic direct stream error (${upstream.status}): ${errBody.slice(0, 500)}`)
         return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
 
       let iTokens = 0, oTokens = 0, ccTokens = 0, crTokens = 0
       if (!upstream.body) {
+        console.error(`[anthropic] anthropic direct stream has no body (status: ${upstream.status})`)
         return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
       reply.hijack()
@@ -414,13 +417,14 @@ function streamPassthrough(
   /** 是否收到过有效 SSE 事件（用于检测空流） */
   let hasReceivedEvent = false
 
+  let chunkCount = 0
   function pump(): Promise<void> {
     return reader.read().then(({ done, value }) => {
       if (done) {
         /** 空流检测：从未收到有效 SSE 事件，向上游报错 */
         if (!hasReceivedEvent) {
           const errMsg = "Empty response body from upstream"
-          console.error(`[anthropic] ${errMsg}`)
+          console.error(`[anthropic] ${errMsg} after ${chunkCount} chunks. buffer: ${JSON.stringify(sseBuffer.slice(0, 300))}`)
           onStreamError?.(errMsg)
           if (raw.writable) {
             const errorEvent = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: errMsg } })}\n\n`
@@ -436,13 +440,18 @@ function streamPassthrough(
         reader.cancel().catch(() => {})
         return
       }
+      const decodedChunk = decoder.decode(value, { stream: true })
+      chunkCount++
+      if (chunkCount <= 3) {
+        console.log(`[anthropic] chunk #${chunkCount}: ${JSON.stringify(decodedChunk.slice(0, 300))}`)
+      }
       /**
        * 逐事件写入而非整个 chunk 透传。
        * 上游 fetch 返回的 chunk 可能包含多个 SSE 事件，
        * 整个 chunk 一次性 write 会导致客户端 reader.read() 批量返回。
        * 逐事件 write + flushHeaders 保证每个事件独立到达客户端。
        */
-      sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+      sseBuffer += decodedChunk.replace(/\r\n/g, "\n")
       const lines = sseBuffer.split("\n")
       sseBuffer = lines.pop()!
       for (const line of lines) {
