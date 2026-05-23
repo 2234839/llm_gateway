@@ -5,6 +5,7 @@ import { healthApi, tokenApi, type HealthInfo, type TokenStats } from "../api"
 import { t } from "../i18n"
 import { formatDuration, formatNumber, formatTokenCount } from "../format"
 import { subscribeSSE } from "../sse-manager"
+import SkuUsageWidget from "./SkuUsageWidget.vue"
 
 Chart.register(...registerables)
 
@@ -119,6 +120,106 @@ const EMA_DECAY = 0.85
 const groupTokenStats = ref<{ groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
 const keyTokenStats = ref<{ keyId: string; keyName: string; groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
 
+/** 卡片折叠状态 */
+const LS_KEY_COLLAPSED = "dashboard_collapsed_v2"
+const collapsedCards = ref<Set<string>>(new Set())
+
+function loadCollapsedState() {
+  try {
+    const saved = localStorage.getItem(LS_KEY_COLLAPSED)
+    if (saved) collapsedCards.value = new Set(JSON.parse(saved) as string[])
+  } catch { /* ignore */ }
+}
+
+function toggleCollapse(cardId: string) {
+  const next = new Set(collapsedCards.value)
+  if (next.has(cardId)) next.delete(cardId)
+  else next.add(cardId)
+  collapsedCards.value = next
+  localStorage.setItem(LS_KEY_COLLAPSED, JSON.stringify([...next]))
+}
+
+function isCollapsed(cardId: string): boolean {
+  return collapsedCards.value.has(cardId)
+}
+
+/** 卡片拖拽排序 */
+const LS_KEY_MAIN_ORDER = "dashboard_main_order_v2"
+const LS_KEY_GRID_ORDER = "dashboard_grid_order_v2"
+
+const DEFAULT_MAIN_ORDER = ["concurrency", "sku-usage", "token-trend", "live-requests", "group-token", "key-token"]
+const DEFAULT_GRID_ORDER = ["provider-stats", "model-stats", "provider-token", "model-token"]
+
+const mainCardOrder = ref<string[]>([...DEFAULT_MAIN_ORDER])
+const gridCardOrder = ref<string[]>([...DEFAULT_GRID_ORDER])
+
+function loadCardOrder() {
+  try {
+    const main = localStorage.getItem(LS_KEY_MAIN_ORDER)
+    if (main) {
+      const parsed = JSON.parse(main) as string[]
+      if (parsed.length === DEFAULT_MAIN_ORDER.length && parsed.every(id => DEFAULT_MAIN_ORDER.includes(id))) {
+        mainCardOrder.value = parsed
+      }
+    }
+    const grid = localStorage.getItem(LS_KEY_GRID_ORDER)
+    if (grid) {
+      const parsed = JSON.parse(grid) as string[]
+      if (parsed.length === DEFAULT_GRID_ORDER.length && parsed.every(id => DEFAULT_GRID_ORDER.includes(id))) {
+        gridCardOrder.value = parsed
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+function saveMainOrder() {
+  localStorage.setItem(LS_KEY_MAIN_ORDER, JSON.stringify(mainCardOrder.value))
+}
+
+function saveGridOrder() {
+  localStorage.setItem(LS_KEY_GRID_ORDER, JSON.stringify(gridCardOrder.value))
+}
+
+let dragCardId: string | null = null
+
+function onDragStart(e: DragEvent, cardId: string) {
+  dragCardId = cardId
+  const el = e.target as HTMLElement
+  el.classList.add("dragging")
+  if (e.dataTransfer) {
+    e.dataTransfer.setData("text/plain", cardId)
+    e.dataTransfer.effectAllowed = "move"
+  }
+}
+
+function onDragEnd(e: DragEvent) {
+  (e.target as HTMLElement).classList.remove("dragging")
+  dragCardId = null
+}
+
+function onDragOver(e: DragEvent, orderRef: 'main' | 'grid') {
+  e.preventDefault()
+  if (!dragCardId) return
+  const target = (e.target as HTMLElement).closest("[data-card-id]") as HTMLElement | null
+  if (!target) return
+  const targetId = target.dataset.cardId
+  if (!targetId || targetId === dragCardId) return
+  const list = orderRef === 'main' ? mainCardOrder.value : gridCardOrder.value
+  const fromIndex = list.indexOf(dragCardId)
+  const toIndex = list.indexOf(targetId)
+  if (fromIndex === -1 || toIndex === -1) return
+  const next = [...list]
+  next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, dragCardId)
+  if (orderRef === 'main') {
+    mainCardOrder.value = next
+    saveMainOrder()
+  } else {
+    gridCardOrder.value = next
+    saveGridOrder()
+  }
+}
+
 onMounted(async () => {
   try {
     info.value = await healthApi.get()
@@ -132,6 +233,8 @@ onMounted(async () => {
   initConcurrencyChart()
   loadTokenTrend()
   loadGroupTokenStats()
+  loadCollapsedState()
+  loadCardOrder()
   connectSSE()
   cleanupTimer = setInterval(cleanupCompleted, 30000)
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
@@ -616,37 +719,59 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- 并发 + 输出速率监控 -->
-      <div class="detail-card" style="margin-bottom: 16px">
-        <h3>{{ t('dashboard.concurrencyOutputRate') }}</h3>
-        <div class="chart-container">
-          <canvas ref="concurrencyCanvas"></canvas>
+      <div class="detail-card" style="margin-bottom: 16px" data-card-id="concurrency" draggable="true"
+           @dragstart="onDragStart($event, 'concurrency')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
+        <div class="card-header-row">
+          <h3>{{ t('dashboard.concurrencyOutputRate') }}</h3>
+          <button class="btn-collapse" @click="toggleCollapse('concurrency')">{{ isCollapsed('concurrency') ? '▶' : '▼' }}</button>
         </div>
-        <div v-if="providerConcurrency.length" class="concurrency-grid">
-          <div v-for="p in providerConcurrency" :key="p.id" class="concurrency-block">
-            <div class="concurrency-item">
-              <span class="concurrency-name">{{ p.name }}</span>
-              <span :class="['concurrency-value', { active: p.gateway > 0, saturated: p.max && p.gateway >= p.max }]">
-                <span class="concurrency-upstream">{{ p.upstream }}</span>
-                <span class="concurrency-sep">/</span>
-                <span class="concurrency-gateway">{{ p.gateway }}</span>
-                <template v-if="p.max">{{ ` / ${p.max}` }}</template>
-              </span>
-            </div>
-            <div v-if="p.models?.length" class="concurrency-models">
-              <span v-for="m in p.models" :key="m.model + m.targetModel" class="model-concurrency">
-                {{ m.model }} → {{ m.targetModel }} <strong>x{{ m.count }}</strong>
-              </span>
+        <div v-show="!isCollapsed('concurrency')">
+          <div class="chart-container">
+            <canvas ref="concurrencyCanvas"></canvas>
+          </div>
+          <div v-if="providerConcurrency.length" class="concurrency-grid">
+            <div v-for="p in providerConcurrency" :key="p.id" class="concurrency-block">
+              <div class="concurrency-item">
+                <span class="concurrency-name">{{ p.name }}</span>
+                <span :class="['concurrency-value', { active: p.gateway > 0, saturated: p.max && p.gateway >= p.max }]">
+                  <span class="concurrency-upstream">{{ p.upstream }}</span>
+                  <span class="concurrency-sep">/</span>
+                  <span class="concurrency-gateway">{{ p.gateway }}</span>
+                  <template v-if="p.max">{{ ` / ${p.max}` }}</template>
+                </span>
+              </div>
+              <div v-if="p.models?.length" class="concurrency-models">
+                <span v-for="m in p.models" :key="m.model + m.targetModel" class="model-concurrency">
+                  {{ m.model }} → {{ m.targetModel }} <strong>x{{ m.count }}</strong>
+                </span>
+              </div>
             </div>
           </div>
+          <div v-else class="empty">{{ t('dashboard.noProvider') }}</div>
         </div>
-        <div v-else class="empty">{{ t('dashboard.noProvider') }}</div>
+      </div>
+
+      <!-- SKU 用量统计 -->
+      <div class="detail-card" style="margin-bottom: 16px" data-card-id="sku-usage" draggable="true"
+           @dragstart="onDragStart($event, 'sku-usage')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
+        <div class="card-header-row">
+          <h3>{{ t('skuUsage.title') }}</h3>
+          <button class="btn-collapse" @click="toggleCollapse('sku-usage')">{{ isCollapsed('sku-usage') ? '▶' : '▼' }}</button>
+        </div>
+        <div v-show="!isCollapsed('sku-usage')">
+          <SkuUsageWidget />
+        </div>
       </div>
 
       <!-- Token 用量趋势 -->
-      <div class="detail-card" style="margin-bottom: 16px">
+      <div class="detail-card" style="margin-bottom: 16px" data-card-id="token-trend" draggable="true"
+           @dragstart="onDragStart($event, 'token-trend')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.tokenTrend') }}</h3>
-          <div class="range-tabs">
+          <button class="btn-collapse" @click="toggleCollapse('token-trend')">{{ isCollapsed('token-trend') ? '▶' : '▼' }}</button>
+        </div>
+        <div v-show="!isCollapsed('token-trend')">
+          <div class="range-tabs" style="margin-bottom: 12px;">
             <button
               v-for="opt in tokenTrendOptions"
               :key="opt.value"
@@ -654,24 +779,28 @@ function truncate(s: string, len: number): string {
               @click="setTokenTrendRange(opt.value)"
             >{{ opt.label }}</button>
           </div>
-        </div>
-        <div class="chart-container">
-          <canvas ref="tokenTrendCanvas"></canvas>
+          <div class="chart-container">
+            <canvas ref="tokenTrendCanvas"></canvas>
+          </div>
         </div>
       </div>
 
       <!-- 实时请求日志 -->
-      <div class="detail-card" style="margin-bottom: 24px">
+      <div class="detail-card" style="margin-bottom: 24px" data-card-id="live-requests" draggable="true"
+           @dragstart="onDragStart($event, 'live-requests')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.liveRequests') }}</h3>
-          <div class="filter-tabs" v-if="completedRequests.length > 0">
-            <button :class="['filter-tab', { active: requestFilter === 'all' }]" @click="requestFilter = 'all'">{{ t('dashboard.filterAll') }}</button>
-            <button :class="['filter-tab', { active: requestFilter === 'done' }]" @click="requestFilter = 'done'">{{ t('dashboard.filterDone') }}</button>
-            <button :class="['filter-tab', { active: requestFilter === 'error' }]" @click="requestFilter = 'error'">{{ t('dashboard.filterError') }}</button>
-            <button class="filter-tab" @click="completedRequests = []">✕</button>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <div class="filter-tabs" v-if="completedRequests.length > 0">
+              <button :class="['filter-tab', { active: requestFilter === 'all' }]" @click="requestFilter = 'all'">{{ t('dashboard.filterAll') }}</button>
+              <button :class="['filter-tab', { active: requestFilter === 'done' }]" @click="requestFilter = 'done'">{{ t('dashboard.filterDone') }}</button>
+              <button :class="['filter-tab', { active: requestFilter === 'error' }]" @click="requestFilter = 'error'">{{ t('dashboard.filterError') }}</button>
+              <button class="filter-tab" @click="completedRequests = []">✕</button>
+            </div>
+            <button class="btn-collapse" @click="toggleCollapse('live-requests')">{{ isCollapsed('live-requests') ? '▶' : '▼' }}</button>
           </div>
         </div>
-        <div class="live-logs" ref="liveLogsRef">
+        <div v-show="!isCollapsed('live-requests')" class="live-logs" ref="liveLogsRef">
           <template v-if="liveRequests.size === 0 && filteredCompleted.length === 0">
             <div class="empty">{{ t('dashboard.waitingRequests') }}</div>
           </template>
@@ -724,142 +853,178 @@ function truncate(s: string, len: number): string {
       </div>
 
       <div class="detail-grid">
-        <div class="detail-card">
-          <h3>{{ t('dashboard.providerStats') }}</h3>
-          <table class="table" v-if="info.requestsByProvider.length">
-            <thead>
-              <tr><th>{{ t('dashboard.providerCol') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in info.requestsByProvider" :key="row.providerId">
-                <td>{{ row.providerName }}</td>
-                <td class="mono">{{ row.total }}</td>
-                <td class="mono">{{ row.today }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+        <div class="detail-card" data-card-id="provider-stats" draggable="true"
+             @dragstart="onDragStart($event, 'provider-stats')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
+          <div class="card-header-row">
+            <h3>{{ t('dashboard.providerStats') }}</h3>
+            <button class="btn-collapse" @click="toggleCollapse('provider-stats')">{{ isCollapsed('provider-stats') ? '▶' : '▼' }}</button>
+          </div>
+          <div v-show="!isCollapsed('provider-stats')">
+            <table class="table" v-if="info.requestsByProvider.length">
+              <thead>
+                <tr><th>{{ t('dashboard.providerCol') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in info.requestsByProvider" :key="row.providerId">
+                  <td>{{ row.providerName }}</td>
+                  <td class="mono">{{ row.total }}</td>
+                  <td class="mono">{{ row.today }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+          </div>
         </div>
 
-        <div class="detail-card">
-          <h3>{{ t('dashboard.modelStats') }}</h3>
-          <table class="table" v-if="info.requestsByModel.length">
-            <thead>
-              <tr><th>{{ t('dashboard.requestModel') }}</th><th>{{ t('dashboard.mappedModel') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in info.requestsByModel" :key="row.model + row.targetModel">
-                <td class="mono">{{ row.model }}</td>
-                <td class="mono">{{ row.targetModel }}</td>
-                <td class="mono">{{ row.total }}</td>
-                <td class="mono">{{ row.today }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+        <div class="detail-card" data-card-id="model-stats" draggable="true"
+             @dragstart="onDragStart($event, 'model-stats')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
+          <div class="card-header-row">
+            <h3>{{ t('dashboard.modelStats') }}</h3>
+            <button class="btn-collapse" @click="toggleCollapse('model-stats')">{{ isCollapsed('model-stats') ? '▶' : '▼' }}</button>
+          </div>
+          <div v-show="!isCollapsed('model-stats')">
+            <table class="table" v-if="info.requestsByModel.length">
+              <thead>
+                <tr><th>{{ t('dashboard.requestModel') }}</th><th>{{ t('dashboard.mappedModel') }}</th><th>{{ t('dashboard.totalCol') }}</th><th>{{ t('dashboard.todayCol') }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in info.requestsByModel" :key="row.model + row.targetModel">
+                  <td class="mono">{{ row.model }}</td>
+                  <td class="mono">{{ row.targetModel }}</td>
+                  <td class="mono">{{ row.total }}</td>
+                  <td class="mono">{{ row.today }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+          </div>
         </div>
 
-        <div class="detail-card span-2">
-          <h3>{{ t('dashboard.providerTokenUsage') }}</h3>
-          <table class="table" v-if="info.tokensByProvider?.length">
-            <thead>
-              <tr><th rowspan="2">{{ t('dashboard.providerCol') }}</th><th colspan="4">{{ t('dashboard.totalCol') }}</th><th colspan="4">{{ t('dashboard.todayCol') }}</th></tr>
-              <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in info.tokensByProvider" :key="row.providerId">
-                <td>{{ row.providerName }}</td>
-                <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+        <div class="detail-card span-2" data-card-id="provider-token" draggable="true"
+             @dragstart="onDragStart($event, 'provider-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
+          <div class="card-header-row">
+            <h3>{{ t('dashboard.providerTokenUsage') }}</h3>
+            <button class="btn-collapse" @click="toggleCollapse('provider-token')">{{ isCollapsed('provider-token') ? '▶' : '▼' }}</button>
+          </div>
+          <div v-show="!isCollapsed('provider-token')">
+            <table class="table" v-if="info.tokensByProvider?.length">
+              <thead>
+                <tr><th rowspan="2">{{ t('dashboard.providerCol') }}</th><th colspan="4">{{ t('dashboard.totalCol') }}</th><th colspan="4">{{ t('dashboard.todayCol') }}</th></tr>
+                <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in info.tokensByProvider" :key="row.providerId">
+                  <td>{{ row.providerName }}</td>
+                  <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+          </div>
         </div>
 
-        <div class="detail-card span-2">
-          <h3>{{ t('dashboard.modelTokenUsage') }}</h3>
-          <table class="table" v-if="info.tokensByModel?.length">
-            <thead>
-              <tr><th rowspan="2">{{ t('dashboard.requestModel') }}</th><th rowspan="2">{{ t('dashboard.mappedModel') }}</th><th colspan="4">{{ t('dashboard.totalCol') }}</th><th colspan="4">{{ t('dashboard.todayCol') }}</th></tr>
-              <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in info.tokensByModel" :key="row.model + row.targetModel">
-                <td class="mono">{{ row.model }}</td>
-                <td class="mono">{{ row.targetModel }}</td>
-                <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
-                <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+        <div class="detail-card span-2" data-card-id="model-token" draggable="true"
+             @dragstart="onDragStart($event, 'model-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
+          <div class="card-header-row">
+            <h3>{{ t('dashboard.modelTokenUsage') }}</h3>
+            <button class="btn-collapse" @click="toggleCollapse('model-token')">{{ isCollapsed('model-token') ? '▶' : '▼' }}</button>
+          </div>
+          <div v-show="!isCollapsed('model-token')">
+            <table class="table" v-if="info.tokensByModel?.length">
+              <thead>
+                <tr><th rowspan="2">{{ t('dashboard.requestModel') }}</th><th rowspan="2">{{ t('dashboard.mappedModel') }}</th><th colspan="4">{{ t('dashboard.totalCol') }}</th><th colspan="4">{{ t('dashboard.todayCol') }}</th></tr>
+                <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in info.tokensByModel" :key="row.model + row.targetModel">
+                  <td class="mono">{{ row.model }}</td>
+                  <td class="mono">{{ row.targetModel }}</td>
+                  <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
+                  <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="empty">{{ t('dashboard.noData') }}</div>
+          </div>
         </div>
       </div>
 
       <!-- 分组 Token 用量 -->
-      <div v-if="groupTokenStats.length" class="detail-card" style="margin-bottom: 16px">
-        <h3>{{ t('dashboard.groupTokenUsage') }}</h3>
-        <table class="table">
-          <thead>
-            <tr><th rowspan="2">{{ t('dashboard.groupCol') }}</th><th colspan="5">{{ t('dashboard.totalCol') }}</th><th colspan="5">{{ t('dashboard.todayCol') }}</th></tr>
-            <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in groupTokenStats" :key="row.groupId">
-              <td>{{ row.groupName }}</td>
-              <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.inputTokens + row.total.outputTokens + row.total.cacheCreationTokens + row.total.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.inputTokens + row.today.outputTokens + row.today.cacheCreationTokens + row.today.cacheReadTokens) }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-if="groupTokenStats.length" class="detail-card" style="margin-bottom: 16px" data-card-id="group-token" draggable="true"
+           @dragstart="onDragStart($event, 'group-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
+        <div class="card-header-row">
+          <h3>{{ t('dashboard.groupTokenUsage') }}</h3>
+          <button class="btn-collapse" @click="toggleCollapse('group-token')">{{ isCollapsed('group-token') ? '▶' : '▼' }}</button>
+        </div>
+        <div v-show="!isCollapsed('group-token')">
+          <table class="table">
+            <thead>
+              <tr><th rowspan="2">{{ t('dashboard.groupCol') }}</th><th colspan="5">{{ t('dashboard.totalCol') }}</th><th colspan="5">{{ t('dashboard.todayCol') }}</th></tr>
+              <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in groupTokenStats" :key="row.groupId">
+                <td>{{ row.groupName }}</td>
+                <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.inputTokens + row.total.outputTokens + row.total.cacheCreationTokens + row.total.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.inputTokens + row.today.outputTokens + row.today.cacheCreationTokens + row.today.cacheReadTokens) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <!-- 密钥 Token 用量 -->
-      <div v-if="keyTokenStats.length" class="detail-card" style="margin-bottom: 16px">
-        <h3>{{ t('dashboard.keyTokenUsage') }}</h3>
-        <table class="table">
-          <thead>
-            <tr><th rowspan="2">{{ t('dashboard.keyCol') }}</th><th rowspan="2">{{ t('dashboard.groupCol') }}</th><th colspan="5">{{ t('dashboard.totalCol') }}</th><th colspan="5">{{ t('dashboard.todayCol') }}</th></tr>
-            <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in keyTokenStats" :key="row.keyId">
-              <td>{{ row.keyName }}</td>
-              <td>{{ row.groupName }}</td>
-              <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.total.inputTokens + row.total.outputTokens + row.total.cacheCreationTokens + row.total.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
-              <td class="mono">{{ formatNumber(row.today.inputTokens + row.today.outputTokens + row.today.cacheCreationTokens + row.today.cacheReadTokens) }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-if="keyTokenStats.length" class="detail-card" style="margin-bottom: 16px" data-card-id="key-token" draggable="true"
+           @dragstart="onDragStart($event, 'key-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
+        <div class="card-header-row">
+          <h3>{{ t('dashboard.keyTokenUsage') }}</h3>
+          <button class="btn-collapse" @click="toggleCollapse('key-token')">{{ isCollapsed('key-token') ? '▶' : '▼' }}</button>
+        </div>
+        <div v-show="!isCollapsed('key-token')">
+          <table class="table">
+            <thead>
+              <tr><th rowspan="2">{{ t('dashboard.keyCol') }}</th><th rowspan="2">{{ t('dashboard.groupCol') }}</th><th colspan="5">{{ t('dashboard.totalCol') }}</th><th colspan="5">{{ t('dashboard.todayCol') }}</th></tr>
+              <tr><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th><th>{{ t('dashboard.inputCol') }}</th><th>{{ t('dashboard.outputCol') }}</th><th>{{ t('dashboard.cacheReadCol') }}</th><th>{{ t('dashboard.cacheWriteCol') }}</th><th>{{ t('dashboard.usage') }}</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in keyTokenStats" :key="row.keyId">
+                <td>{{ row.keyName }}</td>
+                <td>{{ row.groupName }}</td>
+                <td class="mono">{{ formatNumber(row.total.inputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.outputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.cacheCreationTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.total.inputTokens + row.total.outputTokens + row.total.cacheCreationTokens + row.total.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.inputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.outputTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.cacheReadTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.cacheCreationTokens) }}</td>
+                <td class="mono">{{ formatNumber(row.today.inputTokens + row.today.outputTokens + row.today.cacheCreationTokens + row.today.cacheReadTokens) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </template>
 
@@ -912,6 +1077,26 @@ export OPENAI_API_KEY=your-key</pre>
 
 .card-header-row h3 {
   margin-bottom: 0;
+}
+
+.btn-collapse {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.btn-collapse:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.dragging {
+  opacity: 0.5;
+  border: 2px dashed var(--primary);
 }
 
 .range-tabs,

@@ -503,6 +503,104 @@ export interface ApiKeyWithSecret extends ApiKey {
   rawKey: string
 }
 
+// ========== 服务商余额查询类型 ==========
+
+/** 服务商类型 */
+export type ServiceProvider = "zhipu" | "deepseek" | "kimi" | "unknown"
+
+/** 余额查询结果 */
+export interface BalanceResult {
+  /** 是否查询成功 */
+  success: boolean
+  /** 可用余额 */
+  balance?: number
+  /** 货币类型 */
+  currency?: string
+  /** 赠送余额 */
+  grantedBalance?: number
+  /** 充值余额 */
+  toppedUpBalance?: number
+  /** 错误信息 */
+  error?: string
+}
+
+/** 用量限额查询结果（智谱专用） */
+export interface QuotaResult {
+  /** 是否查询成功 */
+  success: boolean
+  /** 限额明细 */
+  limits?: {
+    /** 限额类型: TIME_LIMIT / TOKENS_LIMIT */
+    type: string
+    /** 使用百分比 */
+    percentage: number
+    /** 已用量 */
+    usage?: number
+    /** 当前值 */
+    currentValue?: number
+    /** 剩余量 */
+    remaining?: number
+    /** 智谱: 时间单位编码 (5=小时, 3=天, 6=月) */
+    unit?: number
+    /** 智谱: 单位数量 */
+    number?: number
+  }[]
+  /** 错误信息 */
+  error?: string
+}
+
+/** cURL 查询结果 - 用量类型（如 Kimi Code） */
+export interface CurlUsageResult {
+  /** 查询是否成功 */
+  success: boolean
+  /** 服务商类型 */
+  provider?: string
+  /** 用量明细 */
+  usages?: {
+    /** 用量范围 */
+    scope: string
+    /** 限额 */
+    limit: number
+    /** 已用量 */
+    used: number
+    /** 剩余量 */
+    remaining: number
+    /** 重置时间 */
+    resetTime?: string
+    /** 子限额列表（如 300 分钟窗口） */
+    subLimits?: {
+      /** 时间窗口描述 */
+      window: string
+      limit: number
+      used: number
+      remaining: number
+      resetTime?: string
+    }[]
+  }[]
+  /** 总配额 */
+  totalQuota?: {
+    limit: number
+    remaining: number
+  }
+  /** 错误信息 */
+  error?: string
+}
+
+/** cURL 导入配置（Kimi 网页端用） */
+export interface CurlQueryConfig {
+  id: string
+  /** 显示名称 */
+  name: string
+  /** 请求 URL */
+  url: string
+  /** HTTP 方法 */
+  method: string
+  /** 请求头 */
+  headers: Record<string, string>
+  /** 请求体 */
+  body?: string
+}
+
 /** 请求上的认证上下文 */
 export interface AuthContext {
   keyId: string

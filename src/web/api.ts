@@ -187,6 +187,99 @@ export interface GatewayConfigInfo {
   cors: CorsConfigInfo | null
 }
 
+/** 余额查询结果 */
+export interface BalanceResult {
+  success: boolean
+  balance?: number
+  currency?: string
+  /** 赠送余额 */
+  grantedBalance?: number
+  /** 充值余额 */
+  toppedUpBalance?: number
+  error?: string
+}
+
+/** 用量限额 */
+export interface QuotaLimit {
+  type: string
+  percentage: number
+  usage?: number
+  currentValue?: number
+  remaining?: number
+  /** 智谱: 时间单位编码 (5=小时, 3=天, 6=月) */
+  unit?: number
+  /** 智谱: 单位数量 */
+  number?: number
+}
+
+/** cURL 查询配置 */
+export interface CurlQueryConfig {
+  id: string
+  name: string
+  url: string
+  method: string
+  headers: Record<string, string>
+  body?: string
+}
+
+/** cURL 查询结果 - 用量类型（如 Kimi Code） */
+export interface CurlUsageResult {
+  success: boolean
+  provider?: string
+  usages?: {
+    scope: string
+    limit: number
+    used: number
+    remaining: number
+    resetTime?: string
+    subLimits?: {
+      window: string
+      limit: number
+      used: number
+      remaining: number
+      resetTime?: string
+    }[]
+  }[]
+  totalQuota?: {
+    limit: number
+    remaining: number
+  }
+  error?: string
+}
+
+/** 用量统计面板 - Provider 明细 */
+export interface SkuUsageProvider {
+  id: string
+  name: string
+  baseUrl: string
+  balance?: number
+  currency?: string
+  balanceError?: string
+  /** 赠送余额 (DeepSeek) */
+  grantedBalance?: number
+  /** 充值余额 (DeepSeek) */
+  toppedUpBalance?: number
+  quota?: { success: boolean; limits?: QuotaLimit[]; error?: string }
+  weeklyTokens: number
+  monthlyTokens: number
+}
+
+/** 用量统计面板 - 服务商分组 */
+export interface SkuUsageGroup {
+  provider: string
+  displayName: string
+  providers: SkuUsageProvider[]
+  totalBalance?: number
+  totalWeeklyTokens: number
+  totalMonthlyTokens: number
+}
+
+/** 用量统计面板响应 */
+export interface SkuUsageResponse {
+  groups: SkuUsageGroup[]
+  curlQueries: { id: string; name: string; result?: BalanceResult | CurlUsageResult }[]
+}
+
 export const providerApi = {
   list: () => api<ProviderInfo[]>("/admin/providers"),
   create: (data: Omit<ProviderInfo, "id">) => api<ProviderInfo>("/admin/providers", { method: "POST", body: JSON.stringify(data) }),
@@ -277,6 +370,23 @@ export const authApi = {
 export const configApi = {
   get: () => api<GatewayConfigInfo>("/admin/config"),
   update: (data: { authRequired?: boolean; newPassword?: string; gateway?: { cors?: CorsConfigInfo } }) => api<{ success: boolean }>("/admin/config", { method: "PUT", body: JSON.stringify(data) }),
+}
+
+/** 用量统计面板 API */
+export const skuUsageApi = {
+  get: () => api<SkuUsageResponse>("/admin/sku-usage"),
+}
+
+/** cURL 查询配置 API */
+export const curlQueryApi = {
+  list: () => api<CurlQueryConfig[]>("/admin/curl-queries"),
+  create: (data: { name: string; curlString: string }) =>
+    api<CurlQueryConfig>("/admin/curl-queries", { method: "POST", body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<Omit<CurlQueryConfig, "id">>) =>
+    api<CurlQueryConfig>(`/admin/curl-queries/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  delete: (id: string) => api<void>(`/admin/curl-queries/${id}`, { method: "DELETE" }),
+  test: (data: { curlString: string }) =>
+    api<BalanceResult | CurlUsageResult>("/admin/curl-queries/test", { method: "POST", body: JSON.stringify(data) }),
 }
 
 // ========== SSE 事件类型 ==========

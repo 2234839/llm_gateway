@@ -1,7 +1,7 @@
 import { Database, Statement } from "bun:sqlite"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -246,6 +246,19 @@ export class GatewayDB {
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_status_id ON request_logs(status_code, id)`)
     /** 索引：加速按 provider_id 查找路由规则（级联删除） */
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_route_rules_provider_id ON route_rules(provider_id)`)
+
+    /** cURL 查询配置表：存储用户导入的网页端接口配置 */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS curl_queries (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        method TEXT NOT NULL DEFAULT 'GET',
+        headers TEXT NOT NULL DEFAULT '{}',
+        body TEXT DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `)
   }
 
   private prepareStatements() {
@@ -898,6 +911,65 @@ export class GatewayDB {
       "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) as total FROM request_logs WHERE api_key_id = ? AND timestamp >= ? AND timestamp < ?"
     ).get(keyId, monthStart(), nextMonthStart()) as { total: number }
     return row.total
+  }
+
+  // ========== cURL 查询配置 ==========
+
+  getCurlQueries(): CurlQueryConfig[] {
+    const rows = this.stmt("SELECT * FROM curl_queries ORDER BY created_at").all() as Record<string, unknown>[]
+    return rows.map(this.rowToCurlQuery)
+  }
+
+  getCurlQuery(id: string): CurlQueryConfig | null {
+    const row = this.stmt("SELECT * FROM curl_queries WHERE id = ?").get(id) as Record<string, unknown> | null
+    return row ? this.rowToCurlQuery(row) : null
+  }
+
+  addCurlQuery(config: CurlQueryConfig) {
+    this.stmt(
+      "INSERT INTO curl_queries (id, name, url, method, headers, body) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(config.id, config.name, config.url, config.method, JSON.stringify(config.headers), config.body ?? null)
+  }
+
+  updateCurlQuery(id: string, config: Partial<CurlQueryConfig>) {
+    this.tx(() => {
+      const existing = this.getCurlQuery(id)
+      if (!existing) return
+      const updated = { ...existing, ...config, id }
+      this.stmt(
+        "UPDATE curl_queries SET name=?, url=?, method=?, headers=?, body=? WHERE id=?"
+      ).run(updated.name, updated.url, updated.method, JSON.stringify(updated.headers), updated.body ?? null, id)
+    })
+  }
+
+  deleteCurlQuery(id: string) {
+    this.stmt("DELETE FROM curl_queries WHERE id = ?").run(id)
+  }
+
+  private rowToCurlQuery(row: Record<string, unknown>): CurlQueryConfig {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      url: row.url as string,
+      method: row.method as string,
+      headers: JSON.parse((row.headers as string) || "{}"),
+      body: (row.body as string) || undefined,
+    }
+  }
+
+  // ========== 按时间范围统计 Token（用于用量面板） ==========
+
+  /** 获取指定 provider 在指定时间范围内的 token 用量 */
+  getTokenStatsByProviderAndTimeRange(providerId: string, start: string, end: string): TokenStats {
+    const row = this.stmt(
+      `SELECT
+        COALESCE(SUM(input_tokens), 0) as inputTokens,
+        COALESCE(SUM(output_tokens), 0) as outputTokens,
+        COALESCE(SUM(cache_creation_tokens), 0) as cacheCreationTokens,
+        COALESCE(SUM(cache_read_tokens), 0) as cacheReadTokens
+      FROM request_logs WHERE provider_id = ? AND timestamp >= ? AND timestamp < ?`
+    ).get(providerId, start, end) as TokenStats
+    return row
   }
 
   close() {

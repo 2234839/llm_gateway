@@ -3,6 +3,8 @@ import type { KeyGroup, ApiKey, ProviderConfig, RouteRule } from "../types.ts"
 import { v4 as uuid } from "uuid"
 import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
+import { detectProvider, getProviderDisplayName } from "../utils/provider-detector.ts"
+import { queryProviderBalance, queryZhipuQuota, queryWithCurl, parseCurl } from "../utils/balance-query.ts"
 import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
 
 /** 设置 session cookie（根据请求协议决定 Secure 标志，HTTP 环境下浏览器会拒绝 Secure cookie） */
@@ -658,6 +660,220 @@ export async function adminRoutes(fastify: FastifyInstance) {
   /** 按密钥统计 Token */
   fastify.get("/admin/token-stats/by-key", async () => {
     return fastify.statsCache.getTokensByKey()
+  })
+
+  // ========== 用量统计面板（SKU 余额/用量查询） ==========
+
+  /** 获取用量统计面板数据 */
+  fastify.get("/admin/sku-usage", async () => {
+    const providers = fastify.db.getProviders().filter(p => p.enabled)
+    const curlQueries = fastify.db.getCurlQueries()
+
+    /** 计算本周/本月时间范围 */
+    const now = new Date()
+    const weekStart = new Date(now)
+    weekStart.setUTCDate(now.getUTCDate() - now.getUTCDay())
+    weekStart.setUTCHours(0, 0, 0, 0)
+    const monthStart = new Date(now.getUTCFullYear(), now.getUTCMonth(), 1)
+
+    const weekStartStr = weekStart.toISOString().slice(0, 19).replace("T", " ")
+    const monthStartStr = monthStart.toISOString().slice(0, 19).replace("T", " ")
+    const tomorrowStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate() + 1).padStart(2, "0")} 00:00:00`
+
+    /** 按服务商类型 + apiKey 分组，相同 apiKey 的 provider 合并为一条 */
+    type MergedProvider = {
+      id: string
+      name: string
+      baseUrl: string
+      balance?: number
+      currency?: string
+      balanceError?: string
+      grantedBalance?: number
+      toppedUpBalance?: number
+      quota?: Awaited<ReturnType<typeof queryZhipuQuota>>
+      weeklyTokens: number
+      monthlyTokens: number
+    }
+
+    const groups = new Map<string, {
+      provider: string
+      displayName: string
+      providers: MergedProvider[]
+    }>()
+
+    /** 先按 (serviceType, apiKey) 收集所有 provider，合并用量 */
+    const mergedMap = new Map<string, {
+      serviceType: string
+      apiKey: string
+      names: string[]
+      baseUrl: string
+      providerIds: string[]
+      weeklyTokens: number
+      monthlyTokens: number
+    }>()
+
+    for (const p of providers) {
+      const serviceType = detectProvider(p.baseUrl)
+      /** 不支持余额查询的 provider 跳过 */
+      if (serviceType === "unknown") continue
+      const mergeKey = `${serviceType}:${p.apiKey}`
+
+      const weeklyStats = fastify.db.getTokenStatsByProviderAndTimeRange(p.id, weekStartStr, tomorrowStr)
+      const monthlyStats = fastify.db.getTokenStatsByProviderAndTimeRange(p.id, monthStartStr, tomorrowStr)
+      const weeklyTokens = weeklyStats.inputTokens + weeklyStats.outputTokens + weeklyStats.cacheCreationTokens + weeklyStats.cacheReadTokens
+      const monthlyTokens = monthlyStats.inputTokens + monthlyStats.outputTokens + monthlyStats.cacheCreationTokens + monthlyStats.cacheReadTokens
+
+      if (mergedMap.has(mergeKey)) {
+        const entry = mergedMap.get(mergeKey)!
+        entry.names.push(p.name)
+        entry.providerIds.push(p.id)
+        entry.weeklyTokens += weeklyTokens
+        entry.monthlyTokens += monthlyTokens
+      } else {
+        mergedMap.set(mergeKey, {
+          serviceType,
+          apiKey: p.apiKey,
+          names: [p.name],
+          baseUrl: p.baseUrl,
+          providerIds: [p.id],
+          weeklyTokens,
+          monthlyTokens,
+        })
+      }
+    }
+
+    /** 并行查询所有合并后的余额（每个唯一 apiKey 只查一次） */
+    const balancePromises = [...mergedMap.values()].map(async (entry) => {
+      const p = providers.find(x => x.apiKey === entry.apiKey && detectProvider(x.baseUrl) === entry.serviceType)!
+      const balance = await queryProviderBalance(p)
+      let quota: Awaited<ReturnType<typeof queryZhipuQuota>> | undefined
+      if (entry.serviceType === "zhipu") {
+        quota = await queryZhipuQuota(p)
+      }
+      return { mergeKey: `${entry.serviceType}:${entry.apiKey}`, balance, quota }
+    })
+    const balanceResults = await Promise.all(balancePromises)
+    const balanceMap = new Map(balanceResults.map(r => [r.mergeKey, r]))
+
+    /** 将合并后的数据放入分组 */
+    for (const [mergeKey, entry] of mergedMap) {
+      const groupKey = entry.serviceType
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          provider: entry.serviceType,
+          displayName: getProviderDisplayName(entry.serviceType as import("../types.ts").ServiceProvider),
+          providers: [],
+        })
+      }
+      const group = groups.get(groupKey)!
+      const balanceInfo = balanceMap.get(mergeKey)
+
+      group.providers.push({
+        id: entry.providerIds.join(","),
+        name: entry.names.join(" / "),
+        baseUrl: entry.baseUrl,
+        balance: balanceInfo?.balance.success ? balanceInfo.balance.balance : undefined,
+        currency: balanceInfo?.balance.success ? balanceInfo.balance.currency : undefined,
+        balanceError: balanceInfo?.balance.success ? undefined : balanceInfo?.balance.error,
+        grantedBalance: balanceInfo?.balance.success ? balanceInfo.balance.grantedBalance : undefined,
+        toppedUpBalance: balanceInfo?.balance.success ? balanceInfo.balance.toppedUpBalance : undefined,
+        quota: balanceInfo?.quota,
+        weeklyTokens: entry.weeklyTokens,
+        monthlyTokens: entry.monthlyTokens,
+      })
+    }
+
+    /** 查询 cURL 配置 */
+    const curlResults = await Promise.all(
+      curlQueries.map(async (q) => {
+        const result = await queryWithCurl(q)
+        return { id: q.id, name: q.name, result }
+      })
+    )
+
+    /** 计算合计 */
+    const groupArray = [...groups.values()].map(g => {
+      const totalBalance = g.providers.reduce((sum, p) => sum + (p.balance ?? 0), 0)
+      const totalWeeklyTokens = g.providers.reduce((sum, p) => sum + p.weeklyTokens, 0)
+      const totalMonthlyTokens = g.providers.reduce((sum, p) => sum + p.monthlyTokens, 0)
+      return {
+        ...g,
+        totalBalance: totalBalance > 0 ? totalBalance : undefined,
+        totalWeeklyTokens,
+        totalMonthlyTokens,
+      }
+    })
+
+    return {
+      groups: groupArray,
+      curlQueries: curlResults,
+    }
+  })
+
+  // ---------- cURL 查询配置 CRUD ----------
+
+  fastify.get("/admin/curl-queries", async () => {
+    return fastify.db.getCurlQueries()
+  })
+
+  fastify.post<{ Body: { name: string; curlString: string } }>("/admin/curl-queries", async (request, reply) => {
+    const { name, curlString } = request.body
+    if (!name || !curlString) {
+      return reply.status(400).send({ error: "名称和 cURL 命令不能为空" })
+    }
+
+    const parsed = parseCurl(curlString)
+    if (!parsed.url) {
+      return reply.status(400).send({ error: "无法解析 cURL 命令" })
+    }
+
+    const config = {
+      id: uuid(),
+      name,
+      url: parsed.url,
+      method: parsed.method,
+      headers: parsed.headers,
+      body: parsed.body,
+    }
+
+    fastify.db.addCurlQuery(config)
+    return reply.status(201).send(config)
+  })
+
+  fastify.put<{ Params: { id: string }; Body: Partial<{ name: string; url: string; method: string; headers: Record<string, string>; body?: string }> }>("/admin/curl-queries/:id", async (request, reply) => {
+    const existing = fastify.db.getCurlQuery(request.params.id)
+    if (!existing) return reply.status(404).send({ error: "Not found" })
+
+    fastify.db.updateCurlQuery(request.params.id, request.body)
+    return fastify.db.getCurlQuery(request.params.id)
+  })
+
+  fastify.delete<{ Params: { id: string } }>("/admin/curl-queries/:id", async (request, reply) => {
+    fastify.db.deleteCurlQuery(request.params.id)
+    return reply.status(204).send()
+  })
+
+  fastify.post<{ Body: { curlString: string } }>("/admin/curl-queries/test", async (request, reply) => {
+    const { curlString } = request.body
+    if (!curlString) {
+      return reply.status(400).send({ error: "cURL 命令不能为空" })
+    }
+
+    const parsed = parseCurl(curlString)
+    if (!parsed.url) {
+      return reply.status(400).send({ error: "无法解析 cURL 命令" })
+    }
+
+    const result = await queryWithCurl({
+      id: "test",
+      name: "test",
+      url: parsed.url,
+      method: parsed.method,
+      headers: parsed.headers,
+      body: parsed.body,
+    })
+
+    return result
   })
 
   // ========== SSE 实时事件流 ==========
