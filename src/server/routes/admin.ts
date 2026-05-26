@@ -878,8 +878,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   // ========== SSE 实时事件流 ==========
 
-  /** 活跃请求追踪：requestId -> { providerId, providerName, model, targetModel } */
-  const activeRequests = new Map<string, { providerId: string; providerName: string; model: string; targetModel: string }>()
+  /** 活跃请求追踪：存储完整信息用于 SSE 重连回放 */
+  interface ActiveRequest {
+    providerId: string
+    providerName: string
+    model: string
+    targetModel: string
+    input: string
+    rulePattern: string | null
+    keyName?: string | null
+    groupName?: string | null
+    startedAt: number
+    /** 已累积的输出文本（截断至 50000 字符防止内存膨胀） */
+    output: string
+  }
+  const activeRequests = new Map<string, ActiveRequest>()
 
   /** 上游 API 调用追踪：requestId -> providerId */
   const upstreamRequests = new Map<string, string>()
@@ -890,9 +903,18 @@ export async function adminRoutes(fastify: FastifyInstance) {
     time: string
     /** 各 provider 两层并发数 */
     providers: { id: string; gateway: number; upstream: number }[]
+    /** EMA 平滑后的输出速率（chars/s） */
+    outputRate: number
   }
   const maxSnapshots = 300
   const concurrencySnapshots: ConcurrencySnapshot[] = []
+
+  /** 输出速率 EMA 追踪 */
+  let windowOutputChars = 0
+  let lastOutputRateTime = 0
+  let smoothedRate = 0
+  const EMA_ALPHA = 0.3
+  const EMA_DECAY = 0.85
 
   /** 从 activeRequests 统计每个 provider 的网关层并发数 */
   function countActiveByProvider(): Map<string, number> {
@@ -912,6 +934,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return counts
   }
 
+  /** 计算当前 EMA 平滑输出速率并重置累积窗口 */
+  function calcOutputRate(): number {
+    const nowMs = Date.now()
+    const elapsedMs = lastOutputRateTime > 0 ? nowMs - lastOutputRateTime : 0
+    lastOutputRateTime = nowMs
+    if (elapsedMs > 0 && windowOutputChars > 0) {
+      const instantRate = windowOutputChars / (elapsedMs / 1000)
+      smoothedRate = smoothedRate === 0 ? instantRate : EMA_ALPHA * instantRate + (1 - EMA_ALPHA) * smoothedRate
+    } else if (windowOutputChars === 0) {
+      smoothedRate *= EMA_DECAY
+      if (smoothedRate < 0.5) smoothedRate = 0
+    }
+    windowOutputChars = 0
+    return Math.round(smoothedRate)
+  }
+
   /** 记录当前并发快照到环形缓冲区 */
   function recordSnapshot() {
     const now = new Date()
@@ -919,6 +957,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const providers = fastify.registry.getConcurrencyStatus()
     const gatewayCounts = countActiveByProvider()
     const upstreamCounts = countUpstreamByProvider()
+    const outputRate = calcOutputRate()
     concurrencySnapshots.push({
       time,
       providers: providers.map(p => ({
@@ -927,6 +966,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         gateway: gatewayCounts.get(p.id) ?? 0,
         upstream: upstreamCounts.get(p.id) ?? 0,
       })),
+      outputRate,
     })
     if (concurrencySnapshots.length > maxSnapshots) concurrencySnapshots.shift()
   }
@@ -968,17 +1008,20 @@ export async function adminRoutes(fastify: FastifyInstance) {
         models.set(key, { model: req.model, targetModel: req.targetModel, count: 1 })
       }
     }
-    return providerStatus.map(p => ({
-      id: p.id,
-      name: p.name,
-      max: p.max,
-      gateway: gatewayCounts.get(p.id) ?? 0,
-      upstream: upstreamCounts.get(p.id) ?? 0,
-      models: [...(modelMap.get(p.id)?.values() ?? [])],
-    }))
+    return {
+      providers: providerStatus.map(p => ({
+        id: p.id,
+        name: p.name,
+        max: p.max,
+        gateway: gatewayCounts.get(p.id) ?? 0,
+        upstream: upstreamCounts.get(p.id) ?? 0,
+        models: [...(modelMap.get(p.id)?.values() ?? [])],
+      })),
+      outputRate: smoothedRate,
+    }
   }
 
-  /** 事件监听：维护活跃请求表，并发变化时记录快照 */
+  /** 事件监听：维护活跃请求表，并发变化时记录快照并推送 */
   onEvent((event: BusEvent) => {
     if (event.type === "request_start") {
       activeRequests.set(event.requestId, {
@@ -986,8 +1029,15 @@ export async function adminRoutes(fastify: FastifyInstance) {
         providerName: event.provider,
         model: event.model,
         targetModel: event.targetModel,
+        input: event.input,
+        rulePattern: event.rulePattern,
+        keyName: event.keyName,
+        groupName: event.groupName,
+        startedAt: Date.now(),
+        output: "",
       })
       recordSnapshot()
+      pushConcurrency()
     } else if (event.type === "request_end") {
       activeRequests.delete(event.requestId)
       /** 增量更新 total 计数器（避免全表 COUNT/SUM） */
@@ -995,16 +1045,44 @@ export async function adminRoutes(fastify: FastifyInstance) {
       /** 使统计缓存失效 */
       fastify.statsCache.onRequestEnd()
       recordSnapshot()
+      pushConcurrency()
       /** 防抖推送统计数据 */
       scheduleStatsPush()
+    } else if (event.type === "request_stream") {
+      /** 累加输出字符数用于计算输出速率 */
+      windowOutputChars += event.text.length
+      /** 累加输出文本到对应活跃请求，用于 SSE 重连回放 */
+      const req = activeRequests.get(event.requestId)
+      if (req && req.output.length < 50000) req.output += event.text
     } else if (event.type === "upstream_start") {
       upstreamRequests.set(event.requestId, event.providerId)
+      /** 更新活跃请求的 providerId（可能发生 fallback 切换） */
+      const req = activeRequests.get(event.requestId)
+      if (req) {
+        req.providerId = event.providerId
+        if (event.providerName) req.providerName = event.providerName
+      }
       recordSnapshot()
+      pushConcurrency()
     } else if (event.type === "upstream_end") {
       upstreamRequests.delete(event.requestId)
       recordSnapshot()
+      pushConcurrency()
     }
   })
+
+  /** 并发推送回调注册：SSE 连接注册 safeWrite，并发变化时主动推送 */
+  type ConcurrencyWriter = (data: string) => void
+  const concurrencyWriters = new Set<ConcurrencyWriter>()
+
+  function pushConcurrency() {
+    if (concurrencyWriters.size === 0) return
+    const payload = buildConcurrencyPayload()
+    const data = `data: ${JSON.stringify({ type: "concurrency", ...payload })}\n\n`
+    for (const write of concurrencyWriters) {
+      try { write(data) } catch { /* connection already closed */ }
+    }
+  }
 
   /** SSE 最大连接数，超出时拒绝新连接 */
   const MAX_SSE_CONNECTIONS = 20
@@ -1025,8 +1103,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return reply.status(503).send({ error: "Too many SSE connections" })
     }
 
-    let timer: ReturnType<typeof setInterval> | undefined
     let unsubscribe: (() => void) | undefined
+    let unregisterConcurrency: (() => void) | undefined
     /** 背压标记：write 返回 false 时暂停写入，drain 时恢复 */
     let buffered = false
     /** 防止 cleanup 重复触发（error + close 可能连续触发） */
@@ -1038,8 +1116,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     function cleanup() {
       if (cleaned) return
       cleaned = true
-      if (timer) { clearInterval(timer); timer = undefined }
       if (unsubscribe) { unsubscribe(); unsubscribe = undefined }
+      if (unregisterConcurrency) { unregisterConcurrency(); unregisterConcurrency = undefined }
       buffered = false
       sseConnectionCount--
       activeSSEConnections.delete(raw)
@@ -1078,19 +1156,37 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
 
     /** 推送当前并发状态 */
-    const enriched = buildConcurrencyPayload()
-    safeWrite(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
+    const payload = buildConcurrencyPayload()
+    safeWrite(`data: ${JSON.stringify({ type: "concurrency", ...payload })}\n\n`)
 
-    /** 并发状态定时推送（每 2 秒） */
-    timer = setInterval(() => {
+    /** 回放所有活跃请求，前端刷新后可恢复正在进行的请求面板 */
+    for (const [requestId, req] of activeRequests) {
+      safeWrite(`data: ${JSON.stringify({
+        type: "request_start",
+        requestId,
+        model: req.model,
+        targetModel: req.targetModel,
+        provider: req.providerName,
+        providerId: req.providerId,
+        input: req.input,
+        rulePattern: req.rulePattern,
+        keyName: req.keyName,
+        groupName: req.groupName,
+        startedAt: req.startedAt,
+        output: req.output || undefined,
+      })}\n\n`)
+    }
+
+    /** 注册并发推送：并发变化时主动推送，不再定时轮询 */
+    const concurrencyWriter: ConcurrencyWriter = (data) => {
       try {
-        if (!raw.writable) { cleanup(); return }
-        const enriched = buildConcurrencyPayload()
-        safeWrite(`data: ${JSON.stringify({ type: "concurrency", providers: enriched })}\n\n`)
+        safeWrite(data)
       } catch {
         cleanup()
       }
-    }, 2000)
+    }
+    concurrencyWriters.add(concurrencyWriter)
+    unregisterConcurrency = () => { concurrencyWriters.delete(concurrencyWriter) }
 
     /** 监听请求事件并转发（使用预序列化，避免每个连接重复 JSON.stringify） */
     unsubscribe = onSerializedEvent((data) => {

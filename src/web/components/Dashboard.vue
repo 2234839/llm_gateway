@@ -103,18 +103,8 @@ const tokenTrendOptions = [
   { label: "7d", value: 168 },
 ]
 
-/** 输出速率历史（chars/s），与并发共享时间轴 */
+/** 输出速率历史（chars/s），与并发共享时间轴，值由服务端推送 */
 const outputRateHistory: number[] = []
-/** 当前采样窗口内累积的输出字符数 */
-let windowOutputChars = 0
-/** 上一次 appendChartPoint 的时间戳（用于计算实际经过时间） */
-let lastChartPointTime = 0
-/** EMA 平滑后的当前输出速率 */
-let smoothedRate = 0
-/** EMA 更新系数：新数据权重 */
-const EMA_ALPHA = 0.3
-/** 无数据时的衰减系数 */
-const EMA_DECAY = 0.85
 
 /** 分组 Token 用量 */
 const groupTokenStats = ref<{ groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
@@ -214,9 +204,44 @@ function onDragOver(e: DragEvent, orderRef: 'main' | 'grid') {
   if (orderRef === 'main') {
     mainCardOrder.value = next
     saveMainOrder()
+    /** 拖拽过程中实时移动 DOM 元素 */
+    moveDomCard(dragCardId, target, orderRef)
   } else {
     gridCardOrder.value = next
     saveGridOrder()
+    moveDomCard(dragCardId, target, orderRef)
+  }
+}
+
+/** 在 DOM 中移动卡片元素到目标元素之前 */
+function moveDomCard(cardId: string, targetEl: HTMLElement, orderRef: 'main' | 'grid') {
+  const container = orderRef === 'main' ? document.querySelector('.dashboard') : document.querySelector('.detail-grid')
+  if (!container) return
+  const dragEl: HTMLElement | null = container.querySelector(`[data-card-id="${cardId}"]`)
+  if (!dragEl) return
+  container.insertBefore(dragEl, targetEl)
+}
+
+/** 按排序数组重排所有卡片 DOM 位置 */
+function applyCardOrder() {
+  const dashboard = document.querySelector('.dashboard')
+  if (!dashboard) return
+
+  /** 主卡片：插入到 grid 之前，按 mainCardOrder 顺序排列 */
+  const gridSection = dashboard.querySelector('[data-card-id="grid-section"]')
+  for (const cardId of mainCardOrder.value) {
+    const el = dashboard.querySelector(`[data-card-id="${cardId}"]`)
+    if (el && el.parentElement === dashboard) {
+      dashboard.insertBefore(el, gridSection)
+    }
+  }
+
+  /** 网格卡片：在 detail-grid 内按 gridCardOrder 顺序排列 */
+  const grid = dashboard.querySelector('.detail-grid')
+  if (!grid) return
+  for (const cardId of gridCardOrder.value) {
+    const el: HTMLElement | null = grid.querySelector(`[data-card-id="${cardId}"]`)
+    if (el) grid.appendChild(el)
   }
 }
 
@@ -235,6 +260,7 @@ onMounted(async () => {
   loadGroupTokenStats()
   loadCollapsedState()
   loadCardOrder()
+  applyCardOrder()
   connectSSE()
   cleanupTimer = setInterval(cleanupCompleted, 30000)
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
@@ -346,7 +372,7 @@ function initConcurrencyChart() {
 }
 
 /** 从后端历史快照恢复图表数据（重连时先清空旧数据避免重复） */
-function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[] }[]) {
+function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[]; outputRate: number }[]) {
   historyLabels.length = 0
   outputRateHistory.length = 0
   concurrencyHistory.clear()
@@ -362,7 +388,7 @@ function restoreHistory(snapshots: { time: string; providers: { id: string; name
       entry.upstreamPoints.push(p.upstream)
       entry.gatewayPoints.push(p.gateway)
     }
-    outputRateHistory.push(0)
+    outputRateHistory.push(snap.outputRate)
   }
   while (historyLabels.length > maxHistoryPoints) historyLabels.shift()
   for (const entry of concurrencyHistory.values()) {
@@ -374,7 +400,7 @@ function restoreHistory(snapshots: { time: string; providers: { id: string; name
 }
 
 /** 追加单个实时并发数据点并刷新图表 */
-function appendChartPoint() {
+function appendChartPoint(outputRate: number) {
   if (!chartInstance) return
   const now = new Date()
   const label = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
@@ -400,21 +426,9 @@ function appendChartPoint() {
     if (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
   }
 
-  /** EMA 平滑计算输出速率：用实际时间间隔而非请求耗时之和 */
-  const nowMs = Date.now()
-  const elapsedMs = lastChartPointTime > 0 ? nowMs - lastChartPointTime : 0
-  lastChartPointTime = nowMs
-  if (elapsedMs > 0 && windowOutputChars > 0) {
-    const instantRate = windowOutputChars / (elapsedMs / 1000)
-    smoothedRate = smoothedRate === 0 ? instantRate : EMA_ALPHA * instantRate + (1 - EMA_ALPHA) * smoothedRate
-  } else if (windowOutputChars === 0) {
-    /** 无新数据时衰减，不直接归零 */
-    smoothedRate *= EMA_DECAY
-    if (smoothedRate < 0.5) smoothedRate = 0
-  }
-  outputRateHistory.push(Math.round(smoothedRate))
+  /** 输出速率由服务端 EMA 计算，前端仅记录 */
+  outputRateHistory.push(outputRate)
   if (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
-  windowOutputChars = 0
 
   renderConcurrencyChart()
 }
@@ -577,17 +591,13 @@ function disconnectSSE() {
 
 function connectSSE() {
   disconnectSSE()
-  /** 重连时重置速率窗口，避免用旧累积值计算尖峰 */
-  windowOutputChars = 0
-  lastChartPointTime = 0
-  smoothedRate = 0
 
   sseUnsubscribe = subscribeSSE((event) => {
     if (event.type === "concurrency_history") {
       restoreHistory(event.snapshots)
     } else if (event.type === "concurrency") {
       providerConcurrency.value = event.providers
-      appendChartPoint()
+      appendChartPoint(event.outputRate)
     } else if (event.type === "request_start") {
       liveRequests.value.set(event.requestId, {
         requestId: event.requestId,
@@ -597,12 +607,12 @@ function connectSSE() {
         providerId: event.providerId ?? "",
         fallbackProvider: null,
         input: event.input,
-        output: "",
+        output: event.output ?? "",
         status: "running",
         durationMs: 0,
         statusCode: 0,
         error: null,
-        startedAt: Date.now(),
+        startedAt: event.startedAt ?? Date.now(),
         rulePattern: event.rulePattern ?? null,
         keyName: event.keyName ?? null,
         groupName: event.groupName ?? null,
@@ -614,8 +624,6 @@ function connectSSE() {
       if (req) {
         /** 截断过长输出防止浏览器内存膨胀 */
         if (req.output.length < 50000) req.output += event.text
-        /** 实时累加输出字符数到速率窗口 */
-        if (event.text) windowOutputChars += event.text.length
         /** 节流 DOM 滚动：每 200ms 最多触发一次 */
         if (!req._scrollTimer) {
           req._scrollTimer = setTimeout(() => {
@@ -719,7 +727,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- 并发 + 输出速率监控 -->
-      <div class="detail-card" style="margin-bottom: 16px" data-card-id="concurrency" draggable="true"
+      <div class="detail-card" :style="{ order: mainCardOrder.indexOf('concurrency') }" data-card-id="concurrency" draggable="true"
            @dragstart="onDragStart($event, 'concurrency')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.concurrencyOutputRate') }}</h3>
@@ -752,7 +760,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- SKU 用量统计 -->
-      <div class="detail-card" style="margin-bottom: 16px" data-card-id="sku-usage" draggable="true"
+      <div class="detail-card" :style="{ order: mainCardOrder.indexOf('sku-usage') }" data-card-id="sku-usage" draggable="true"
            @dragstart="onDragStart($event, 'sku-usage')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('skuUsage.title') }}</h3>
@@ -764,7 +772,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- Token 用量趋势 -->
-      <div class="detail-card" style="margin-bottom: 16px" data-card-id="token-trend" draggable="true"
+      <div class="detail-card" :style="{ order: mainCardOrder.indexOf('token-trend') }" data-card-id="token-trend" draggable="true"
            @dragstart="onDragStart($event, 'token-trend')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.tokenTrend') }}</h3>
@@ -786,7 +794,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- 实时请求日志 -->
-      <div class="detail-card" style="margin-bottom: 24px" data-card-id="live-requests" draggable="true"
+      <div class="detail-card" :style="{ order: mainCardOrder.indexOf('live-requests') }" data-card-id="live-requests" draggable="true"
            @dragstart="onDragStart($event, 'live-requests')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.liveRequests') }}</h3>
@@ -852,8 +860,8 @@ function truncate(s: string, len: number): string {
         </div>
       </div>
 
-      <div class="detail-grid">
-        <div class="detail-card" data-card-id="provider-stats" draggable="true"
+      <div class="detail-grid" data-card-id="grid-section">
+        <div class="detail-card" :style="{ order: gridCardOrder.indexOf('provider-stats') }" data-card-id="provider-stats" draggable="true"
              @dragstart="onDragStart($event, 'provider-stats')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
           <div class="card-header-row">
             <h3>{{ t('dashboard.providerStats') }}</h3>
@@ -876,7 +884,7 @@ function truncate(s: string, len: number): string {
           </div>
         </div>
 
-        <div class="detail-card" data-card-id="model-stats" draggable="true"
+        <div class="detail-card" :style="{ order: gridCardOrder.indexOf('model-stats') }" data-card-id="model-stats" draggable="true"
              @dragstart="onDragStart($event, 'model-stats')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
           <div class="card-header-row">
             <h3>{{ t('dashboard.modelStats') }}</h3>
@@ -900,7 +908,7 @@ function truncate(s: string, len: number): string {
           </div>
         </div>
 
-        <div class="detail-card span-2" data-card-id="provider-token" draggable="true"
+        <div class="detail-card span-2" :style="{ order: gridCardOrder.indexOf('provider-token') }" data-card-id="provider-token" draggable="true"
              @dragstart="onDragStart($event, 'provider-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
           <div class="card-header-row">
             <h3>{{ t('dashboard.providerTokenUsage') }}</h3>
@@ -930,7 +938,7 @@ function truncate(s: string, len: number): string {
           </div>
         </div>
 
-        <div class="detail-card span-2" data-card-id="model-token" draggable="true"
+        <div class="detail-card span-2" :style="{ order: gridCardOrder.indexOf('model-token') }" data-card-id="model-token" draggable="true"
              @dragstart="onDragStart($event, 'model-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'grid')">
           <div class="card-header-row">
             <h3>{{ t('dashboard.modelTokenUsage') }}</h3>
@@ -963,7 +971,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- 分组 Token 用量 -->
-      <div v-if="groupTokenStats.length" class="detail-card" style="margin-bottom: 16px" data-card-id="group-token" draggable="true"
+      <div v-if="groupTokenStats.length" class="detail-card" :style="{ order: mainCardOrder.indexOf('group-token') }" data-card-id="group-token" draggable="true"
            @dragstart="onDragStart($event, 'group-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.groupTokenUsage') }}</h3>
@@ -995,7 +1003,7 @@ function truncate(s: string, len: number): string {
       </div>
 
       <!-- 密钥 Token 用量 -->
-      <div v-if="keyTokenStats.length" class="detail-card" style="margin-bottom: 16px" data-card-id="key-token" draggable="true"
+      <div v-if="keyTokenStats.length" class="detail-card" :style="{ order: mainCardOrder.indexOf('key-token') }" data-card-id="key-token" draggable="true"
            @dragstart="onDragStart($event, 'key-token')" @dragend="onDragEnd" @dragover="onDragOver($event, 'main')">
         <div class="card-header-row">
           <h3>{{ t('dashboard.keyTokenUsage') }}</h3>
@@ -1054,6 +1062,7 @@ export OPENAI_API_KEY=your-key</pre>
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 20px;
+  margin-bottom: 16px;
   min-width: 0;
   overflow: auto;
 }

@@ -16,6 +16,10 @@ export interface RequestStartEvent {
   keyName?: string | null
   /** 认证分组名称 */
   groupName?: string | null
+  /** 请求开始时间戳（SSE 重连回放时携带，新请求由前端 Date.now() 填充） */
+  startedAt?: number
+  /** 已累积的输出文本（SSE 重连回放时携带） */
+  output?: string
 }
 
 export interface RequestStreamEvent {

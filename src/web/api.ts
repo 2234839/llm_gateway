@@ -395,12 +395,13 @@ export interface SseConnectedEvent { type: "connected" }
 
 export interface SseConcurrencyHistoryEvent {
   type: "concurrency_history"
-  snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[] }[]
+  snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[]; outputRate: number }[]
 }
 
 export interface SseConcurrencyEvent {
   type: "concurrency"
   providers: { id: string; name: string; max: number; gateway: number; upstream: number; models: { model: string; targetModel: string; count: number }[] }[]
+  outputRate: number
 }
 
 export interface SseRequestStartEvent {
@@ -414,6 +415,10 @@ export interface SseRequestStartEvent {
   rulePattern: string | null
   keyName?: string | null
   groupName?: string | null
+  /** 请求开始时间戳（SSE 重连回放时携带） */
+  startedAt?: number
+  /** 已累积输出文本（SSE 重连回放时携带） */
+  output?: string
 }
 
 export interface SseRequestStreamEvent {
