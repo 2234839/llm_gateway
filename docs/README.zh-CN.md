@@ -77,6 +77,15 @@
 - 按小时、服务商、模型的 Token 用量
 - 完整请求/响应日志（自动裁剪）
 
+**内容改写**
+- 请求到达上游服务商前，对消息内容进行改写
+- 四种动作：替换、全部替换、前插、后插
+- 按关键词或正则匹配，支持限定 system/user/assistant 消息范围
+- 按模型名和请求路径过滤（picomatch glob）
+- 按优先级排序的规则管道，支持启用/禁用
+- 基于历史请求日志的实时预览，带 diff 高亮
+- ReDoS 防护，危险模式检测 + 迭代上限
+
 ## 快速开始
 
 ### 从源码构建
@@ -134,6 +143,8 @@ export OPENAI_API_KEY=sk-your-gateway-key
 | CRUD | `/admin/providers/*` | 服务商管理 |
 | GET/POST | `/admin/providers/test` | 连通性测试 |
 | CRUD | `/admin/routes/*` | 路由规则管理 |
+| CRUD | `/admin/rewrite-rules/*` | 改写规则管理 |
+| POST | `/admin/rewrite-rules/preview` | 基于日志预览改写效果 |
 | CRUD | `/admin/key-groups/*` | Key 分组管理 |
 | CRUD | `/admin/keys/*` | API Key 管理 |
 | GET | `/admin/token-stats/by-group` | 按分组用量 |

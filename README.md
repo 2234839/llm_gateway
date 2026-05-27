@@ -77,6 +77,15 @@ Rules are evaluated top-down. First match wins. Each rule can have fallback prov
 - Token usage breakdown by hour, provider, model
 - Full request/response logging (auto-pruned)
 
+**Content Rewrite**
+- Rewrite message content before it reaches upstream providers
+- Four action types: replace, replace all, prepend, append
+- Match by keyword or regex, scope to system/user/assistant messages
+- Model and path pattern filtering (picomatch glob)
+- Priority-ordered rule pipeline with enable/disable toggle
+- Live preview against historical request logs with diff highlighting
+- ReDoS protection with dangerous pattern detection and iteration limits
+
 ## Quick Start
 
 ### From Source
@@ -134,6 +143,8 @@ No protocol-specific prefixes needed — the gateway detects the format:
 | CRUD | `/admin/providers/*` | Provider management |
 | GET/POST | `/admin/providers/test` | Connectivity test |
 | CRUD | `/admin/routes/*` | Route rule management |
+| CRUD | `/admin/rewrite-rules/*` | Rewrite rule management |
+| POST | `/admin/rewrite-rules/preview` | Preview rewrite against logs |
 | CRUD | `/admin/key-groups/*` | Key group management |
 | CRUD | `/admin/keys/*` | API key management |
 | GET | `/admin/token-stats/by-group` | Usage by group |

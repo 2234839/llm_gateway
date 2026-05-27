@@ -365,6 +365,59 @@ export interface RouteFallback {
   targetModel?: string
 }
 
+/** 内容改写规则的消息作用范围 */
+export type RewriteScope = "all" | "system" | "user" | "assistant"
+
+/** 内容改写动作类型 */
+export type RewriteActionType = "replace" | "replace_all" | "prepend" | "append"
+
+/** 内容改写的匹配条件 */
+export interface RewriteMatchCondition {
+  /** 匹配类型 */
+  type: "keyword" | "regex"
+  /** keyword 时为纯文本，regex 时为正则表达式 */
+  pattern: string
+  /** 多条件间的逻辑关系，默认 and */
+  operator?: "and" | "or"
+  /** 正则标志位，如 i */
+  flags?: string
+  /** 匹配范围：限定匹配作用的消息角色，默认 all */
+  scope?: RewriteScope
+}
+
+/** 内容改写的执行动作 */
+export interface RewriteAction {
+  /** 动作类型 */
+  type: RewriteActionType
+  /** 替换/注入的文本内容 */
+  replacement: string
+  /** replace/replace_all 时的匹配模式，不填则使用 match 条件中第一个的 pattern */
+  pattern?: string
+  /** 正则标志位 */
+  flags?: string
+}
+
+/** 内容改写规则 */
+export interface RewriteRule {
+  id: string
+  /** 规则名称 */
+  name: string
+  /** 匹配条件组 */
+  match: RewriteMatchCondition[]
+  /** 执行动作 */
+  action: RewriteAction
+  /** 是否启用 */
+  enabled: boolean
+  /** 优先级，数值越大越先执行 */
+  priority: number
+  /** 限定模型名 (picomatch)，空 = 所有模型 */
+  modelPattern?: string
+  /** 限定请求路径 (picomatch)，空 = 所有路径 */
+  pathPattern?: string
+  /** 创建时间 */
+  createdAt: string
+}
+
 /** CORS 跨域配置 */
 export interface CorsConfig {
   /** 允许的来源：true = 允许所有（反射请求来源），字符串数组 = 指定白名单 */

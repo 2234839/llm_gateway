@@ -249,7 +249,7 @@ function evictHalf<K, V>(map: Map<K, V>) {
 }
 
 /** 获取或创建 picomatch matcher */
-function getCachedPicomatch(pattern: string): (input: string) => boolean {
+export function getCachedPicomatch(pattern: string): (input: string) => boolean {
   let matcher = picomatchCache.get(pattern)
   if (!matcher) {
     if (picomatchCache.size >= MAX_PATTERN_CACHE) evictHalf(picomatchCache)

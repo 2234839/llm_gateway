@@ -474,6 +474,85 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return { success: true }
   })
 
+    // ========== Rewrite Rules ==========
+
+    fastify.get("/admin/rewrite-rules", async () => {
+      return fastify.db.getRewriteRules()
+    })
+
+    fastify.post<{ Body: Omit<import("../types").RewriteRule, "id" | "createdAt"> }>("/admin/rewrite-rules", async (request, reply) => {
+      const body = request.body
+      if (!body.name) return reply.status(400).send({ error: "name is required" })
+      if (!body.match?.length) return reply.status(400).send({ error: "match conditions are required" })
+      if (!body.action) return reply.status(400).send({ error: "action is required" })
+      const { v4: uuid } = await import("uuid")
+      const rule: import("../types").RewriteRule = { ...body, id: uuid(), enabled: body.enabled !== false, priority: body.priority ?? 0, createdAt: new Date().toISOString() }
+      fastify.db.addRewriteRule(rule)
+      return reply.status(201).send(rule)
+    })
+
+    fastify.put<{ Params: { id: string }; Body: Partial<import("../types").RewriteRule> }>("/admin/rewrite-rules/:id", async (request, reply) => {
+      const { id } = request.params
+      const body = request.body
+      const updated = fastify.db.updateRewriteRule(id, body)
+      if (!updated) return reply.status(404).send({ error: "Rewrite rule not found" })
+      return reply.send(fastify.db.getRewriteRule(id))
+    })
+
+    fastify.delete<{ Params: { id: string } }>("/admin/rewrite-rules/:id", async (request, reply) => {
+      const { id } = request.params
+      fastify.db.deleteRewriteRule(id)
+      return reply.status(204).send()
+    })
+
+    fastify.put<{ Body: { id: string; priority: number }[] }>("/admin/rewrite-rules/reorder", async (request, reply) => {
+      const updates = request.body
+      if (!Array.isArray(updates) || updates.length === 0) {
+        return reply.status(400).send({ error: "Expected non-empty array of {id, priority}" })
+      }
+      for (const u of updates) {
+        if (!u.id || typeof u.priority !== "number") {
+          return reply.status(400).send({ error: "Each item must have id (string) and priority (number)" })
+        }
+      }
+      fastify.db.tx(() => {
+        for (const u of updates) {
+          fastify.db.updateRewriteRule(u.id, { priority: u.priority })
+        }
+      })
+      return { success: true }
+    })
+
+    fastify.post<{ Body: { ruleId?: string; rule?: Partial<import("../types").RewriteRule>; logIds: number[] } }>("/admin/rewrite-rules/preview", async (request, reply) => {
+      const { ruleId, rule: tempRule, logIds } = request.body
+      if (!logIds?.length) return reply.status(400).send({ error: "logIds is required" })
+      if (logIds.length > 10) return reply.status(400).send({ error: "Maximum 10 log entries" })
+
+      let rules: import("../types").RewriteRule[]
+      if (ruleId) {
+        const r = fastify.db.getRewriteRule(ruleId)
+        if (!r) return reply.status(404).send({ error: "Rewrite rule not found" })
+        rules = [r]
+      } else if (tempRule) {
+        rules = [{ id: "preview", name: tempRule.name ?? "preview", match: tempRule.match ?? [], action: tempRule.action ?? { type: "replace", replacement: "" }, enabled: true, priority: 0, createdAt: "", modelPattern: tempRule.modelPattern, pathPattern: tempRule.pathPattern }]
+      } else {
+        return reply.status(400).send({ error: "ruleId or rule is required" })
+      }
+
+      const { rewriteTextWithResult } = await import("../utils/rewrite-engine")
+      const results = []
+      for (const logId of logIds) {
+        const log = fastify.db.getLogDetail(logId)
+        if (!log || !log.inputContent) {
+          results.push({ logId, model: log?.model ?? "", path: log?.path ?? "", original: null, rewritten: null, matched: false, matchedRules: [] })
+          continue
+        }
+        const { result: rr, rewritten } = rewriteTextWithResult(log.inputContent, rules, { path: log.path, model: log.model })
+        results.push({ logId, model: log.model, path: log.path, original: log.inputContent, rewritten, matched: rr.matched, matchedRules: rr.matchedRules })
+      }
+      return { results }
+    })
+
   // ========== Key Groups ==========
 
   fastify.get("/admin/key-groups", async () => {

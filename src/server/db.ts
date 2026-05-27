@@ -1,7 +1,7 @@
 import { Database, Statement } from "bun:sqlite"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -259,6 +259,21 @@ export class GatewayDB {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `)
+
+    /** 内容改写规则表 */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS rewrite_rules (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        match_conditions TEXT NOT NULL DEFAULT '[]',
+        action TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        priority INTEGER NOT NULL DEFAULT 0,
+        model_pattern TEXT DEFAULT NULL,
+        path_pattern TEXT DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `)
   }
 
   private prepareStatements() {
@@ -405,6 +420,54 @@ export class GatewayDB {
       enabled: row.enabled !== 0,
       keyGroups: row.key_groups ? JSON.parse(row.key_groups as string) : undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
+    }
+  }
+
+  // ========== Rewrite Rules ==========
+
+  getRewriteRules(): RewriteRule[] {
+    const rows = this.stmt("SELECT * FROM rewrite_rules ORDER BY priority DESC").all() as Record<string, unknown>[]
+    return rows.map(this.rowToRewriteRule.bind(this))
+  }
+
+  getRewriteRule(id: string): RewriteRule | null {
+    const row = this.stmt("SELECT * FROM rewrite_rules WHERE id = ?").get(id) as Record<string, unknown> | null
+    return row ? this.rowToRewriteRule(row) : null
+  }
+
+  addRewriteRule(rule: RewriteRule) {
+    this.stmt(
+      "INSERT INTO rewrite_rules (id, name, match_conditions, action, enabled, priority, model_pattern, path_pattern) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, rule.name, JSON.stringify(rule.match ?? []), JSON.stringify(rule.action ?? {}), rule.enabled !== false ? 1 : 0, rule.priority, rule.modelPattern ?? null, rule.pathPattern ?? null)
+  }
+
+  updateRewriteRule(id: string, rule: Partial<RewriteRule>): boolean {
+    return this.tx(() => {
+      const existing = this.getRewriteRule(id)
+      if (!existing) return false
+      const updated = { ...existing, ...rule, id }
+      this.stmt(
+        "UPDATE rewrite_rules SET name=?, match_conditions=?, action=?, enabled=?, priority=?, model_pattern=?, path_pattern=? WHERE id=?"
+      ).run(updated.name, JSON.stringify(updated.match ?? []), JSON.stringify(updated.action ?? {}), updated.enabled !== false ? 1 : 0, updated.priority, updated.modelPattern ?? null, updated.pathPattern ?? null, id)
+      return true
+    })
+  }
+
+  deleteRewriteRule(id: string) {
+    this.stmt("DELETE FROM rewrite_rules WHERE id = ?").run(id)
+  }
+
+  private rowToRewriteRule(row: Record<string, unknown>): RewriteRule {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      match: JSON.parse((row.match_conditions as string) || "[]"),
+      action: JSON.parse((row.action as string) || "{}"),
+      enabled: row.enabled !== 0,
+      priority: row.priority as number,
+      modelPattern: (row.model_pattern as string) || undefined,
+      pathPattern: (row.path_pattern as string) || undefined,
+      createdAt: row.created_at as string,
     }
   }
 

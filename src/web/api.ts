@@ -301,6 +301,58 @@ export const routeApi = {
   delete: (id: string) => api<void>(`/admin/routes/${id}`, { method: "DELETE" }),
 }
 
+export interface RewriteMatchCondition {
+  type: "keyword" | "regex"
+  pattern: string
+  operator?: "and" | "or"
+  flags?: string
+  scope?: "all" | "system" | "user" | "assistant"
+}
+
+export type RewriteActionType = "replace" | "replace_all" | "prepend" | "append"
+
+export interface RewriteAction {
+  type: RewriteActionType
+  replacement: string
+  pattern?: string
+  flags?: string
+}
+
+export interface RewriteRuleInfo {
+  id: string
+  name: string
+  match: RewriteMatchCondition[]
+  action: RewriteAction
+  enabled: boolean
+  priority: number
+  modelPattern?: string
+  pathPattern?: string
+  createdAt: string
+}
+
+export interface RewritePreviewItem {
+  logId: number
+  model: string
+  path: string
+  original: string | null
+  rewritten: string | null
+  matched: boolean
+  matchedRules: string[]
+}
+
+export const rewriteApi = {
+  list: () => api<RewriteRuleInfo[]>("/admin/rewrite-rules"),
+  create: (data: Omit<RewriteRuleInfo, "id" | "createdAt">) =>
+    api<RewriteRuleInfo>("/admin/rewrite-rules", { method: "POST", body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<RewriteRuleInfo>) =>
+    api<RewriteRuleInfo>(`/admin/rewrite-rules/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  reorder: (items: { id: string; priority: number }[]) =>
+    api<{ success: boolean }>("/admin/rewrite-rules/reorder", { method: "PUT", body: JSON.stringify(items) }),
+  delete: (id: string) => api<void>(`/admin/rewrite-rules/${id}`, { method: "DELETE" }),
+  preview: (data: { ruleId?: string; rule?: Partial<RewriteRuleInfo>; logIds: number[] }) =>
+    api<{ results: RewritePreviewItem[] }>("/admin/rewrite-rules/preview", { method: "POST", body: JSON.stringify(data) }),
+}
+
 export const logApi = {
   list: (options?: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: boolean }) => {
     const params = new URLSearchParams()

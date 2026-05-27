@@ -101,6 +101,16 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       const contentTypes = extractAnthropicContentTypes(body)
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
 
+      /** 内容改写管道 */
+      {
+        const rewriteRules = fastify.db.getRewriteRules()
+        if (rewriteRules.length > 0) {
+          const { rewriteAnthropic } = await import("../utils/rewrite-engine")
+          const rr = rewriteAnthropic(body, rewriteRules, { path: "/v1/messages", model })
+          if (rr.matched) fullMessageText = extractAnthropicText(body)
+        }
+      }
+
       /** 附加路由调试 header（RFC 7230 要求 header 值为可见 ASCII 字符） */
       reply.header("x-gateway-provider", encodeURIComponent(providerConfig.name))
       reply.header("x-gateway-model", encodeURIComponent(tm))

@@ -3,6 +3,7 @@ import { ref, reactive, watch, onMounted, onBeforeUnmount } from "vue"
 import Dashboard from "./components/Dashboard.vue"
 import ProviderList from "./components/ProviderList.vue"
 import RouteRules from "./components/RouteRules.vue"
+import RewriteRules from "./components/RewriteRules.vue"
 import ApiKeyList from "./components/ApiKeyList.vue"
 import RequestLog from "./components/RequestLog.vue"
 import { t, currentLocale, setLocale } from "./i18n"
@@ -124,7 +125,7 @@ function toggleLocale() {
   setLocale(currentLocale.value === "zh" ? "en" : "zh")
 }
 
-const tabKeys = ["dashboard", "providers", "routes", "keys", "logs"]
+const tabKeys = ["dashboard", "providers", "routes", "rewrites", "keys", "logs"]
 
 /** 启动时判断状态 */
 onMounted(async () => {
@@ -444,6 +445,7 @@ async function handleChangePassword() {
         <Dashboard v-if="activeTab === 'dashboard'" />
         <ProviderList v-else-if="activeTab === 'providers'" />
         <RouteRules v-else-if="activeTab === 'routes'" />
+        <RewriteRules v-else-if="activeTab === 'rewrites'" />
         <ApiKeyList v-else-if="activeTab === 'keys'" />
         <RequestLog v-else-if="activeTab === 'logs'" />
       </KeepAlive>
