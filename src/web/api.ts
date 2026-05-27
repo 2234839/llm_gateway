@@ -46,6 +46,8 @@ export interface ProviderInfo {
   customHeaders?: Record<string, string>
   maxConcurrency?: number
   requestTimeout?: number
+  /** 图表显示颜色（HEX），不设置则自动生成 */
+  color?: string
 }
 
 /** 内容匹配条件 */

@@ -152,6 +152,11 @@ export class GatewayDB {
       // 列已存在
     }
     try {
+      this.db.run("ALTER TABLE providers ADD COLUMN color TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
       this.db.run("ALTER TABLE request_logs ADD COLUMN input_content TEXT DEFAULT NULL")
     } catch {
       // 列已存在
@@ -313,7 +318,7 @@ export class GatewayDB {
 
   addProvider(provider: ProviderConfig) {
     this.stmt(
-      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       provider.id,
       provider.name,
@@ -326,6 +331,7 @@ export class GatewayDB {
       0,
       provider.maxConcurrency ?? 0,
       provider.requestTimeout ?? 0,
+      provider.color ?? null,
     )
   }
 
@@ -336,7 +342,7 @@ export class GatewayDB {
 
       const updated = { ...existing, ...provider, id }
       this.stmt(
-        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=? WHERE id=?"
+        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=? WHERE id=?"
       ).run(
         updated.name,
         updated.type,
@@ -347,6 +353,7 @@ export class GatewayDB {
         JSON.stringify(updated.customHeaders ?? {}),
         updated.maxConcurrency ?? 0,
         updated.requestTimeout ?? 0,
+        updated.color ?? null,
         id,
       )
     })
@@ -368,6 +375,7 @@ export class GatewayDB {
       customHeaders: JSON.parse((row.custom_headers as string) || "{}"),
       maxConcurrency: (row.max_concurrency as number) || undefined,
       requestTimeout: (row.request_timeout as number) || undefined,
+      color: (row.color as string) || undefined,
     }
   }
 

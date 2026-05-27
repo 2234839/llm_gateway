@@ -1042,6 +1042,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       providers: providers.map(p => ({
         id: p.id,
         name: p.name,
+        color: p.color,
         gateway: gatewayCounts.get(p.id) ?? 0,
         upstream: upstreamCounts.get(p.id) ?? 0,
       })),
@@ -1091,6 +1092,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       providers: providerStatus.map(p => ({
         id: p.id,
         name: p.name,
+        color: p.color,
         max: p.max,
         gateway: gatewayCounts.get(p.id) ?? 0,
         upstream: upstreamCounts.get(p.id) ?? 0,

@@ -4,6 +4,7 @@ import { Chart, registerables } from "chart.js"
 import { healthApi, tokenApi, type HealthInfo, type TokenStats } from "../api"
 import { t } from "../i18n"
 import { formatDuration, formatNumber, formatTokenCount } from "../format"
+import { getStableColor } from "../utils/color"
 import { subscribeSSE } from "../sse-manager"
 import SkuUsageWidget from "./SkuUsageWidget.vue"
 
@@ -60,7 +61,7 @@ const filteredCompleted = computed(() => {
   return completedRequests.value.filter(r => r.status === requestFilter.value)
 })
 
-const providerConcurrency = ref<{ id: string; name: string; gateway: number; upstream: number; max: number; models: { model: string; targetModel: string; count: number }[] }[]>([])
+const providerConcurrency = ref<{ id: string; name: string; color?: string; gateway: number; upstream: number; max: number; models: { model: string; targetModel: string; count: number }[] }[]>([])
 
 let sseUnsubscribe: (() => void) | null = null
 let chartInstance: Chart | null = null
@@ -72,7 +73,7 @@ let clockTimer: ReturnType<typeof setInterval> | null = null
 let themeObserver: MutationObserver | null = null
 
 /** 并发历史数据（两层：upstream + gateway） */
-const concurrencyHistory = new Map<string, { name: string; upstreamPoints: number[]; gatewayPoints: number[] }>()
+const concurrencyHistory = new Map<string, { name: string; color?: string; upstreamPoints: number[]; gatewayPoints: number[] }>()
 let historyLabels: string[] = []
 const maxHistoryPoints = 300
 
@@ -372,7 +373,7 @@ function initConcurrencyChart() {
 }
 
 /** 从后端历史快照恢复图表数据（重连时先清空旧数据避免重复） */
-function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; gateway: number; upstream: number }[]; outputRate: number }[]) {
+function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; color?: string; gateway: number; upstream: number }[]; outputRate: number }[]) {
   historyLabels.length = 0
   outputRateHistory.length = 0
   concurrencyHistory.clear()
@@ -381,10 +382,11 @@ function restoreHistory(snapshots: { time: string; providers: { id: string; name
     for (const p of snap.providers) {
       let entry = concurrencyHistory.get(p.id)
       if (!entry) {
-        entry = { name: p.name, upstreamPoints: [], gatewayPoints: [] }
+        entry = { name: p.name, color: p.color, upstreamPoints: [], gatewayPoints: [] }
         concurrencyHistory.set(p.id, entry)
       }
       entry.name = p.name
+      entry.color = p.color
       entry.upstreamPoints.push(p.upstream)
       entry.gatewayPoints.push(p.gateway)
     }
@@ -416,10 +418,11 @@ function appendChartPoint(outputRate: number) {
   for (const p of providerConcurrency.value) {
     let entry = concurrencyHistory.get(p.id)
     if (!entry) {
-      entry = { name: p.name, upstreamPoints: [], gatewayPoints: [] }
+      entry = { name: p.name, color: p.color, upstreamPoints: [], gatewayPoints: [] }
       concurrencyHistory.set(p.id, entry)
     }
     entry.name = p.name
+    entry.color = p.color
     entry.upstreamPoints.push(p.upstream)
     entry.gatewayPoints.push(p.gateway)
     if (entry.upstreamPoints.length > maxHistoryPoints) entry.upstreamPoints.shift()
@@ -435,7 +438,7 @@ function appendChartPoint(outputRate: number) {
 
 function renderConcurrencyChart() {
   if (!chartInstance) return
-  const colors = ["#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4", "#a855f7"]
+  // 使用 provider 自带的 color 或 getStableColor 分配颜色，不再使用硬编码 colors 数组
   const style = getComputedStyle(document.documentElement)
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
@@ -449,9 +452,8 @@ function renderConcurrencyChart() {
   const barDatasets: Record<string, unknown>[] = []
 
   /** 先放所有 upstream（底层，实色） */
-  for (const [_, entry] of activeEntries) {
-    const i = barDatasets.length
-    const color = colors[i % colors.length]
+  for (const [providerId, entry] of activeEntries) {
+    const color = entry.color || getStableColor(providerId)
     barDatasets.push({
       label: entry.name,
       data: [...entry.upstreamPoints],
@@ -464,9 +466,8 @@ function renderConcurrencyChart() {
     })
   }
   /** 再放所有 queued（上层，半透明） */
-  for (const [_, entry] of activeEntries) {
-    const i = barDatasets.length - activeEntries.length
-    const color = colors[i % colors.length]
+  for (const [providerId, entry] of activeEntries) {
+    const color = entry.color || getStableColor(providerId)
     barDatasets.push({
       label: `${entry.name} (${t("dashboard.queuedConcurrency")})`,
       data: entry.gatewayPoints.map((g, idx) => Math.max(0, g - (entry.upstreamPoints[idx] ?? 0))),

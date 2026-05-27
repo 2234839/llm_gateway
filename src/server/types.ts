@@ -324,6 +324,8 @@ export interface ProviderConfig {
   maxConcurrency?: number
   /** 请求超时毫秒数，0 或不设置使用默认 300000 (5分钟) */
   requestTimeout?: number
+  /** 图表显示颜色（HEX），不设置则自动生成 */
+  color?: string
 }
 
 /** 内容匹配条件 */

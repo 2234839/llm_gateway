@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from "vue"
 import { providerApi, type ProviderInfo, type ProviderTestResult } from "../api"
 import { t } from "../i18n"
+import { randomColor } from "../utils/color"
 
 const error = ref("")
 
@@ -20,6 +21,7 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
   enabled: true,
   maxConcurrency: 0,
   requestTimeout: 0,
+  color: "",
   customHeaders: {},
 }
 
@@ -341,6 +343,15 @@ function removeHeader(index: number) {
             <input v-model.number="form.requestTimeout" type="number" min="0" :placeholder="t('provider.timeoutPlaceholder')" />
           </label>
           <label>
+            {{ t('provider.colorLabel') }}
+            <div class="color-input-row">
+              <input type="color" :value="form.color || '#6366f1'" @input="form.color = ($event.target as HTMLInputElement).value" />
+              <input type="text" v-model="form.color" :placeholder="t('provider.colorPlaceholder')" class="color-text-input" />
+              <button type="button" class="btn-sm" @click="form.color = randomColor()">{{ t('provider.randomColor') }}</button>
+              <button type="button" class="btn-sm" v-if="form.color" @click="form.color = ''">✕</button>
+            </div>
+          </label>
+          <label>
             {{ t('provider.enabledLabel') }}
             <input type="checkbox" v-model="form.enabled" />
           </label>
@@ -529,5 +540,25 @@ function removeHeader(index: number) {
   .header-key {
     width: 100%;
   }
+}
+
+.color-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.color-input-row input[type="color"] {
+  width: 36px;
+  height: 36px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.color-text-input {
+  width: 100px;
 }
 </style>

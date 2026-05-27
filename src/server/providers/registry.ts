@@ -180,8 +180,8 @@ export class ProviderRegistry {
   }
 
   /** 获取所有 provider 的实时并发状态 */
-  getConcurrencyStatus(): { id: string; name: string; current: number; max: number }[] {
-    const result: { id: string; name: string; current: number; max: number }[] = []
+  getConcurrencyStatus(): { id: string; name: string; current: number; max: number; color?: string }[] {
+    const result: { id: string; name: string; current: number; max: number; color?: string }[] = []
     for (const config of this.providerConfigs.values()) {
       if (!config.enabled) continue
       const sem = this.semaphores.get(config.id)
@@ -190,6 +190,7 @@ export class ProviderRegistry {
         name: config.name,
         current: sem?.current ?? 0,
         max: sem ? sem.max : config.maxConcurrency ?? 0,
+        color: config.color,
       })
     }
     return result
