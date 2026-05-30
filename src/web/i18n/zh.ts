@@ -229,6 +229,8 @@ export default {
     addExclude: "+ 添加排除条件",
     fallbackLabel: "故障转移（可选）",
     fallbackHint: "主 Provider 失败（5xx / 超时）时，按顺序尝试备选 Provider",
+    fallbackOnClientError: "客户端错误也触发故障转移",
+    fallbackOnClientErrorHint: "默认仅服务端错误(5xx)和限流(429/408)触发故障转移，启用后4xx客户端错误也会触发",
     addFallback: "+ 添加备选",
     keyGroupsLabel: "密钥分组限制",
     keyGroupsHint: "不选则对所有分组生效；选择后仅对指定分组生效",

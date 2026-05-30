@@ -229,6 +229,8 @@ export default {
     addExclude: "+ Add exclude condition",
     fallbackLabel: "Fallback (optional)",
     fallbackHint: "When the primary provider fails (5xx / timeout), try alternatives in order",
+    fallbackOnClientError: "Fallback on client errors (4xx)",
+    fallbackOnClientErrorHint: "By default only server errors (5xx) and rate limits (429/408) trigger fallback. Enable to also trigger on 4xx client errors",
     addFallback: "+ Add fallback",
     keyGroupsLabel: "Key Group Restriction",
     keyGroupsHint: "Leave empty to apply to all groups; select to restrict to specific groups",

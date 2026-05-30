@@ -224,6 +224,9 @@ export class GatewayDB {
       this.db.run("ALTER TABLE route_rules ADD COLUMN fallbacks TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
+      this.db.run("ALTER TABLE route_rules ADD COLUMN fallback_on_client_error INTEGER DEFAULT 0")
+    } catch { /* 列已存在 */ }
+    try {
       this.db.run("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
@@ -394,8 +397,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match, key_groups, fallbacks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match, key_groups, fallbacks, fallback_on_client_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.fallbackOnClientError ? 1 : 0)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>): boolean {
@@ -405,8 +408,8 @@ export class GatewayDB {
 
       const updated = { ...existing, ...rule, id }
       this.stmt(
-        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=? WHERE id=?"
-      ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, id)
+        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, fallback_on_client_error=? WHERE id=?"
+      ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.fallbackOnClientError ? 1 : 0, id)
       return true
     })
   }
@@ -428,6 +431,7 @@ export class GatewayDB {
       enabled: row.enabled !== 0,
       keyGroups: row.key_groups ? JSON.parse(row.key_groups as string) : undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
+      fallbackOnClientError: row.fallback_on_client_error === 1,
     }
   }
 

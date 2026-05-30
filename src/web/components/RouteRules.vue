@@ -21,6 +21,7 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   contentMatch: [],
   excludeMatch: [],
   fallbacks: [],
+  fallbackOnClientError: false,
   keyGroups: [],
 }
 
@@ -51,7 +52,7 @@ async function load() {
 function startCreate() {
   editingId.value = null
   creating.value = true
-  form.value = { ...emptyRule, contentMatch: [], excludeMatch: [], keyGroups: [], fallbacks: [], modelMapping: {} }
+  form.value = { ...emptyRule, contentMatch: [], excludeMatch: [], keyGroups: [], fallbacks: [], fallbackOnClientError: false, modelMapping: {} }
   syncMappingFromForm()
 }
 
@@ -67,6 +68,7 @@ function startEdit(rule: RouteRuleInfo) {
     contentMatch: rule.contentMatch ? rule.contentMatch.map(c => ({ ...c })) : [],
     excludeMatch: rule.excludeMatch ? rule.excludeMatch.map(c => ({ ...c })) : [],
     fallbacks: rule.fallbacks ? rule.fallbacks.map(f => ({ ...f })) : [],
+    fallbackOnClientError: rule.fallbackOnClientError ?? false,
     keyGroups: rule.keyGroups ? [...rule.keyGroups] : [],
   }
   syncMappingFromForm()
@@ -326,6 +328,7 @@ function syncMappingToForm() {
                 <span v-for="(fb, fi) in rule.fallbacks" :key="fi" class="fallback-tag">
                   {{ providerName(fb.providerId) }}<template v-if="fb.targetModel"> → {{ fb.targetModel }}</template>
                 </span>
+                <span v-if="rule.fallbackOnClientError" class="fallback-tag fallback-tag-4xx">4xx</span>
               </div>
             </td>
             <td>
@@ -518,6 +521,12 @@ function syncMappingToForm() {
         <div class="match-section">
           <div class="section-label">{{ t('route.fallbackLabel') }}</div>
           <p class="section-hint">{{ t('route.fallbackHint') }}</p>
+
+          <label class="checkbox-label" style="margin-bottom: 10px">
+            <input type="checkbox" v-model="form.fallbackOnClientError" />
+            {{ t('route.fallbackOnClientError') }}
+          </label>
+          <p class="section-hint" style="margin-top: -6px; margin-bottom: 10px">{{ t('route.fallbackOnClientErrorHint') }}</p>
 
           <div v-for="(fb, i) in form.fallbacks" :key="i" class="condition-row indented fallback-row">
             <select v-model="fb.providerId" class="cond-type">
@@ -829,6 +838,11 @@ tr.disabled {
   border-radius: 3px;
   margin-right: 4px;
   font-size: 11px;
+}
+
+.fallback-tag-4xx {
+  background: var(--tag-orange-bg, #fff3e0);
+  color: var(--tag-orange, #e65100);
 }
 
 .key-groups-grid {

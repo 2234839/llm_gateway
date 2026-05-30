@@ -136,6 +136,7 @@ export class ProviderRegistry {
         providerConfig,
         rulePattern: rule.pattern || null,
         fallbacks,
+        fallbackOnClientError: rule.fallbackOnClientError ?? false,
       }
     }
 

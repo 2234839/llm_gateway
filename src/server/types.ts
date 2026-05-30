@@ -358,6 +358,8 @@ export interface RouteRule {
   keyGroups?: string[]
   /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
   fallbacks?: RouteFallback[]
+  /** 客户端错误（4xx）也触发故障转移，默认仅 5xx/429/408 触发 */
+  fallbackOnClientError?: boolean
 }
 
 /** 路由规则的故障转移备选 */
@@ -501,6 +503,8 @@ export interface RouteResult {
   rulePattern: string | null
   /** 故障转移备选列表 */
   fallbacks: RouteFallback[]
+  /** 客户端错误（4xx）也触发故障转移 */
+  fallbackOnClientError: boolean
 }
 
 // ========== Anthropic 错误响应格式 ==========
