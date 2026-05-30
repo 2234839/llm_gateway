@@ -87,6 +87,8 @@ export interface RouteRuleInfo {
   keyGroups?: string[]
   /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
   fallbacks?: RouteFallback[]
+  /** 客户端错误（4xx）也触发故障转移，默认仅 5xx/429/408 触发 */
+  fallbackOnClientError?: boolean
 }
 
 /** Token 用量统计 */
