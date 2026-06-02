@@ -111,7 +111,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       const messageText = extractOpenAIText(body)
       fullMessageText = messageText
       const contentTypes = extractOpenAIContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId })
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, charCount: messageText.length })
 
       /** 内容改写管道 */
       {

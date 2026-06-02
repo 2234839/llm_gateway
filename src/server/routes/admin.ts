@@ -1,8 +1,21 @@
 import type { FastifyInstance } from "fastify"
-import type { KeyGroup, ApiKey, ProviderConfig, RouteRule } from "../types.ts"
+import type { KeyGroup, ApiKey, ProviderConfig, RouteRule, ConditionNode, ConditionLeaf, ConditionGroup } from "../types.ts"
 import { v4 as uuid } from "uuid"
 import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
+
+/** 从条件树中递归提取第一个 model 类型的 pattern */
+function extractModelPatternSimple(node?: ConditionNode): string | undefined {
+  if (!node) return undefined
+  if (node.type === "model") return (node as ConditionLeaf).pattern
+  if (node.type === "and" || node.type === "or") {
+    for (const child of (node as ConditionGroup).children) {
+      const found = extractModelPatternSimple(child)
+      if (found) return found
+    }
+  }
+  return undefined
+}
 import { detectProvider, getProviderDisplayName } from "../utils/provider-detector.ts"
 import { queryProviderBalance, queryZhipuQuota, queryWithCurl, parseCurl } from "../utils/balance-query.ts"
 import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
@@ -261,7 +274,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const rules = fastify.db.getRouteRules()
     const affectedRules = rules.filter(r => r.providerId === id || r.fallbacks?.some(fb => fb.providerId === id))
     if (affectedRules.length > 0) {
-      const names = affectedRules.map(r => r.pattern || r.id).join(", ")
+      const names = affectedRules.map(r => extractModelPatternSimple(r.matchConditions) || r.id).join(", ")
       return reply.status(400).send({ error: `Cannot delete: route rules [${names}] reference this provider. Remove or update those rules first.` })
     }
     fastify.db.deleteProvider(id)

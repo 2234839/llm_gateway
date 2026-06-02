@@ -328,30 +328,52 @@ export interface ProviderConfig {
   color?: string
 }
 
-/** 内容匹配条件 */
-export interface ContentMatchCondition {
-  /** 匹配类型：keyword 纯文本包含，regex 正则匹配，content_type 多模态内容存在性检测 */
-  type: "keyword" | "regex" | "content_type"
-  /** keyword 时为纯文本，regex 时为正则表达式，content_type 时为模态名称 (image/file/tool_use) */
+/** 叶子条件：具体的匹配规则 */
+export interface ConditionLeaf {
+  /**
+   * 匹配类型：
+   * - model: 模型名 glob 匹配 (picomatch)
+   * - keyword: 纯文本包含
+   * - regex: 正则匹配
+   * - content_type: 多模态内容存在性检测 (image/file/tool_use)
+   * - char_count: 请求字符数比较，如 "<100000"、">=5000"
+   */
+  type: "model" | "keyword" | "regex" | "content_type" | "char_count"
+  /**
+   * 匹配值，语义依 type 而定：
+   * - model: glob 模式，如 "gpt-*"
+   * - keyword: 纯文本子串
+   * - regex: 正则表达式
+   * - content_type: 模态名称 (image/file/tool_use)
+   * - char_count: 比较表达式，如 "<100000"、">=5000"
+   */
   pattern: string
-  /** 多条件间的逻辑关系，默认 and */
-  operator?: "and" | "or"
-  /** 正则标志位，如 i */
+  /** 正则标志位 (仅 type="regex")，如 "i" */
   flags?: string
 }
 
+/** 逻辑组：包含子节点 + 逻辑运算符 */
+export interface ConditionGroup {
+  /** 逻辑运算符 */
+  type: "and" | "or"
+  /** 子节点列表 */
+  children: ConditionNode[]
+}
+
+/** 条件节点：叶子 or 逻辑组（递归） */
+export type ConditionNode = ConditionLeaf | ConditionGroup
+
 export interface RouteRule {
   id: string
-  pattern: string
   providerId: string
   /** 转发给上游的目标模型名，不填则用请求中的原始模型名 */
   targetModel?: string
   modelMapping?: Record<string, string>
   priority: number
-  /** 内容匹配条件组，不存在则仅按模型名匹配 */
-  contentMatch?: ContentMatchCondition[]
-  /** 排除条件组，匹配成功时跳过此规则，优先级高于匹配条件 */
-  excludeMatch?: ContentMatchCondition[]
+  /** 匹配条件（递归嵌套树），不存在则匹配所有 */
+  matchConditions?: ConditionNode
+  /** 排除条件（同结构），匹配成功时跳过此规则 */
+  excludeMatch?: ConditionNode
   /** 是否启用，默认 true */
   enabled?: boolean
   /** 限定匹配的密钥分组 ID 列表，空/缺省=匹配所有 */

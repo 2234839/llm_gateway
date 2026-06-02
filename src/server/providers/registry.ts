@@ -1,4 +1,4 @@
-import type { Provider, ProviderConfig, RouteResult, ContentMatchCondition } from "../types.ts"
+import type { Provider, ProviderConfig, RouteResult, ConditionNode, ConditionLeaf, ConditionGroup } from "../types.ts"
 import picomatch from "picomatch"
 import { OpenAIProvider } from "./openai.ts"
 import { AnthropicProvider } from "./anthropic.ts"
@@ -12,6 +12,8 @@ export interface ResolveContext {
   contentTypes: Set<string>
   /** 请求来源的密钥分组 ID */
   groupId?: string
+  /** 请求消息的字符数 */
+  charCount: number
 }
 
 export class ProviderRegistry {
@@ -66,6 +68,7 @@ export class ProviderRegistry {
     this.modelsCache.clear()
     regexCache.clear()
     picomatchCache.clear()
+    compiledCache.clear()
   }
 
   /** 获取路由规则（带缓存） */
@@ -96,27 +99,23 @@ export class ProviderRegistry {
     for (const rule of rules) {
       if (rule.enabled === false) continue
 
-      /** 模型名匹配：pattern 为空或 * 时不过滤 */
-      if (rule.pattern && rule.pattern !== "*") {
-        if (!getCachedPicomatch(rule.pattern)(model)) continue
-      }
-
       /** 密钥分组匹配：规则指定了 keyGroups 时，请求的 groupId 必须在列表中 */
       if (rule.keyGroups && rule.keyGroups.length > 0) {
         if (!context?.groupId) continue
         if (!rule.keyGroups.includes(context.groupId)) continue
       }
 
-      /** 内容匹配 */
-      if (rule.contentMatch && rule.contentMatch.length > 0) {
-        if (!context?.messageText && !context?.contentTypes?.size) continue
-        if (!matchContent(rule.contentMatch, context?.messageText ?? "", context?.contentTypes ?? new Set())) continue
+      /** 统一匹配条件（递归嵌套树） */
+      if (rule.matchConditions) {
+        const fn = compileCondition(rule.matchConditions)
+        if (!fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.charCount ?? 0)) continue
       }
 
       /** 排除条件：命中则跳过此规则 */
-      if (rule.excludeMatch && rule.excludeMatch.length > 0) {
+      if (rule.excludeMatch) {
         if (context?.messageText || context?.contentTypes?.size) {
-          if (matchContent(rule.excludeMatch, context?.messageText ?? "", context?.contentTypes ?? new Set())) continue
+          const fn = compileCondition(rule.excludeMatch)
+          if (fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.charCount ?? 0)) continue
         }
       }
 
@@ -130,11 +129,14 @@ export class ProviderRegistry {
       /** 构建有效 fallback 列表（过滤掉不可用的 provider） */
       const fallbacks = (rule.fallbacks ?? []).filter(fb => this.providers.has(fb.providerId))
 
+      /** 提取模型 pattern 用于 rulePattern 字段 */
+      const modelPattern = extractModelPatternFromTree(rule.matchConditions)
+
       return {
         provider,
         targetModel,
         providerConfig,
-        rulePattern: rule.pattern || null,
+        rulePattern: modelPattern,
         fallbacks,
       }
     }
@@ -215,11 +217,12 @@ export class ProviderRegistry {
       const config = this.providerConfigs.get(rule.providerId)
       if (!config || !config.enabled) continue
 
-      /** pattern 为空或 * 时，包含该 provider 所有模型 */
-      const isWildcard = !rule.pattern || rule.pattern === "*"
+      /** 从条件树中提取模型 pattern */
+      const modelPattern = extractModelPatternFromTree(rule.matchConditions)
+      const isWildcard = !modelPattern || modelPattern === "*"
       for (const model of config.models) {
         if (seen.has(model)) continue
-        if (!isWildcard && !getCachedPicomatch(rule.pattern)(model)) continue
+        if (!isWildcard && !getCachedPicomatch(modelPattern!)(model)) continue
         seen.add(model)
         models.push({
           id: model,
@@ -276,22 +279,96 @@ function getCachedRegex(pattern: string, flags: string): RegExp | null {
   }
 }
 
-/** 测试文本是否满足一组内容匹配条件 */
-function matchContent(conditions: ContentMatchCondition[], text: string, contentTypes: Set<string>): boolean {
-  const operator = conditions[0]?.operator ?? "and"
+/** 编译后的条件求值函数签名 */
+type CompiledCondition = (model: string, text: string, contentTypes: Set<string>, charCount: number) => boolean
 
-  const results = conditions.map(cond => {
-    if (cond.type === "content_type") {
-      return contentTypes.has(cond.pattern)
-    }
-    if (cond.type === "keyword") {
-      return text.includes(cond.pattern)
-    }
-    const re = getCachedRegex(cond.pattern, cond.flags ?? "")
-    return re ? re.test(text) : false
-  })
+/** 条件树编译缓存：key = JSON.stringify(node) */
+const compiledCache = new Map<string, CompiledCondition>()
+const MAX_COMPILED_CACHE = 200
 
-  return operator === "or"
-    ? results.some(Boolean)
-    : results.every(Boolean)
+/**
+ * 将条件树编译为可复用的求值函数。
+ * 规则不变时复用已编译函数，避免每次请求都遍历树结构。
+ */
+function compileCondition(node: ConditionNode): CompiledCondition {
+  const key = JSON.stringify(node)
+  const cached = compiledCache.get(key)
+  if (cached) return cached
+
+  const fn = doCompile(node)
+
+  if (compiledCache.size >= MAX_COMPILED_CACHE) evictHalf(compiledCache)
+  compiledCache.set(key, fn)
+  return fn
+}
+
+/** 实际编译逻辑：递归将条件树转为嵌套函数调用 */
+function doCompile(node: ConditionNode): CompiledCondition {
+  /** 逻辑组 */
+  if (node.type === "and" || node.type === "or") {
+    const group = node as ConditionGroup
+    const compiledChildren = group.children.map(doCompile)
+    if (group.type === "and") {
+      return (model, text, contentTypes, charCount) =>
+        compiledChildren.every(fn => fn(model, text, contentTypes, charCount))
+    }
+    return (model, text, contentTypes, charCount) =>
+      compiledChildren.some(fn => fn(model, text, contentTypes, charCount))
+  }
+
+  /** 叶子条件 */
+  const leaf = node as ConditionLeaf
+  switch (leaf.type) {
+    case "model": {
+      if (!leaf.pattern || leaf.pattern === "*") return () => true
+      const matcher = getCachedPicomatch(leaf.pattern)
+      return (model) => matcher(model)
+    }
+    case "keyword": {
+      const pattern = leaf.pattern
+      return (_model, text) => text.includes(pattern)
+    }
+    case "regex": {
+      const re = getCachedRegex(leaf.pattern, leaf.flags ?? "")
+      return (_model, text) => re ? re.test(text) : false
+    }
+    case "content_type": {
+      const pattern = leaf.pattern
+      return (_model, _text, contentTypes) => contentTypes.has(pattern)
+    }
+    case "char_count": {
+      const parsed = parseCharCountExpr(leaf.pattern)
+      return (_model, _text, _contentTypes, charCount) => parsed(charCount)
+    }
+    default:
+      return () => false
+  }
+}
+
+/** 解析字符数比较表达式，返回求值函数 */
+function parseCharCountExpr(pattern: string): (count: number) => boolean {
+  const match = pattern.match(/^(<=?|>=?)\s*(\d+)$/)
+  if (!match) return () => false
+  const op = match[1]
+  const threshold = parseInt(match[2]!, 10)
+  switch (op) {
+    case "<":  return (n) => n < threshold
+    case "<=": return (n) => n <= threshold
+    case ">":  return (n) => n > threshold
+    case ">=": return (n) => n >= threshold
+    default:   return () => false
+  }
+}
+
+/** 从条件树中递归提取第一个 model 类型的 pattern */
+function extractModelPatternFromTree(node?: ConditionNode): string | null {
+  if (!node) return null
+  if (node.type === "model") return (node as ConditionLeaf).pattern
+  if (node.type === "and" || node.type === "or") {
+    for (const child of (node as ConditionGroup).children) {
+      const found = extractModelPatternFromTree(child)
+      if (found) return found
+    }
+  }
+  return null
 }

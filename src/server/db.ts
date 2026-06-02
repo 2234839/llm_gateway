@@ -1,7 +1,7 @@
 import { Database, Statement } from "bun:sqlite"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, ConditionNode, ConditionLeaf, ConditionGroup } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -123,6 +123,11 @@ export class GatewayDB {
     /** 兼容已有数据库：添加新列 */
     try {
       this.db.run("ALTER TABLE route_rules ADD COLUMN content_match TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.run("ALTER TABLE route_rules ADD COLUMN match_conditions TEXT DEFAULT NULL")
     } catch {
       // 列已存在
     }
@@ -308,7 +313,7 @@ export class GatewayDB {
 
   getProviders(): ProviderConfig[] {
     const rows = this.stmt("SELECT * FROM providers ORDER BY sort_order").all() as Record<string, unknown>[]
-    return rows.map(this.rowToProvider)
+    return rows.map(this.rowToProvider.bind(this))
   }
 
   getProvider(id: string): ProviderConfig | null {
@@ -383,7 +388,7 @@ export class GatewayDB {
 
   getRouteRules(): RouteRule[] {
     const rows = this.stmt("SELECT * FROM route_rules ORDER BY priority DESC").all() as Record<string, unknown>[]
-    return rows.map(this.rowToRouteRule)
+    return rows.map(this.rowToRouteRule.bind(this))
   }
 
   /** 按主键查询单条路由规则 */
@@ -394,8 +399,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, target_model, enabled, exclude_match, key_groups, fallbacks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, rule.pattern, rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, rule.contentMatch ? JSON.stringify(rule.contentMatch) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>): boolean {
@@ -404,9 +409,10 @@ export class GatewayDB {
       if (!existing) return false
 
       const updated = { ...existing, ...rule, id }
+      const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
-        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=? WHERE id=?"
-      ).run(updated.pattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, updated.contentMatch ? JSON.stringify(updated.contentMatch) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, id)
+        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=? WHERE id=?"
+      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, id)
       return true
     })
   }
@@ -416,19 +422,100 @@ export class GatewayDB {
   }
 
   private rowToRouteRule(row: Record<string, unknown>): RouteRule {
+    const matchConditions = row.match_conditions
+      ? this.migrateToConditionNode(JSON.parse(row.match_conditions as string))
+      : undefined
+
+    /** 向后兼容：若无 match_conditions，从旧字段迁移 */
+    let resolvedConditions = matchConditions
+    if (!resolvedConditions) {
+      const legacyPattern = (row.pattern as string) || ""
+      const legacyContentMatch = row.content_match
+        ? JSON.parse(row.content_match as string)
+        : undefined
+      const leaves = this.buildLeavesFromLegacy(legacyPattern, legacyContentMatch)
+      if (leaves.length > 0) {
+        resolvedConditions = { type: "and", children: leaves }
+      }
+    }
+
+    /** 排除条件同样需要迁移 */
+    let resolvedExclude: ConditionNode | undefined
+    if (row.exclude_match) {
+      const raw = JSON.parse(row.exclude_match as string)
+      resolvedExclude = this.migrateToConditionNode(raw)
+    }
+
     return {
       id: row.id as string,
-      pattern: row.pattern as string,
       providerId: row.provider_id as string,
       modelMapping: JSON.parse((row.model_mapping as string) || "{}"),
       priority: row.priority as number,
-      contentMatch: row.content_match ? JSON.parse(row.content_match as string) : undefined,
+      matchConditions: resolvedConditions,
       targetModel: (row.target_model as string) || undefined,
-      excludeMatch: row.exclude_match ? JSON.parse(row.exclude_match as string) : undefined,
+      excludeMatch: resolvedExclude,
       enabled: row.enabled !== 0,
       keyGroups: row.key_groups ? JSON.parse(row.key_groups as string) : undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
     }
+  }
+
+  /**
+   * 将原始 JSON 迁移为 ConditionNode，兼容三种格式：
+   * 1. 新格式 ConditionNode（有 children 的对象）→ 直接用
+   * 2. 上轮扁平 MatchCondition[]（数组）→ 包装为 { type: op, children: [...] }
+   * 3. 其他 → undefined
+   */
+  private migrateToConditionNode(raw: unknown): ConditionNode | undefined {
+    if (!raw) return undefined
+    /** 新格式：已经是 ConditionGroup（有 children 字段） */
+    if (typeof raw === "object" && !Array.isArray(raw) && "children" in (raw as object)) {
+      return raw as ConditionNode
+    }
+    /** 上轮扁平格式：MatchCondition[]（数组） */
+    if (Array.isArray(raw)) {
+      const conditions = raw as Array<Record<string, unknown>>
+      if (conditions.length === 0) return undefined
+      const op = (conditions[0]?.operator as "and" | "or") ?? "and"
+      const leaves: ConditionLeaf[] = conditions.map(c => ({
+        type: c.type as ConditionLeaf["type"],
+        pattern: c.pattern as string,
+        ...(c.flags ? { flags: c.flags as string } : {}),
+      }))
+      return { type: op, children: leaves }
+    }
+    return undefined
+  }
+
+  /** 从旧的 pattern + content_match 字段构建叶子条件列表 */
+  private buildLeavesFromLegacy(legacyPattern: string, legacyContentMatch: unknown): ConditionLeaf[] {
+    const leaves: ConditionLeaf[] = []
+    if (legacyPattern && legacyPattern !== "*") {
+      leaves.push({ type: "model", pattern: legacyPattern })
+    }
+    if (Array.isArray(legacyContentMatch)) {
+      for (const c of legacyContentMatch as Array<Record<string, unknown>>) {
+        leaves.push({
+          type: c.type as ConditionLeaf["type"],
+          pattern: c.pattern as string,
+          ...(c.flags ? { flags: c.flags as string } : {}),
+        })
+      }
+    }
+    return leaves
+  }
+
+  /** 从条件树中递归提取第一个 model 类型的 pattern（用于写入旧的 pattern 列） */
+  private extractModelPattern(node?: ConditionNode): string | undefined {
+    if (!node) return undefined
+    if (node.type === "model") return (node as ConditionLeaf).pattern
+    if (node.type === "and" || node.type === "or") {
+      for (const child of (node as ConditionGroup).children) {
+        const found = this.extractModelPattern(child)
+        if (found) return found
+      }
+    }
+    return undefined
   }
 
   // ========== Rewrite Rules ==========
@@ -780,7 +867,7 @@ export class GatewayDB {
 
   getKeyGroups(): KeyGroup[] {
     const rows = this.stmt("SELECT * FROM key_groups ORDER BY created_at").all() as Record<string, unknown>[]
-    return rows.map(this.rowToKeyGroup)
+    return rows.map(this.rowToKeyGroup.bind(this))
   }
 
   getKeyGroup(id: string): KeyGroup | null {
@@ -830,7 +917,7 @@ export class GatewayDB {
 
   getApiKeys(): ApiKey[] {
     const rows = this.stmt("SELECT * FROM api_keys ORDER BY created_at").all() as Record<string, unknown>[]
-    return rows.map(this.rowToApiKey)
+    return rows.map(this.rowToApiKey.bind(this))
   }
 
   getApiKey(id: string): ApiKey | null {

@@ -50,17 +50,21 @@ export interface ProviderInfo {
   color?: string
 }
 
-/** 内容匹配条件 */
-export interface ContentMatchCondition {
-  /** 匹配类型：keyword 纯文本包含，regex 正则匹配，content_type 多模态内容存在性检测 */
-  type: "keyword" | "regex" | "content_type"
-  /** keyword 时为纯文本，regex 时为正则表达式，content_type 时为模态名称 (image/file/tool_use) */
+/** 叶子条件：具体的匹配规则 */
+export interface ConditionLeaf {
+  type: "model" | "keyword" | "regex" | "content_type" | "char_count"
   pattern: string
-  /** 多条件间的逻辑关系，默认 and */
-  operator?: "and" | "or"
-  /** 正则标志位，如 i */
   flags?: string
 }
+
+/** 逻辑组：包含子节点 + 逻辑运算符 */
+export interface ConditionGroup {
+  type: "and" | "or"
+  children: ConditionNode[]
+}
+
+/** 条件节点：叶子 or 逻辑组（递归） */
+export type ConditionNode = ConditionLeaf | ConditionGroup
 
 /** 路由规则的故障转移备选 */
 export interface RouteFallback {
@@ -71,16 +75,15 @@ export interface RouteFallback {
 
 export interface RouteRuleInfo {
   id: string
-  pattern: string
   providerId: string
   /** 转发给上游的目标模型名 */
   targetModel?: string
   modelMapping?: Record<string, string>
   priority: number
-  /** 内容匹配条件组，不存在则仅按模型名匹配 */
-  contentMatch?: ContentMatchCondition[]
-  /** 排除条件组，匹配成功时跳过此规则 */
-  excludeMatch?: ContentMatchCondition[]
+  /** 匹配条件（递归嵌套树），不存在则匹配所有 */
+  matchConditions?: ConditionNode
+  /** 排除条件（同结构），匹配成功时跳过此规则 */
+  excludeMatch?: ConditionNode
   /** 是否启用，默认 true */
   enabled?: boolean
   /** 匹配的密钥分组 ID 列表 */

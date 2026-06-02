@@ -42,6 +42,7 @@ That's content-aware routing with protocol translation. That's what this does.
 | Model pattern | `gpt-4*` | Any provider with matching models |
 | Keyword in message | "review this code" | A cost-effective model |
 | Content type | Contains images | A vision model |
+| Character count | `> 100000` chars | A model with large context window |
 | API key group | `senior-devs` group | Premium provider with high quota |
 | Exclude pattern | Contains "/internal/" | Skip this rule, try next |
 
@@ -50,8 +51,10 @@ Rules are evaluated top-down. First match wins. Each rule can have fallback prov
 ## Feature Breakdown
 
 **Routing**
-- Glob model matching (`claude-*`, `gpt-4*`)
+- Recursive condition tree with nested AND/OR logic groups
+- Model name glob matching (`claude-*`, `gpt-4*`) as a condition type
 - Keyword / regex content matching
+- Request character count matching (`<100000`, `>=5000`)
 - Multimodal content type detection (images, files, tool calls)
 - Per-group routing (different teams see different rules)
 - Exclusion rules with priority over match rules
