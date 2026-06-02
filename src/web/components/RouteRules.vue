@@ -105,9 +105,23 @@ async function save() {
   saving.value = false
 }
 
+/** 从条件树中递归提取第一个 model 类型的 pattern */
+function findModelPattern(node: unknown): string {
+  if (!node || typeof node !== "object") return ""
+  const n = node as Record<string, unknown>
+  if (n.type === "and" || n.type === "or") {
+    for (const child of (n.children as unknown[]) ?? []) {
+      const found = findModelPattern(child)
+      if (found) return found
+    }
+    return ""
+  }
+  return n.type === "model" ? (n.pattern as string) : ""
+}
+
 async function remove(id: string) {
   const rule = rules.value.find(r => r.id === id)
-  if (!confirm(t('route.deleteConfirm', { pattern: rule?.matchConditions?.find(c => c.type === 'model')?.pattern ?? '' }))) return
+  if (!confirm(t('route.deleteConfirm', { pattern: findModelPattern(rule?.matchConditions) }))) return
   error.value = ""
   try {
     await routeApi.delete(id)
