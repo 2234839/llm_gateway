@@ -162,6 +162,11 @@ export class GatewayDB {
       // 列已存在
     }
     try {
+      this.db.run("ALTER TABLE providers ADD COLUMN flatten_mid_system INTEGER NOT NULL DEFAULT 0")
+    } catch {
+      // 列已存在
+    }
+    try {
       this.db.run("ALTER TABLE request_logs ADD COLUMN input_content TEXT DEFAULT NULL")
     } catch {
       // 列已存在
@@ -323,7 +328,7 @@ export class GatewayDB {
 
   addProvider(provider: ProviderConfig) {
     this.stmt(
-      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color, flatten_mid_system) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       provider.id,
       provider.name,
@@ -337,6 +342,7 @@ export class GatewayDB {
       provider.maxConcurrency ?? 0,
       provider.requestTimeout ?? 0,
       provider.color ?? null,
+      provider.flattenMidSystem ? 1 : 0,
     )
   }
 
@@ -347,7 +353,7 @@ export class GatewayDB {
 
       const updated = { ...existing, ...provider, id }
       this.stmt(
-        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=? WHERE id=?"
+        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=? WHERE id=?"
       ).run(
         updated.name,
         updated.type,
@@ -359,6 +365,7 @@ export class GatewayDB {
         updated.maxConcurrency ?? 0,
         updated.requestTimeout ?? 0,
         updated.color ?? null,
+        updated.flattenMidSystem ? 1 : 0,
         id,
       )
     })
@@ -381,6 +388,7 @@ export class GatewayDB {
       maxConcurrency: (row.max_concurrency as number) || undefined,
       requestTimeout: (row.request_timeout as number) || undefined,
       color: (row.color as string) || undefined,
+      flattenMidSystem: (row.flatten_mid_system as number) === 1 || undefined,
     }
   }
 

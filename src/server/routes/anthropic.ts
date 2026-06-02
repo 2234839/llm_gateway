@@ -153,7 +153,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
           
-          const result = await handleAnthropicUpstream(currentProvider, currentTarget, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
+          const result = await handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
             /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */
@@ -254,6 +254,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 async function handleAnthropicUpstream(
   provider: Provider,
   targetModel: string,
+  providerConfig: ProviderConfig,
   body: AnthropicMessagesRequest,
   isStream: boolean,
   upstreamHeaders: Record<string, string>,
@@ -276,9 +277,15 @@ async function handleAnthropicUpstream(
 }> {
   try {
   if (provider.type === "anthropic") {
+    /** 兼容 Claude Code mid_conversation_system beta：
+     *  若 provider 开启了 flattenMidSystem，将 messages 中的 system 消息转为 user */
+    const sendBody = providerConfig.flattenMidSystem && body.messages.some(m => m.role === "system")
+      ? { ...body, model: targetModel, messages: body.messages.map(m => m.role === "system" ? { ...m, role: "user" as const } : m) }
+      : { ...body, model: targetModel }
+
     /** Anthropic 直连 — 透传 */
     if (isStream) {
-      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, upstreamHeaders, signal)
+      const upstream = await provider.sendStreamRequest(sendBody, upstreamHeaders, signal)
       console.log(`[anthropic] anthropic direct stream status: ${upstream.status}, body: ${upstream.body ? "present" : "null"}, content-type: ${upstream.headers.get("content-type")}`)
       if (!upstream.ok) {
         const errBody = await upstream.text()
@@ -301,7 +308,7 @@ async function handleAnthropicUpstream(
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest({ ...body, model: targetModel }, upstreamHeaders, signal)
+    const upstream = await provider.sendRequest(sendBody, upstreamHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -329,7 +336,7 @@ async function handleAnthropicUpstream(
   }
 
   /** 非 Anthropic 提供商 — 转换格式 */
-  const openaiBody = convertRequestToOpenAI(body, targetModel)
+  const openaiBody = convertRequestToOpenAI(body, targetModel, { flattenMidSystem: providerConfig.flattenMidSystem })
 
   if (isStream) {
     const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {}, signal)

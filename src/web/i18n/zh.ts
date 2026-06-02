@@ -158,6 +158,8 @@ export default {
     colorLabel: "图表颜色",
     colorPlaceholder: "留空自动分配",
     randomColor: "随机",
+    flattenMidSystemLabel: "兼容中途 System",
+    flattenMidSystemHint: "将 messages 中的 system 消息转为 user，兼容不支持 mid_conversation_system 的第三方",
     testSuccess: "连接成功 ({code}) - {ms}ms",
     testFail: "连接失败 ({code}) - {error}",
     unknownError: "未知错误",

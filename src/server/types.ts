@@ -19,9 +19,9 @@ export interface AnthropicMessagesRequest {
   metadata?: { user_id?: string }
 }
 
-/** Anthropic 消息 */
+/** Anthropic 消息（system 来自 Claude Code mid_conversation_system beta） */
 export interface AnthropicMessage {
-  role: "user" | "assistant"
+  role: "user" | "assistant" | "system"
   content: string | AnthropicContentBlock[]
 }
 
@@ -326,6 +326,8 @@ export interface ProviderConfig {
   requestTimeout?: number
   /** 图表显示颜色（HEX），不设置则自动生成 */
   color?: string
+  /** 将 messages 中间的 system 消息转为 user（兼容 Claude Code mid_conversation_system beta） */
+  flattenMidSystem?: boolean
 }
 
 /** 叶子条件：具体的匹配规则 */

@@ -23,6 +23,7 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
   requestTimeout: 0,
   color: "",
   customHeaders: {},
+  flattenMidSystem: false,
 }
 
 const form = ref({ ...emptyProvider })
@@ -354,6 +355,11 @@ function removeHeader(index: number) {
           <label>
             {{ t('provider.enabledLabel') }}
             <input type="checkbox" v-model="form.enabled" />
+          </label>
+          <label>
+            {{ t('provider.flattenMidSystemLabel') }}
+            <input type="checkbox" v-model="form.flattenMidSystem" />
+            <small class="field-hint">{{ t('provider.flattenMidSystemHint') }}</small>
           </label>
         </div>
 

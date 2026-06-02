@@ -158,6 +158,8 @@ export default {
     colorLabel: "Chart Color",
     colorPlaceholder: "Leave empty for auto",
     randomColor: "Random",
+    flattenMidSystemLabel: "Flatten Mid-System",
+    flattenMidSystemHint: "Convert system messages in the middle of conversation to user role, for third-party APIs that don't support mid_conversation_system",
     testSuccess: "Connected ({code}) - {ms}ms",
     testFail: "Failed ({code}) - {error}",
     unknownError: "Unknown error",

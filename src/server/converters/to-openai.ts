@@ -13,8 +13,9 @@ import type {
 /**
  * Anthropic Messages 请求体 → OpenAI Chat Completions 请求体
  */
-export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetModel: string): OpenAIChatCompletionRequest {
+export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetModel: string, options?: { flattenMidSystem?: boolean }): OpenAIChatCompletionRequest {
   const messages: OpenAIChatMessage[] = []
+  const flattenMidSystem = options?.flattenMidSystem ?? false
 
   /** system 顶层字段 → messages 中的 system message */
   if (body.system) {
@@ -26,7 +27,7 @@ export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetMod
 
   /** 转换消息列表 */
   for (const msg of body.messages) {
-    const converted = convertMessage(msg)
+    const converted = convertMessage(msg, flattenMidSystem)
     messages.push(...converted)
   }
 
@@ -73,8 +74,17 @@ export function convertRequestToOpenAI(body: AnthropicMessagesRequest, targetMod
   return result
 }
 
-function convertMessage(msg: AnthropicMessage): OpenAIChatMessage[] {
+function convertMessage(msg: AnthropicMessage, flattenMidSystem: boolean): OpenAIChatMessage[] {
   const results: OpenAIChatMessage[] = []
+
+  /** mid-conversation system（Claude Code beta）：转为 user 消息，保持位置 */
+  if (msg.role === "system" && flattenMidSystem) {
+    const text = typeof msg.content === "string"
+      ? msg.content
+      : (msg.content as { type: "text"; text: string }[]).filter(b => b.type === "text").map(b => b.text).join("\n")
+    results.push({ role: "user", content: text })
+    return results
+  }
 
   if (typeof msg.content === "string") {
     results.push({ role: msg.role, content: msg.content } as OpenAIChatMessage)
