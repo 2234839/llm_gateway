@@ -1,8 +1,73 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue"
+import { ref, computed, onMounted, defineComponent, h } from "vue"
 import { routeApi, providerApi, keyGroupApi, type RouteRuleInfo, type ProviderInfo, type KeyGroupInfo } from "../api"
 import { t } from "../i18n"
 import ConditionTree from "./ConditionTree.vue"
+
+/** 递归渲染条件树的只读展示组件 */
+const ConditionTag: ReturnType<typeof defineComponent> = defineComponent({
+  name: "ConditionTag",
+  props: {
+    node: { type: Object, required: true },
+    isExclude: { type: Boolean, default: false },
+  },
+  setup(props): () => ReturnType<typeof h> | null {
+    return () => {
+      const n = props.node as Record<string, unknown>
+      if (!n || typeof n !== "object") return null
+
+      /** 逻辑组 */
+      if (n.type === "and" || n.type === "or") {
+        const logicClass = n.type === "and" ? "logic-and" : "logic-or"
+        const children = (n.children as unknown[]) ?? []
+        /**
+         * 估算右侧内容区的「行数」：
+         * - 每个叶子算 1 行
+         * - 每个嵌套组至少算 2 行（标签 + 内容）
+         * - 多个子节点因 flex-wrap 会换行，总行数 ≈ ceil(子节点数 / 平均每行容纳数)
+         */
+        const estimateLines = (node: unknown): number => {
+          if (!node || typeof node !== "object") return 0
+          const nd = node as Record<string, unknown>
+          if (nd.type === "and" || nd.type === "or") {
+            const ch = (nd.children as unknown[]) ?? []
+            if (ch.length === 0) return 1
+            let lines = 0
+            for (const child of ch) {
+              lines += estimateLines(child)
+            }
+            /** 嵌套组本身占一行（标签），加上子内容行数 */
+            return Math.max(2, lines)
+          }
+          return 1
+        }
+        const childNodes = (n.children as unknown[]) ?? []
+        /** 右侧只有 1 个直接子元素 → 横排，否则竖排 */
+        const isVertical = childNodes.length > 1
+        const labelText = n.type === "and" ? "AND" : "OR"
+
+        return h("div", { class: `cond-group ${logicClass}` }, [
+          h("span", {
+            class: ["logic-label", { vertical: isVertical }],
+          }, labelText),
+          h("div", { class: "cond-children" },
+            children.map((child: unknown) =>
+              h(ConditionTag as any, { node: child, isExclude: props.isExclude })
+            )
+          ),
+        ])
+      }
+
+      /** 叶子：类型标签 + 值 */
+      const type = n.type as string
+      const tagCls = props.isExclude ? "leaf-tag exclude" : `leaf-tag type-${type}`
+      return h("span", { class: tagCls }, [
+        h("span", { class: "leaf-type" }, leafTypeLabel(type)),
+        h("span", { class: "leaf-value" }, leafValueLabel(n)),
+      ])
+    }
+  },
+})
 
 const rules = ref<RouteRuleInfo[]>([])
 const providers = ref<ProviderInfo[]>([])
@@ -174,34 +239,33 @@ async function syncPriorities(reordered: RouteRuleInfo[]) {
   }
 }
 
-/** 递归提取条件树中的所有叶子条件文本（用于表格显示） */
-function flattenConditionLabels(node: unknown): string[] {
-  if (!node || typeof node !== "object") return []
-  const n = node as Record<string, unknown>
-  if (n.type === "and" || n.type === "or") {
-    return (n.children as unknown[])?.flatMap(flattenConditionLabels) ?? []
+/** 叶子条件的类型标签文字 */
+function leafTypeLabel(type: string): string {
+  switch (type) {
+    case "model": return t('route.model')
+    case "char_count": return t('route.charCount')
+    case "content_type": return t('route.contentType')
+    case "keyword": return t('route.keyword')
+    case "regex": return t('route.regex')
+    default: return type
   }
-  const labels: string[] = []
+}
+
+/** 叶子条件的值文字 */
+function leafValueLabel(n: Record<string, unknown>): string {
   const type = n.type as string
   const pattern = n.pattern as string
   switch (type) {
-    case "model":
-      labels.push(`${t('route.modelLabel')} ${pattern}`)
-      break
-    case "char_count":
-      labels.push(`${t('route.charCount')} ${pattern}`)
-      break
     case "content_type":
-      labels.push(pattern === 'image' ? t('route.containsImage') : pattern === 'file' ? t('route.containsFile') : pattern === 'tool_use' ? t('route.containsToolUse') : pattern)
-      break
-    case "keyword":
-      labels.push(`${t('route.contains')} "${pattern}"`)
-      break
-    case "regex":
-      labels.push(`${t('route.match')} "${pattern}"`)
-      break
+      return pattern === 'image' ? t('route.containsImage') : pattern === 'file' ? t('route.containsFile') : pattern === 'tool_use' ? t('route.containsToolUse') : pattern
+    case "keyword": return `"${pattern}"`
+    case "regex": {
+      const flags = n.flags as string | undefined
+      return flags ? `/${pattern}/${flags}` : `/${pattern}/`
+    }
+    case "char_count": return pattern
+    default: return pattern
   }
-  return labels
 }
 
 function addFallback() {
@@ -302,13 +366,13 @@ function syncMappingToForm() {
             </td>
             <td>
               <template v-if="rule.matchConditions">
-                <span v-for="(label, li) in flattenConditionLabels(rule.matchConditions)" :key="'ml'+li" class="match-tag content">{{ label }}</span>
+                <ConditionTag :node="rule.matchConditions" />
               </template>
               <template v-if="rule.excludeMatch">
                 <span class="exclude-group">
                   <span class="exclude-prefix">{{ t('route.excludes') }}</span>
                   <span class="exclude-conditions">
-                    <span v-for="(label, li) in flattenConditionLabels(rule.excludeMatch)" :key="'el'+li" class="match-tag exclude">{{ label }}</span>
+                    <ConditionTag :node="rule.excludeMatch" :is-exclude="true" />
                   </span>
                 </span>
               </template>
@@ -631,6 +695,98 @@ function syncMappingToForm() {
   background: var(--tag-red-bg);
   color: var(--tag-red);
 }
+
+/** 条件树层级结构展示（:deep 穿透 scoped，因为 ConditionTag 用 h() 渲染） */
+:deep(.cond-group) {
+  display: flex;
+  align-items: stretch;
+  margin: 2px 0;
+}
+:deep(.cond-group > .logic-label) {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 6px;
+  border-radius: 4px;
+  text-align: center;
+  line-height: 1.4;
+}
+/** 横排：右侧只有单行子元素 */
+:deep(.cond-group > .logic-label:not(.vertical)) {
+  align-self: center;
+}
+/** 竖排：右侧多行/多子元素 */
+:deep(.cond-group > .logic-label.vertical) {
+  align-self: stretch;
+  writing-mode: vertical-lr;
+  letter-spacing: 2px;
+  padding: 6px 4px;
+}
+:deep(.cond-children) {
+  flex: 1;
+  min-width: 0;
+  border-left: 2px solid var(--tag-blue);
+  padding-left: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  align-items: center;
+}
+:deep(.cond-group.logic-or > .cond-children) {
+  border-left-color: var(--tag-purple);
+}
+:deep(.logic-and > .logic-label) {
+  background: var(--tag-blue-bg);
+  color: var(--tag-blue);
+  border: 1px solid var(--tag-blue);
+}
+:deep(.logic-or > .logic-label) {
+  background: var(--tag-purple-bg);
+  color: var(--tag-purple);
+  border: 1px solid var(--tag-purple);
+}
+
+/** 叶子条件标签 */
+:deep(.leaf-tag) {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 1px 0;
+}
+:deep(.leaf-type) {
+  padding: 2px 7px;
+  font-weight: 600;
+  font-size: 11px;
+}
+:deep(.leaf-value) {
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+:deep(.leaf-tag.type-model) { border: 1px solid var(--tag-blue); }
+:deep(.leaf-tag.type-model .leaf-type) { background: var(--tag-blue); color: #fff; }
+:deep(.leaf-tag.type-model .leaf-value) { background: var(--tag-blue-bg); color: var(--tag-blue); }
+
+:deep(.leaf-tag.type-keyword) { border: 1px solid var(--tag-purple); }
+:deep(.leaf-tag.type-keyword .leaf-type) { background: var(--tag-purple); color: #fff; }
+:deep(.leaf-tag.type-keyword .leaf-value) { background: var(--tag-purple-bg); color: var(--tag-purple); }
+
+:deep(.leaf-tag.type-regex) { border: 1px solid var(--tag-green); }
+:deep(.leaf-tag.type-regex .leaf-type) { background: var(--tag-green); color: #fff; }
+:deep(.leaf-tag.type-regex .leaf-value) { background: var(--tag-green-bg); color: var(--tag-green); }
+
+:deep(.leaf-tag.type-content_type) { border: 1px solid var(--tag-green); }
+:deep(.leaf-tag.type-content_type .leaf-type) { background: var(--tag-green); color: #fff; }
+:deep(.leaf-tag.type-content_type .leaf-value) { background: var(--tag-green-bg); color: var(--tag-green); }
+
+:deep(.leaf-tag.type-char_count) { border: 1px solid #e6960e; }
+:deep(.leaf-tag.type-char_count .leaf-type) { background: #e6960e; color: #fff; }
+:deep(.leaf-tag.type-char_count .leaf-value) { background: #fef3e2; color: #c47d0a; }
+
+:deep(.leaf-tag.exclude) { border: 1px solid var(--tag-red); }
+:deep(.leaf-tag.exclude .leaf-type) { background: var(--tag-red); color: #fff; }
+:deep(.leaf-tag.exclude .leaf-value) { background: var(--tag-red-bg); color: var(--tag-red); }
 
 /** 排除规则整体分组：前缀标签 + 竖线 + 条件列表 */
 .exclude-group {
