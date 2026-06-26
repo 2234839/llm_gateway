@@ -338,7 +338,7 @@ export interface ConditionLeaf {
    * - keyword: 纯文本包含
    * - regex: 正则匹配
    * - content_type: 多模态内容存在性检测 (image/file/tool_use)
-   * - char_count: 请求字符数比较，如 "<100000"、">=5000"
+   * - char_count: 预估 token 数比较，如 "<100000"、">=5000"（按字符类别加权估算）
    */
   type: "model" | "keyword" | "regex" | "content_type" | "char_count"
   /**
@@ -347,7 +347,7 @@ export interface ConditionLeaf {
    * - keyword: 纯文本子串
    * - regex: 正则表达式
    * - content_type: 模态名称 (image/file/tool_use)
-   * - char_count: 比较表达式，如 "<100000"、">=5000"
+   * - char_count: 比较表达式，如 "<100000"、">=5000"（与预估 token 数比较）
    */
   pattern: string
   /** 正则标志位 (仅 type="regex")，如 "i" */

@@ -4,6 +4,7 @@ import { convertRequestToOpenAI } from "../converters/to-openai.ts"
 import { convertResponseToAnthropic } from "../converters/resp-to-anthropic.ts"
 import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
 import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropicContentTypes } from "../utils/extract-text.ts"
+import { estimateTokenCount } from "../providers/registry.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
 import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
@@ -99,7 +100,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       const messageText = extractAnthropicText(body)
       fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, charCount: messageText.length })
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + body.max_tokens })
 
       /** 内容改写管道 */
       {

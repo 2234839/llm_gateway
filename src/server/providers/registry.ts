@@ -12,8 +12,12 @@ export interface ResolveContext {
   contentTypes: Set<string>
   /** 请求来源的密钥分组 ID */
   groupId?: string
-  /** 请求消息的字符数 */
-  charCount: number
+  /**
+   * 请求的预估总 token 预算 = 预估 input token + max_tokens(completion)。
+   * 按字符类别加权估算 input（无需分词器），加上客户端指定的 completion 上限，
+   * 用于与目标模型的上下文窗口限制做比对。
+   */
+  tokenCount: number
 }
 
 export class ProviderRegistry {
@@ -108,14 +112,14 @@ export class ProviderRegistry {
       /** 统一匹配条件（递归嵌套树） */
       if (rule.matchConditions) {
         const fn = compileCondition(rule.matchConditions)
-        if (!fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.charCount ?? 0)) continue
+        if (!fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.tokenCount ?? 0)) continue
       }
 
       /** 排除条件：命中则跳过此规则 */
       if (rule.excludeMatch) {
         if (context?.messageText || context?.contentTypes?.size) {
           const fn = compileCondition(rule.excludeMatch)
-          if (fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.charCount ?? 0)) continue
+          if (fn(model, context?.messageText ?? "", context?.contentTypes ?? new Set(), context?.tokenCount ?? 0)) continue
         }
       }
 
@@ -280,7 +284,7 @@ function getCachedRegex(pattern: string, flags: string): RegExp | null {
 }
 
 /** 编译后的条件求值函数签名 */
-type CompiledCondition = (model: string, text: string, contentTypes: Set<string>, charCount: number) => boolean
+type CompiledCondition = (model: string, text: string, contentTypes: Set<string>, tokenCount: number) => boolean
 
 /** 条件树编译缓存：key = JSON.stringify(node) */
 const compiledCache = new Map<string, CompiledCondition>()
@@ -309,11 +313,11 @@ function doCompile(node: ConditionNode): CompiledCondition {
     const group = node as ConditionGroup
     const compiledChildren = group.children.map(doCompile)
     if (group.type === "and") {
-      return (model, text, contentTypes, charCount) =>
-        compiledChildren.every(fn => fn(model, text, contentTypes, charCount))
+      return (model, text, contentTypes, tokenCount) =>
+        compiledChildren.every(fn => fn(model, text, contentTypes, tokenCount))
     }
-    return (model, text, contentTypes, charCount) =>
-      compiledChildren.some(fn => fn(model, text, contentTypes, charCount))
+    return (model, text, contentTypes, tokenCount) =>
+      compiledChildren.some(fn => fn(model, text, contentTypes, tokenCount))
   }
 
   /** 叶子条件 */
@@ -338,14 +342,45 @@ function doCompile(node: ConditionNode): CompiledCondition {
     }
     case "char_count": {
       const parsed = parseCharCountExpr(leaf.pattern)
-      return (_model, _text, _contentTypes, charCount) => parsed(charCount)
+      return (_model, _text, _contentTypes, tokenCount) => parsed(tokenCount)
     }
     default:
       return () => false
   }
 }
 
-/** 解析字符数比较表达式，返回求值函数 */
+/**
+ * 预估文本的 token 数。
+ *
+ * 不依赖任何分词器，按字符类别加权估算，对中英文混合文本都给出合理近似：
+ * - CJK（中日韩）字符：约 1 token/字（取保守上界，便于"小于 N 才路由"判定）
+ * - 其他字符（含空格/标点）：约 4 字符/token（接近英文 BPE 平均比率）
+ *
+ * 相比直接用字符串长度（UTF-16 码元数），该估算对中文不再严重低估。
+ */
+export function estimateTokenCount(text: string): number {
+  let cjk = 0
+  let other = 0
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!
+    /** CJK 统一表意文字及扩展区、日文假名、韩文音节/谚文等 */
+    if (
+      (code >= 0x3000 && code <= 0x30ff) ||  // CJK 符号标点 + 日文假名
+      (code >= 0x3400 && code <= 0x4dbf) ||  // CJK 扩展 A
+      (code >= 0x4e00 && code <= 0x9fff) ||  // CJK 统一表意文字
+      (code >= 0xac00 && code <= 0xd7af) ||  // 韩文音节
+      (code >= 0xf900 && code <= 0xfaff) ||  // CJK 兼容表意
+      (code >= 0xff00 && code <= 0xffef)     // 全角字符
+    ) {
+      cjk++
+    } else {
+      other++
+    }
+  }
+  return cjk + Math.ceil(other / 4)
+}
+
+/** 解析 token 数比较表达式，返回求值函数 */
 function parseCharCountExpr(pattern: string): (count: number) => boolean {
   const match = pattern.match(/^(<=?|>=?)\s*(\d+)$/)
   if (!match) return () => false
