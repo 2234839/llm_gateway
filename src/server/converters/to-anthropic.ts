@@ -23,7 +23,10 @@ export function convertRequestToAnthropic(body: OpenAIChatCompletionRequest, tar
     const role = msg.role
     if (role === "system") {
       const sysMsg = msg as OpenAISystemMessage
-      system = system ? `${system}\n${sysMsg.content}` : sysMsg.content
+      /** 跳过 content 为空的 system 消息，避免 Anthropic API 拒绝 */
+      if (sysMsg.content && sysMsg.content.trim().length > 0) {
+        system = system ? `${system}\n${sysMsg.content.trim()}` : sysMsg.content.trim()
+      }
       continue
     }
 

@@ -279,10 +279,30 @@ async function handleAnthropicUpstream(
   try {
   if (provider.type === "anthropic") {
     /** 兼容 Claude Code mid_conversation_system beta：
-     *  若 provider 开启了 flattenMidSystem，将 messages 中的 system 消息转为 user */
-    const sendBody = providerConfig.flattenMidSystem && body.messages.some(m => m.role === "system")
-      ? { ...body, model: targetModel, messages: body.messages.map(m => m.role === "system" ? { ...m, role: "user" as const } : m) }
-      : { ...body, model: targetModel }
+     *  若 provider 开启了 flattenMidSystem，将 messages 中的 system 消息转为 user
+     *  注意：始终过滤掉 content 为空的 system 消息，避免 Anthropic API 拒绝 */
+    const messages = body.messages.filter(m => {
+      if (m.role !== "system") return true
+      if (typeof m.content === "string") return m.content.trim().length > 0
+      if (!Array.isArray(m.content) || m.content.length === 0) return false
+      return m.content.some(b => b.type === "text" && b.text && b.text.trim().length > 0)
+    })
+    const sendBody: Record<string, unknown> = {
+      ...body,
+      model: targetModel,
+      messages: providerConfig.flattenMidSystem && messages.some(m => m.role === "system")
+        ? messages.map(m => m.role === "system" ? { ...m, role: "user" as const } : m)
+        : messages,
+    }
+    /** 过滤掉空的顶层 system 字段 */
+    if (body.system !== undefined) {
+      const hasContent = typeof body.system === "string"
+        ? body.system.trim().length > 0
+        : Array.isArray(body.system) && body.system.some(b => b.type === "text" && b.text && b.text.trim().length > 0)
+      if (!hasContent) {
+        delete sendBody.system
+      }
+    }
 
     /** Anthropic 直连 — 透传 */
     if (isStream) {
