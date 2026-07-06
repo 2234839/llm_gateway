@@ -311,7 +311,7 @@ function doCompile(node: ConditionNode): CompiledCondition {
   /** 逻辑组 */
   if (node.type === "and" || node.type === "or") {
     const group = node as ConditionGroup
-    const compiledChildren = group.children.map(doCompile)
+    const compiledChildren = group.children.filter(Boolean).map(doCompile)
     if (group.type === "and") {
       return (model, text, contentTypes, tokenCount) =>
         compiledChildren.every(fn => fn(model, text, contentTypes, tokenCount))

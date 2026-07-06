@@ -53,8 +53,16 @@ function removeChild(group: ConditionGroup, index: number) {
 }
 
 /** 更新子节点（从 ConditionTree 子组件的 emit 触发） */
-function updateChild(group: ConditionGroup, index: number, value: ConditionNode) {
-  group.children[index] = value
+function updateChild(group: ConditionGroup, index: number, value: ConditionNode | undefined) {
+  if (value === undefined) {
+    group.children.splice(index, 1)
+    if (group.children.length === 0) {
+      emit("update:modelValue", undefined)
+      return
+    }
+  } else {
+    group.children[index] = value
+  }
   emitUpdate(group)
 }
 
