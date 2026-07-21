@@ -145,15 +145,16 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
         /** 基于 TCP socket close 的断连信号，比 request.signal 可靠（Bun 下 request.signal 在请求体消费后会误 abort） */
-        const clientSignal = createDisconnectSignal(request)
+        const { signal: clientSignal, cleanup: cleanupDisconnect } = createDisconnectSignal(request)
         try {
           await semaphore?.acquire(clientSignal)
         } catch {
+          cleanupDisconnect()
           return
         }
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
-          
+
           const result = await handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
@@ -170,6 +171,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
             outputText = result.outputText ?? outputText
             /** 上游已接受请求，释放信号量（不延迟到流结束，避免 Bun 下 close 事件不可靠导致信号量泄漏） */
             semaphore?.release()
+            /** signal 已完成使命（fetch response 已返回），移除 socket close 监听器避免 keep-alive 复用下的泄漏 */
+            cleanupDisconnect()
             return
           }
           /** 请求失败，释放信号量 */
@@ -183,6 +186,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
           /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回 */
           if (statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
+            cleanupDisconnect()
             reply.status(statusCode)
             return reply.send(convertErrorToAnthropic(result.errorMsg!, statusCode))
           }
@@ -190,8 +194,11 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           /** handleAnthropicUpstream 抛出异常（如网络错误），释放信号量 */
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           semaphore?.release()
+          cleanupDisconnect()
           throw err
         }
+        /** 本轮 fallback 结束（将进入下一个候选），清理本轮的断连监听器 */
+        cleanupDisconnect()
       }
 
       /** 所有候选都失败了 */
