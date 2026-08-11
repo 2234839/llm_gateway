@@ -1,10 +1,11 @@
 import type { GatewayDB } from "./db.ts"
 import type { AuthContext } from "./types.ts"
 
-interface QuotaResult {
+export interface QuotaResult {
   allowed: boolean
   reason?: string
   retryAfterMs?: number
+  type?: "rpm" | "daily" | "monthly"
 }
 
 /** 有效限额：Key 级别 > 分组级别 > 0(不限) */
@@ -81,7 +82,7 @@ export function checkQuota(db: GatewayDB, auth: AuthContext | null): QuotaResult
     const window = rpmWindows.get(auth.keyId)
     const rpm = window?.length ?? 0
     if (rpm >= effectiveRpm) {
-      return { allowed: false, reason: `Rate limit exceeded: ${rpm}/${effectiveRpm} requests per minute.`, retryAfterMs: 60_000 }
+      return { allowed: false, reason: `Rate limit exceeded: ${rpm}/${effectiveRpm} requests per minute.`, retryAfterMs: 60_000, type: "rpm" }
     }
   }
 
@@ -108,17 +109,63 @@ export function checkQuota(db: GatewayDB, auth: AuthContext | null): QuotaResult
     }
 
     if (effectiveDaily > 0 && cached.daily >= effectiveDaily) {
-      return { allowed: false, reason: `Daily token quota exceeded: ${cached.daily}/${effectiveDaily}.`, retryAfterMs: 86400000 }
+      return { allowed: false, reason: `Daily token quota exceeded: ${cached.daily}/${effectiveDaily}.`, retryAfterMs: 86400000, type: "daily" }
     }
     if (effectiveMonthly > 0 && cached.monthly >= effectiveMonthly) {
-      return { allowed: false, reason: `Monthly token quota exceeded: ${cached.monthly}/${effectiveMonthly}.` }
+      return { allowed: false, reason: `Monthly token quota exceeded: ${cached.monthly}/${effectiveMonthly}.`, type: "monthly" }
     }
   }
 
   return { allowed: true }
 }
 
-/** 请求完成后将实际 token 消耗累加到缓存，缩小 TOCTOU 窗口 */
+/** 可被 AbortSignal 取消的延迟等待 */
+export function waitDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      if (signal) signal.removeEventListener("abort", onAbort)
+    }
+
+    const onAbort = () => {
+      cleanup()
+      reject(new Error("Request aborted"))
+    }
+
+    if (signal) {
+      if (signal.aborted) {
+        cleanup()
+        reject(new Error("Request aborted"))
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+  })
+}
+
+export async function acquireRpmSlot(keyId: string, keyRpmLimit: number, groupRpmLimit: number, signal?: AbortSignal): Promise<void> {
+  const effective = effectiveLimit(keyRpmLimit, groupRpmLimit)
+  if (effective <= 0) return
+
+  while (true) {
+    cleanRpmWindow(keyId, 60_000)
+    const window = rpmWindows.get(keyId)
+    const rpm = window?.length ?? 0
+    if (rpm < effective) {
+      recordRpmRequest(keyId, keyRpmLimit, groupRpmLimit)
+      return
+    }
+    const nextExpireMs = window![0]! + 60_000 - Date.now()
+    const waitMs = Math.max(50, Math.min(nextExpireMs + 1, 1000))
+    await waitDelay(waitMs, signal)
+  }
+}
+
 export function recordUsage(keyId: string | null, tokens: number) {
   if (!keyId || tokens <= 0) return
   const cached = usageCache.get(keyId)

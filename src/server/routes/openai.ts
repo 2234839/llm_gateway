@@ -7,7 +7,7 @@ import { extractOpenAIText, extractOpenAIResponseSummary, extractOpenAIContentTy
 import { estimateTokenCount } from "../providers/registry.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
-import { checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
+import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage, waitDelay } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
@@ -96,23 +96,37 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       statusCode = 502
     }
 
-    /** 配额检查 */
-    if (auth) {
-      const quotaResult = checkQuota(fastify.db, auth)
-      if (!quotaResult.allowed) {
-        if (quotaResult.retryAfterMs) reply.header("Retry-After", Math.ceil(quotaResult.retryAfterMs / 1000))
-        return reply.status(429).send({
-          error: { message: quotaResult.reason!, type: "rate_limit_error", code: "rate_limit_exceeded" },
-        })
-      }
-      recordRpmRequest(auth.keyId, auth.keyLimits.rpmLimit, auth.groupLimits.rpmLimit)
-    }
-
     try {
       const messageText = extractOpenAIText(body)
       fullMessageText = messageText
       const contentTypes = extractOpenAIContentTypes(body)
-      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + (body.max_tokens ?? body.max_completion_tokens ?? 0) })
+      const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + (body.max_tokens ?? body.max_completion_tokens ?? 0) })
+
+      /** 配额检查 */
+      if (auth) {
+        const quotaResult = checkQuota(fastify.db, auth)
+        if (!quotaResult.allowed) {
+          if (quotaResult.type === "rpm" && routeResult.routeRule?.retryQpmLimit) {
+            try {
+              await acquireRpmSlot(auth.keyId, auth.keyLimits.rpmLimit, auth.groupLimits.rpmLimit, request.signal)
+            } catch {
+              if (quotaResult.retryAfterMs) reply.header("Retry-After", Math.ceil(quotaResult.retryAfterMs / 1000))
+              return reply.status(429).send({
+                error: { message: quotaResult.reason!, type: "rate_limit_error", code: "rate_limit_exceeded" },
+              })
+            }
+          } else {
+            if (quotaResult.retryAfterMs) reply.header("Retry-After", Math.ceil(quotaResult.retryAfterMs / 1000))
+            return reply.status(429).send({
+              error: { message: quotaResult.reason!, type: "rate_limit_error", code: "rate_limit_exceeded" },
+            })
+          }
+        } else {
+          recordRpmRequest(auth.keyId, auth.keyLimits.rpmLimit, auth.groupLimits.rpmLimit)
+        }
+      }
+
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = routeResult
 
       /** 内容改写管道 */
       {
@@ -142,6 +156,11 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 
       emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerConfig.name, providerId: providerConfig.id, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
 
+      /** retryQpmLimit 开启时，上游 429 不透传，在网关层等待后重试同一 provider */
+      const retryOnUpstream429 = routeResult.routeRule?.retryQpmLimit === true
+      /** 上游 429 重试上限（指数退避：1s → 2s → 4s） */
+      const MAX_UPSTREAM_429_RETRIES = 3
+
       /** 依次尝试每个候选 provider，直到成功 */
       for (let attempt = 0; attempt < candidates.length; attempt++) {
         const { provider: currentProvider, providerConfig: currentConfig, targetModel: currentTarget } = candidates[attempt]!
@@ -154,6 +173,9 @@ export async function openaiRoutes(fastify: FastifyInstance) {
           console.log(`[openai] Fallback #${attempt} → ${providerName} / ${targetModel}`)
         }
 
+        /** 当前候选 provider 的上游 429 重试计数 */
+        let upstream429Retries = 0
+
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
         /** 基于 TCP socket close 的断连信号，比 request.signal 可靠（Bun 下 request.signal 在请求体消费后会误 abort） */
         const { signal: clientSignal, cleanup: cleanupDisconnect } = createDisconnectSignal(request)
@@ -165,7 +187,19 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
-          const result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal)
+          let result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal)
+
+          /** 上游 429 且路由规则开启了 retryQpmLimit → 在网关层等待后重试同一 provider */
+          while (!result.ok && result.statusCode === 429 && retryOnUpstream429 && upstream429Retries < MAX_UPSTREAM_429_RETRIES && !clientSignal.aborted) {
+            const waitMs = 1000 * Math.pow(2, upstream429Retries)
+            console.log(`[openai] Upstream 429 from "${providerName}", retrying in ${waitMs}ms (attempt ${upstream429Retries + 1}/${MAX_UPSTREAM_429_RETRIES})`)
+            await waitDelay(waitMs, clientSignal)
+            upstream429Retries++
+            emitEvent({ type: "upstream_end", requestId: reqId, providerId })
+            emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
+            result = await handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal)
+          }
+
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
             /** 流式 hijack 成功时 statusCode 为 200；失败时 setStreamError 已设置 statusCode */

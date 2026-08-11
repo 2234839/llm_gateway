@@ -380,6 +380,8 @@ export interface RouteRule {
   enabled?: boolean
   /** 限定匹配的密钥分组 ID 列表，空/缺省=匹配所有 */
   keyGroups?: string[]
+  /** 是否在 QPM 限流时自动等待并重试，而不是直接返回 429 */
+  retryQpmLimit?: boolean
   /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
   fallbacks?: RouteFallback[]
 }
@@ -523,6 +525,8 @@ export interface RouteResult {
   providerConfig: ProviderConfig
   /** 命中的路由规则 pattern，兜底规则时为 null */
   rulePattern: string | null
+  /** 命中的完整路由规则对象，方便访问额外配置 */
+  routeRule?: RouteRule
   /** 故障转移备选列表 */
   fallbacks: RouteFallback[]
 }

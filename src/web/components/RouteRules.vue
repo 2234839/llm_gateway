@@ -85,6 +85,7 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   priority: 0,
   fallbacks: [],
   keyGroups: [],
+  retryQpmLimit: false,
 }
 
 const form = ref({ ...emptyRule })
@@ -114,7 +115,7 @@ async function load() {
 function startCreate() {
   editingId.value = null
   creating.value = true
-  form.value = { ...emptyRule, keyGroups: [], fallbacks: [], modelMapping: {} }
+  form.value = { ...emptyRule, keyGroups: [], fallbacks: [], modelMapping: {}, retryQpmLimit: false }
   syncMappingFromForm()
 }
 
@@ -130,6 +131,7 @@ function startEdit(rule: RouteRuleInfo) {
     excludeMatch: rule.excludeMatch ? JSON.parse(JSON.stringify(rule.excludeMatch)) : undefined,
     fallbacks: rule.fallbacks ? rule.fallbacks.map(f => ({ ...f })) : [],
     keyGroups: rule.keyGroups ? [...rule.keyGroups] : [],
+    retryQpmLimit: rule.retryQpmLimit ?? false,
   }
   syncMappingFromForm()
 }
@@ -154,6 +156,7 @@ async function save() {
   }
   if (!data.keyGroups?.length) data.keyGroups = undefined
   if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = undefined
+  if (!data.retryQpmLimit) data.retryQpmLimit = undefined
   error.value = ""
   saving.value = true
   try {
@@ -492,6 +495,13 @@ function syncMappingToForm() {
           <button class="btn-sm" type="button" @click="addFallback" style="margin-left: 24px">{{ t('route.addFallback') }}</button>
         </div>
 
+        <div class="match-section">
+          <div class="section-label">{{ t('route.retryQpmLabel') }}</div>
+          <label class="checkbox-label">
+            <input type="checkbox" v-model="form.retryQpmLimit" />
+            {{ t('route.retryQpmHint') }}
+          </label>
+        </div>
         <div class="form-actions">
           <button class="btn btn-primary" @click="save" :disabled="saving">{{ saving ? '...' : t('route.save') }}</button>
           <button class="btn" @click="cancel">{{ t('route.cancel') }}</button>

@@ -90,6 +90,8 @@ export interface RouteRuleInfo {
   enabled?: boolean
   /** 匹配的密钥分组 ID 列表 */
   keyGroups?: string[]
+  /** 是否在 QPM 限流时自动等待并重试，而不是直接返回 429 */
+  retryQpmLimit?: boolean
   /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
   fallbacks?: RouteFallback[]
 }

@@ -93,7 +93,8 @@ export class GatewayDB {
         pattern TEXT NOT NULL,
         provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
         model_mapping TEXT DEFAULT '{}',
-        priority INTEGER NOT NULL DEFAULT 0
+        priority INTEGER NOT NULL DEFAULT 0,
+        retry_qpm_limit INTEGER NOT NULL DEFAULT 0
       )
     `)
 
@@ -143,6 +144,11 @@ export class GatewayDB {
     }
     try {
       this.db.run("ALTER TABLE route_rules ADD COLUMN exclude_match TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.run("ALTER TABLE route_rules ADD COLUMN retry_qpm_limit INTEGER NOT NULL DEFAULT 0")
     } catch {
       // 列已存在
     }
@@ -407,8 +413,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks, retry_qpm_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.retryQpmLimit ? 1 : 0)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>): boolean {
@@ -419,8 +425,8 @@ export class GatewayDB {
       const updated = { ...existing, ...rule, id }
       const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
-        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=? WHERE id=?"
-      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, id)
+        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, retry_qpm_limit=? WHERE id=?"
+      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.retryQpmLimit ? 1 : 0, id)
       return true
     })
   }
@@ -464,6 +470,7 @@ export class GatewayDB {
       excludeMatch: resolvedExclude,
       enabled: row.enabled !== 0,
       keyGroups: row.key_groups ? JSON.parse(row.key_groups as string) : undefined,
+      retryQpmLimit: (row.retry_qpm_limit as number) === 1 || undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
     }
   }

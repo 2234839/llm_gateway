@@ -141,6 +141,7 @@ export class ProviderRegistry {
         targetModel,
         providerConfig,
         rulePattern: modelPattern,
+        routeRule: rule,
         fallbacks,
       }
     }

@@ -240,6 +240,8 @@ export default {
     addExclude: "+ Add exclude condition",
     fallbackLabel: "Fallback (optional)",
     fallbackHint: "When the primary provider fails (5xx / timeout), try alternatives in order",
+    retryQpmLabel: "Retry on RPM limit",
+    retryQpmHint: "If gateway RPM quota is exceeded for this route, wait and retry instead of returning 429 immediately",
     addFallback: "+ Add fallback",
     keyGroupsLabel: "Key Group Restriction",
     keyGroupsHint: "Leave empty to apply to all groups; select to restrict to specific groups",
