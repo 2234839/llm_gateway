@@ -147,8 +147,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
       /** retryQpmLimit 开启时，上游 429 不透传，在网关层等待后重试同一 provider */
       const retryOnUpstream429 = routeResult.routeRule?.retryQpmLimit === true
-      /** 上游 429 重试上限（线性退避：1s → 2s → 3s → 4s → 5s → 6s，总共最多 21s） */
-      const MAX_UPSTREAM_429_RETRIES = 6
+      /** 上游 429 重试上限（指数退避：1s → 2s → 4s → 8s → … → 512s） */
+      const MAX_UPSTREAM_429_RETRIES = 10
 
       /** 依次尝试每个候选 provider，直到成功 */
       let lastError: string | null = null
@@ -182,7 +182,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
           /** 上游 429 且路由规则开启了 retryQpmLimit → 在网关层等待后重试同一 provider */
           while (!result.ok && result.statusCode === 429 && retryOnUpstream429 && upstream429Retries < MAX_UPSTREAM_429_RETRIES && !clientSignal.aborted) {
-            const waitMs = 1000 * (upstream429Retries + 1)
+            const waitMs = 1000 * Math.pow(2, upstream429Retries)
             console.log(`[anthropic] Upstream 429 from "${providerName}", retrying in ${waitMs}ms (attempt ${upstream429Retries + 1}/${MAX_UPSTREAM_429_RETRIES})`)
             await waitDelay(waitMs, clientSignal)
             upstream429Retries++
