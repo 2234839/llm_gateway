@@ -7,8 +7,9 @@ import { extractAnthropicText, extractAnthropicResponseSummary, extractAnthropic
 import { estimateTokenCount } from "../providers/registry.ts"
 import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
-import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage, waitDelay } from "../quota.ts"
+import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
+import { withUpstream429Retry } from "../utils/retry.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -147,8 +148,6 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
       /** retryQpmLimit 开启时，上游 429 不透传，在网关层等待后重试同一 provider */
       const retryOnUpstream429 = routeResult.routeRule?.retryQpmLimit === true
-      /** 上游 429 重试上限（指数退避：1s → 2s → 4s → 8s → … → 512s） */
-      const MAX_UPSTREAM_429_RETRIES = 10
 
       /** 依次尝试每个候选 provider，直到成功 */
       let lastError: string | null = null
@@ -163,9 +162,6 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           console.log(`[anthropic] Fallback #${attempt} → ${providerName} / ${targetModel}`)
         }
 
-        /** 当前候选 provider 的上游 429 重试计数 */
-        let upstream429Retries = 0
-
         const semaphore = fastify.registry.getSemaphore(currentConfig.id)
         /** 基于 TCP socket close 的断连信号，比 request.signal 可靠（Bun 下 request.signal 在请求体消费后会误 abort） */
         const { signal: clientSignal, cleanup: cleanupDisconnect } = createDisconnectSignal(request)
@@ -178,18 +174,15 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
 
-          let result = await handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
-
-          /** 上游 429 且路由规则开启了 retryQpmLimit → 在网关层等待后重试同一 provider */
-          while (!result.ok && result.statusCode === 429 && retryOnUpstream429 && upstream429Retries < MAX_UPSTREAM_429_RETRIES && !clientSignal.aborted) {
-            const waitMs = 1000 * Math.pow(2, upstream429Retries)
-            console.log(`[anthropic] Upstream 429 from "${providerName}", retrying in ${waitMs}ms (attempt ${upstream429Retries + 1}/${MAX_UPSTREAM_429_RETRIES})`)
-            await waitDelay(waitMs, clientSignal)
-            upstream429Retries++
-            emitEvent({ type: "upstream_end", requestId: reqId, providerId })
-            emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
-            result = await handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal)
-          }
+          const result = await withUpstream429Retry(
+            () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal),
+            retryOnUpstream429,
+            clientSignal,
+            providerName,
+            reqId,
+            providerId,
+            "[anthropic]",
+          )
 
           emitEvent({ type: "upstream_end", requestId: reqId, providerId })
           if (result.ok) {
