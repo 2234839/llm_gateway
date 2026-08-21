@@ -244,6 +244,8 @@ export default {
     retryQpmHint: "当此规则命中的网关 RPM 限额超出时，等待并重试，而不是直接返回 429",
     retry529Hint: "上游返回 529（服务过载）时，等待并重试，而不是直接透传",
     retryAllFailuresHint: "重试所有失败：任意上游失败都在网关层等待并重试（涵盖上述两类）",
+    fallbackOnClientError: "客户端错误也触发故障转移",
+    fallbackOnClientErrorHint: "默认仅服务端错误(5xx)和限流(429/408)触发故障转移，启用后4xx客户端错误也会触发",
     addFallback: "+ 添加备选",
     keyGroupsLabel: "密钥分组限制",
     keyGroupsHint: "不选则对所有分组生效；选择后仅对指定分组生效",

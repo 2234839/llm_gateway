@@ -244,6 +244,8 @@ export default {
     retryQpmHint: "If gateway RPM quota is exceeded for this route, wait and retry instead of returning 429 immediately",
     retry529Hint: "When upstream returns 529 (service overloaded), wait and retry instead of passing it through",
     retryAllFailuresHint: "Retry all failures: any upstream failure is retried after waiting at the gateway (covers the above)",
+    fallbackOnClientError: "Fallback on client errors (4xx)",
+    fallbackOnClientErrorHint: "By default only server errors (5xx) and rate limits (429/408) trigger fallback. Enable to also trigger on 4xx client errors",
     addFallback: "+ Add fallback",
     keyGroupsLabel: "Key Group Restriction",
     keyGroupsHint: "Leave empty to apply to all groups; select to restrict to specific groups",

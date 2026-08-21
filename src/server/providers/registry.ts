@@ -143,6 +143,7 @@ export class ProviderRegistry {
         rulePattern: modelPattern,
         routeRule: rule,
         fallbacks,
+        fallbackOnClientError: rule.fallbackOnClientError ?? false,
       }
     }
 

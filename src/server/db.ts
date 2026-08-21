@@ -252,6 +252,9 @@ export class GatewayDB {
       this.db.run("ALTER TABLE route_rules ADD COLUMN fallbacks TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
+      this.db.run("ALTER TABLE route_rules ADD COLUMN fallback_on_client_error INTEGER DEFAULT 0")
+    } catch { /* 列已存在 */ }
+    try {
       this.db.run("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
     try {
@@ -425,8 +428,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks, retry_qpm_limit, retry_on_529, retry_all_failures) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.retryQpmLimit ? 1 : 0, rule.retryOn529 ? 1 : 0, rule.retryAllFailures ? 1 : 0)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks, fallback_on_client_error, retry_qpm_limit, retry_on_529, retry_all_failures) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.fallbackOnClientError ? 1 : 0, rule.retryQpmLimit ? 1 : 0, rule.retryOn529 ? 1 : 0, rule.retryAllFailures ? 1 : 0)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>): boolean {
@@ -437,8 +440,8 @@ export class GatewayDB {
       const updated = { ...existing, ...rule, id }
       const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
-        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, retry_qpm_limit=?, retry_on_529=?, retry_all_failures=? WHERE id=?"
-      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.retryQpmLimit ? 1 : 0, updated.retryOn529 ? 1 : 0, updated.retryAllFailures ? 1 : 0, id)
+        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, fallback_on_client_error=?, retry_qpm_limit=?, retry_on_529=?, retry_all_failures=? WHERE id=?"
+      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.fallbackOnClientError ? 1 : 0, updated.retryQpmLimit ? 1 : 0, updated.retryOn529 ? 1 : 0, updated.retryAllFailures ? 1 : 0, id)
       return true
     })
   }
@@ -486,6 +489,7 @@ export class GatewayDB {
       retryOn529: (row.retry_on_529 as number) === 1 || undefined,
       retryAllFailures: (row.retry_all_failures as number) === 1 || undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
+      fallbackOnClientError: row.fallback_on_client_error === 1,
     }
   }
 

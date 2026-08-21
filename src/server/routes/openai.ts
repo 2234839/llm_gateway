@@ -127,7 +127,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
       }
 
-      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = routeResult
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
 
       /** 内容改写管道 */
       {
@@ -224,8 +224,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
           fallbackAttempts.push({ providerId, providerName, targetModel, statusCode, error: result.errorMsg ?? "" })
           console.warn(`[openai] Provider "${providerName}" failed (${statusCode}): ${result.errorMsg}`)
 
-          /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回 */
-          if (statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
+          /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回（除非 fallbackOnClientError 启用） */
+          if (!fallbackOnClientError && statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
             cleanupDisconnect()
             reply.status(statusCode)
             return reply.send(convertErrorToOpenAI(result.errorMsg ?? "Upstream error", statusCode))

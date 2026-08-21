@@ -108,29 +108,15 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
             if (quotaResult.retryAfterMs) reply.header("Retry-After", Math.ceil(quotaResult.retryAfterMs / 1000))
             return reply.status(429).send({
               type: "error",
-              error: { type: "rate_limit_error", message: quotaResult.reason! },
-            } satisfies AnthropicErrorResponse)
+                error: { type: "rate_limit_error", message: quotaResult.reason! },
+              } satisfies AnthropicErrorResponse)
           }
         } else {
           recordRpmRequest(auth.keyId, auth.keyLimits.rpmLimit, auth.groupLimits.rpmLimit)
         }
       }
 
-      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks } = routeResult
-
-      /** 内容改写管道 */
-      {
-        const rewriteRules = fastify.db.getRewriteRules()
-        if (rewriteRules.length > 0) {
-          const { rewriteAnthropic } = await import("../utils/rewrite-engine")
-          const rr = rewriteAnthropic(body, rewriteRules, { path: "/v1/messages", model })
-          if (rr.matched) fullMessageText = extractAnthropicText(body)
-        }
-      }
-
-      /** 附加路由调试 header（RFC 7230 要求 header 值为可见 ASCII 字符） */
-      reply.header("x-gateway-provider", encodeURIComponent(providerConfig.name))
-      reply.header("x-gateway-model", encodeURIComponent(tm))
+      const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
 
       /** 构建尝试列表：主 provider + fallbacks */
       const candidates: { provider: Provider; providerConfig: ProviderConfig; targetModel: string }[] = [
@@ -216,8 +202,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
           fallbackAttempts.push({ providerId, providerName, targetModel, statusCode, error: result.errorMsg ?? "" })
           console.warn(`[anthropic] Provider "${providerName}" failed (${statusCode}): ${result.errorMsg}`)
 
-          /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回 */
-          if (statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
+          /** 429/408 允许 fallback 尝试其他 provider，其余 4xx 直接返回（除非 fallbackOnClientError 启用） */
+          if (!fallbackOnClientError && statusCode >= 400 && statusCode < 500 && statusCode !== 429 && statusCode !== 408) {
             cleanupDisconnect()
             reply.status(statusCode)
             return reply.send(convertErrorToAnthropic(result.errorMsg!, statusCode))
