@@ -382,6 +382,10 @@ export interface RouteRule {
   keyGroups?: string[]
   /** 是否在 QPM 限流时自动等待并重试，而不是直接返回 429 */
   retryQpmLimit?: boolean
+  /** 是否在上游 529（服务过载）时自动等待并重试 */
+  retryOn529?: boolean
+  /** 是否对任意上游失败自动等待并重试（涵盖 429/529，耗尽次数后按原逻辑 fallback） */
+  retryAllFailures?: boolean
   /** 故障转移备选提供商列表，主 Provider 失败时按顺序尝试 */
   fallbacks?: RouteFallback[]
 }

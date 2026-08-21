@@ -86,6 +86,8 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   fallbacks: [],
   keyGroups: [],
   retryQpmLimit: false,
+  retryOn529: false,
+  retryAllFailures: false,
 }
 
 const form = ref({ ...emptyRule })
@@ -115,7 +117,7 @@ async function load() {
 function startCreate() {
   editingId.value = null
   creating.value = true
-  form.value = { ...emptyRule, keyGroups: [], fallbacks: [], modelMapping: {}, retryQpmLimit: false }
+  form.value = { ...emptyRule, keyGroups: [], fallbacks: [], modelMapping: {}, retryQpmLimit: false, retryOn529: false, retryAllFailures: false }
   syncMappingFromForm()
 }
 
@@ -132,6 +134,8 @@ function startEdit(rule: RouteRuleInfo) {
     fallbacks: rule.fallbacks ? rule.fallbacks.map(f => ({ ...f })) : [],
     keyGroups: rule.keyGroups ? [...rule.keyGroups] : [],
     retryQpmLimit: rule.retryQpmLimit ?? false,
+    retryOn529: rule.retryOn529 ?? false,
+    retryAllFailures: rule.retryAllFailures ?? false,
   }
   syncMappingFromForm()
 }
@@ -157,6 +161,8 @@ async function save() {
   if (!data.keyGroups?.length) data.keyGroups = undefined
   if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = undefined
   if (!data.retryQpmLimit) data.retryQpmLimit = undefined
+  if (!data.retryOn529) data.retryOn529 = undefined
+  if (!data.retryAllFailures) data.retryAllFailures = undefined
   error.value = ""
   saving.value = true
   try {
@@ -496,10 +502,18 @@ function syncMappingToForm() {
         </div>
 
         <div class="match-section">
-          <div class="section-label">{{ t('route.retryQpmLabel') }}</div>
+          <div class="section-label">{{ t('route.retryLabel') }}</div>
           <label class="checkbox-label">
-            <input type="checkbox" v-model="form.retryQpmLimit" />
+            <input type="checkbox" v-model="form.retryQpmLimit" :disabled="form.retryAllFailures" />
             {{ t('route.retryQpmHint') }}
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" v-model="form.retryOn529" :disabled="form.retryAllFailures" />
+            {{ t('route.retry529Hint') }}
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" v-model="form.retryAllFailures" />
+            {{ t('route.retryAllFailuresHint') }}
           </label>
         </div>
         <div class="form-actions">

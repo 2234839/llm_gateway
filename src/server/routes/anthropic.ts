@@ -9,7 +9,7 @@ import { logRequestSummary, nextReqId } from "../utils/log-summary.ts"
 import { emitEvent } from "../utils/event-bus.ts"
 import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
-import { withUpstream429Retry } from "../utils/retry.ts"
+import { withUpstreamRetry } from "../utils/retry.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -146,8 +146,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
       emitEvent({ type: "request_start", requestId: reqId, model, targetModel: tm, provider: providerConfig.name, providerId: providerConfig.id, input: inputSummary, rulePattern, keyName: auth?.keyName, groupName: auth?.groupName })
 
-      /** retryQpmLimit 开启时，上游 429 不透传，在网关层等待后重试同一 provider */
-      const retryOnUpstream429 = routeResult.routeRule?.retryQpmLimit === true
+      /** 重试策略：429（retryQpmLimit）/ 529（retryOn529）/ 任意失败（retryAllFailures）时，不透传，在网关层等待后重试同一 provider */
+      const retryOptions = {
+        retryOn429: routeResult.routeRule?.retryQpmLimit === true,
+        retryOn529: routeResult.routeRule?.retryOn529 === true,
+        retryAllFailures: routeResult.routeRule?.retryAllFailures === true,
+      }
 
       /** 依次尝试每个候选 provider，直到成功 */
       let lastError: string | null = null
@@ -174,9 +178,9 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
 
-          const result = await withUpstream429Retry(
+          const result = await withUpstreamRetry(
             () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal),
-            retryOnUpstream429,
+            retryOptions,
             clientSignal,
             providerName,
             reqId,
