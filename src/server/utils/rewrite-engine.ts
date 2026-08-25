@@ -92,34 +92,37 @@ function getCachedSafeRegex(pattern: string, flags: string): RegExp | null {
 // ========== 动作执行 ==========
 
 /** 对单个文本字符串执行替换动作 */
-function applyAction(text: string, action: RewriteAction, matchPattern?: string, matchFlags?: string): string {
+function applyAction(text: string, action: RewriteAction): string {
   switch (action.type) {
-    case "replace":
-    case "replace_all": {
-      const pattern = action.pattern || matchPattern
-      if (!pattern) return text
-
-      /** 判断匹配条件是否为 regex 类型 —— 如果 action.pattern 存在则按 action 自身的模式来 */
-      const effectiveFlags = action.flags ?? matchFlags ?? ""
-      const globalFlag = action.type === "replace_all" ? "g" : ""
-      const re = getCachedSafeRegex(pattern, effectiveFlags + globalFlag)
+    case "regex_replace": {
+      if (!action.pattern) return text
+      const re = getCachedSafeRegex(action.pattern, (action.flags ?? "") + "g")
       if (!re) return text
-
       /** 安全替换：限制替换迭代次数 */
-      if (action.type === "replace_all") {
-        let count = 0
-        return text.replace(re, () => {
-          if (++count > MAX_REPLACE_ITERATIONS) return arguments[0]
-          return action.replacement
-        })
-      }
-      return text.replace(re, action.replacement)
+      let count = 0
+      return text.replace(re, (...args) => {
+        if (++count > MAX_REPLACE_ITERATIONS) return args[0] as string
+        return action.replacement
+      })
+    }
+    case "text_replace": {
+      if (!action.pattern) return text
+      /** 纯文本字面量替换，不走正则 */
+      return text.split(action.pattern).join(action.replacement)
     }
     case "prepend":
       return action.replacement + text
     case "append":
       return text + action.replacement
   }
+}
+
+/** 计算某个动作的作用 scope 集合：动作自身 scope 优先，否则用 match 条件涉及的 scopes，都没有则作用于全部消息 */
+function actionScopes(action: RewriteAction, matchConditions: RewriteMatchCondition[]): Set<RewriteScope> {
+  if (action.scope) return new Set([action.scope])
+  const scopes = new Set<RewriteScope>(matchConditions.map(c => c.scope || "all"))
+  if (scopes.size === 0) scopes.add("all")
+  return scopes
 }
 
 // ========== 匹配条件检查 ==========
@@ -139,9 +142,9 @@ function buildTextByScope(
   return parts.join("\n")
 }
 
-/** 检查匹配条件是否命中 */
+/** 检查匹配条件是否命中：条件为空表示无条件生效 */
 function matchesConditions(conditions: RewriteMatchCondition[], textByScope: Record<RewriteScope, string>): boolean {
-  if (!conditions.length) return false
+  if (!conditions.length) return true
   const operator = conditions[0]?.operator ?? "and"
 
   const results = conditions.map(cond => {
@@ -181,6 +184,16 @@ function roleInScope(role: string, scope: RewriteScope): boolean {
 /** 从 OpenAI 消息中提取按角色分组的文本 */
 function extractOpenAITextByScope(body: OpenAIChatCompletionRequest): Record<RewriteScope, string> {
   const parts: Record<RewriteScope, string[]> = { all: [], system: [], user: [], assistant: [] }
+
+  /** 工具描述属于系统注入内容，计入 system 桶 */
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool.function?.description) {
+        parts.system.push(tool.function.description)
+        parts.all.push(tool.function.description)
+      }
+    }
+  }
 
   for (const msg of body.messages) {
     const text = extractOpenAIMessageText(msg)
@@ -225,23 +238,29 @@ export function rewriteOpenAI(body: OpenAIChatCompletionRequest, rules: RewriteR
     const matchConditions = rule.match ?? []
     if (!matchesConditions(matchConditions, textByScope)) continue
 
-    /** 规则命中，执行替换 */
-    result.matched = true
-    result.matchedRules.push(rule.name)
+    /** 规则命中，按顺序执行动作组；只有内容实际发生变化才计入命中（避免"命中但没改任何东西"的误导） */
+    const beforeText = textByScope.all
+    for (const action of rule.actions) {
+      const targetScopes = actionScopes(action, matchConditions)
+      for (const msg of body.messages) {
+        const role = msg.role as string
+        const shouldProcess = [...targetScopes].some(s => roleInScope(role, s))
+        if (!shouldProcess) continue
 
-    const action = rule.action
-    const matchPattern = matchConditions[0]?.pattern
-    const matchFlags = matchConditions[0]?.flags
-
-    /** 收集规则中所有涉及的 scope，确定要处理哪些消息 */
-    const targetScopes = new Set<RewriteScope>(matchConditions.map(c => c.scope || "all"))
-
-    for (const msg of body.messages) {
-      const role = msg.role as string
-      const shouldProcess = [...targetScopes].some(s => roleInScope(role, s))
-      if (!shouldProcess) continue
-
-      applyActionToContent(msg, action, matchPattern, matchFlags)
+        applyActionToContent(msg, action)
+      }
+      /** 工具描述属于系统注入内容：scope 命中 system/all 时同步改写（如 Claude Code 把指令藏在 Bash 工具描述里） */
+      if ((targetScopes.has("system") || targetScopes.has("all")) && Array.isArray(body.tools)) {
+        for (const tool of body.tools) {
+          if (typeof tool.function?.description === "string") {
+            tool.function.description = applyAction(tool.function.description, action)
+          }
+        }
+      }
+    }
+    if (extractOpenAITextByScope(body).all !== beforeText) {
+      result.matched = true
+      result.matchedRules.push(rule.name)
     }
   }
 
@@ -251,17 +270,14 @@ export function rewriteOpenAI(body: OpenAIChatCompletionRequest, rules: RewriteR
 /** 对单条消息的 content 执行动作 */
 function applyActionToContent(
   msg: OpenAIChatMessage,
-  action: RewriteAction,
-  matchPattern?: string,
-  matchFlags?: string,
-): void {
+  action: RewriteAction,): void {
   const content = msg.content
   if (typeof content === "string") {
-    ;(msg as unknown as Record<string, unknown>).content = applyAction(content, action, matchPattern, matchFlags)
+    ;(msg as unknown as Record<string, unknown>).content = applyAction(content, action)
   } else if (Array.isArray(content)) {
     for (const block of content) {
       if (block.type === "text" && typeof block.text === "string") {
-        block.text = applyAction(block.text, action, matchPattern, matchFlags)
+        block.text = applyAction(block.text, action)
       }
     }
   }
@@ -278,6 +294,16 @@ function extractAnthropicTextByScope(body: AnthropicMessagesRequest): Record<Rew
   if (systemText) {
     parts.system.push(systemText)
     parts.all.push(systemText)
+  }
+
+  /** 工具描述属于系统注入内容，计入 system 桶 */
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool.description) {
+        parts.system.push(tool.description)
+        parts.all.push(tool.description)
+      }
+    }
   }
 
   for (const msg of body.messages) {
@@ -329,43 +355,53 @@ export function rewriteAnthropic(body: AnthropicMessagesRequest, rules: RewriteR
     const matchConditions = rule.match ?? []
     if (!matchesConditions(matchConditions, textByScope)) continue
 
-    result.matched = true
-    result.matchedRules.push(rule.name)
+    /** 只有内容实际发生变化才计入命中（避免"命中但没改任何东西"的误导） */
+    const beforeText = textByScope.all
 
-    const action = rule.action
-    const matchPattern = matchConditions[0]?.pattern
-    const matchFlags = matchConditions[0]?.flags
+    for (const action of rule.actions) {
+      const targetScopes = actionScopes(action, matchConditions)
 
-    const targetScopes = new Set<RewriteScope>(matchConditions.map(c => c.scope || "all"))
+      /** 处理顶层 system 字段 */
+      if (targetScopes.has("system") || targetScopes.has("all")) {
+        if (typeof body.system === "string" && body.system) {
+          body.system = applyAction(body.system, action)
+        } else if (Array.isArray(body.system)) {
+          for (const block of body.system) {
+            if (block.type === "text") {
+              block.text = applyAction(block.text, action)
+            }
+          }
+        }
+        /** 工具描述属于系统注入内容：同步改写（如 Claude Code 把指令藏在 Bash 工具描述里） */
+        if (Array.isArray(body.tools)) {
+          for (const tool of body.tools) {
+            if (typeof tool.description === "string") {
+              tool.description = applyAction(tool.description, action)
+            }
+          }
+        }
+      }
 
-    /** 处理顶层 system 字段 */
-    if (targetScopes.has("system") || targetScopes.has("all")) {
-      if (typeof body.system === "string" && body.system) {
-        body.system = applyAction(body.system, action, matchPattern, matchFlags)
-      } else if (Array.isArray(body.system)) {
-        for (const block of body.system) {
-          if (block.type === "text") {
-            block.text = applyAction(block.text, action, matchPattern, matchFlags)
+      /** 处理 messages */
+      for (const msg of body.messages) {
+        const role = msg.role
+        const shouldProcess = [...targetScopes].some(s => roleInScope(role, s))
+        if (!shouldProcess) continue
+
+        if (typeof msg.content === "string") {
+          msg.content = applyAction(msg.content, action)
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content as AnthropicContentBlock[]) {
+            if (block.type === "text") {
+              block.text = applyAction(block.text, action)
+            }
           }
         }
       }
     }
-
-    /** 处理 messages */
-    for (const msg of body.messages) {
-      const role = msg.role
-      const shouldProcess = [...targetScopes].some(s => roleInScope(role, s))
-      if (!shouldProcess) continue
-
-      if (typeof msg.content === "string") {
-        msg.content = applyAction(msg.content, action, matchPattern, matchFlags)
-      } else if (Array.isArray(msg.content)) {
-        for (const block of msg.content as AnthropicContentBlock[]) {
-          if (block.type === "text") {
-            block.text = applyAction(block.text, action, matchPattern, matchFlags)
-          }
-        }
-      }
+    if (extractAnthropicTextByScope(body).all !== beforeText) {
+      result.matched = true
+      result.matchedRules.push(rule.name)
     }
   }
 
@@ -390,11 +426,9 @@ export function rewriteText(text: string, rules: RewriteRule[], context: Rewrite
 
     result.matched = true
     result.matchedRules.push(rule.name)
-
-    const action = rule.action
-    const matchPattern = matchConditions[0]?.pattern
-    const matchFlags = matchConditions[0]?.flags
-    current = applyAction(current, action, matchPattern, matchFlags)
+    for (const action of rule.actions) {
+      current = applyAction(current, action)
+    }
   }
 
   /** 将最终结果写回 —— 调用方需要自行比较 original vs current */
@@ -403,7 +437,26 @@ export function rewriteText(text: string, rules: RewriteRule[], context: Rewrite
 
 /** 对纯文本执行改写并返回改写后文本（预览 API 专用） */
 export function rewriteTextWithResult(text: string, rules: RewriteRule[], context: RewriteContext): { result: RewriteResult; rewritten: string } {
+  const { result, rewritten } = rewriteTextWithSteps(text, rules, context)
+  return { result, rewritten }
+}
+
+/** 单个动作的改写步骤快照（预览展示用） */
+export interface RewriteStep {
+  /** 命中的规则名 */
+  ruleName: string
+  /** 动作备注名（用户自定义，可选） */
+  actionName?: string
+  /** 该动作执行前的文本 */
+  before: string
+  /** 该动作执行后的文本 */
+  after: string
+}
+
+/** 对纯文本执行改写，逐步记录每个动作的 before/after（预览 API 专用） */
+export function rewriteTextWithSteps(text: string, rules: RewriteRule[], context: RewriteContext): { result: RewriteResult; steps: RewriteStep[]; rewritten: string } {
   const result: RewriteResult = { matched: false, matchedRules: [], errors: [] }
+  const steps: RewriteStep[] = []
   let current = text
 
   for (const rule of rules) {
@@ -417,11 +470,12 @@ export function rewriteTextWithResult(text: string, rules: RewriteRule[], contex
     result.matched = true
     result.matchedRules.push(rule.name)
 
-    const action = rule.action
-    const matchPattern = matchConditions[0]?.pattern
-    const matchFlags = matchConditions[0]?.flags
-    current = applyAction(current, action, matchPattern, matchFlags)
+    for (const action of rule.actions) {
+      const before = current
+      current = applyAction(current, action)
+      steps.push({ ruleName: rule.name, actionName: action.name, before, after: current })
+    }
   }
 
-  return { result, rewritten: current }
+  return { result, steps, rewritten: current }
 }

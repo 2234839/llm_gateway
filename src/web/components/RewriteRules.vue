@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue"
-import { rewriteApi, logApi, type RewriteRuleInfo, type RewritePreviewItem, type LogEntry } from "../api"
+import { ref, computed, watch, onMounted } from "vue"
+import { rewriteApi, logApi, type RewriteRuleInfo, type RewritePreviewItem, type RewritePreviewStep, type LogEntry } from "../api"
 import { t } from "../i18n"
+import { diffWords } from "../utils/diff"
 
 const rules = ref<RewriteRuleInfo[]>([])
 const loading = ref(true)
@@ -13,12 +14,12 @@ const error = ref("")
 const emptyRule: Omit<RewriteRuleInfo, "id" | "createdAt"> = {
   name: "",
   match: [],
-  action: { type: "replace", replacement: "" },
+  actions: [{ type: "regex_replace", replacement: "" }],
   enabled: true,
   priority: 0,
 }
 
-const form = ref({ ...emptyRule, match: [], action: { type: "replace" as const, replacement: "" } })
+const form = ref<Omit<RewriteRuleInfo, "id" | "createdAt">>({ ...emptyRule })
 
 onMounted(load)
 
@@ -39,7 +40,7 @@ function startCreate() {
   form.value = {
     ...emptyRule,
     match: [],
-    action: { type: "replace", replacement: "" },
+    actions: [{ type: "regex_replace", replacement: "" }],
   }
   previewResults.value = []
   showLogSelector.value = false
@@ -51,7 +52,9 @@ function startEdit(rule: RewriteRuleInfo) {
   form.value = {
     name: rule.name,
     match: rule.match ? rule.match.map(c => ({ ...c })) : [],
-    action: rule.action ? { ...rule.action } : { type: "replace", replacement: "" },
+    actions: rule.actions?.length
+      ? rule.actions.map(a => ({ ...a }))
+      : [{ type: "regex_replace" as const, replacement: "" }],
     enabled: rule.enabled,
     priority: rule.priority,
     modelPattern: rule.modelPattern ?? "",
@@ -71,8 +74,7 @@ function cancel() {
 async function save() {
   const data = { ...form.value }
   if (!data.name) { error.value = t('rewrites.errorNameRequired'); return }
-  if (!data.match?.length) { error.value = t('rewrites.errorMatchRequired'); return }
-  if (!data.action) { error.value = t('rewrites.errorActionRequired'); return }
+  if (!data.actions?.length) { error.value = t('rewrites.errorActionRequired'); return }
   if (!data.modelPattern) data.modelPattern = undefined
   if (!data.pathPattern) data.pathPattern = undefined
   error.value = ""
@@ -156,6 +158,16 @@ function syncOperator(event: Event) {
   form.value.match?.forEach(c => c.operator = op)
 }
 
+/** 动作组管理 */
+function addAction() {
+  if (!form.value.actions) form.value.actions = []
+  form.value.actions.push({ type: "regex_replace", replacement: "" })
+}
+
+function removeAction(index: number) {
+  form.value.actions?.splice(index, 1)
+}
+
 /** 日志预览 */
 const showLogSelector = ref(false)
 const recentLogs = ref<LogEntry[]>([])
@@ -179,7 +191,14 @@ function toggleLogSelect(id: number) {
 }
 
 async function executePreview() {
-  const ids = [...selectedLogIds.value]
+  await runPreview([...selectedLogIds.value])
+}
+
+/** 上次预览使用的日志 ID，供响应式刷新复用 */
+let lastPreviewLogIds: number[] = []
+
+/** 执行预览：silent = 表单变化触发的自动刷新（不收起选择器、不报错打断输入） */
+async function runPreview(ids: number[], silent = false) {
   if (!ids.length) return
   previewLoading.value = true
   try {
@@ -188,7 +207,7 @@ async function executePreview() {
       rule: {
         name: form.value.name || "preview",
         match: form.value.match,
-        action: form.value.action,
+        actions: form.value.actions,
         enabled: true,
         priority: 0,
         modelPattern: form.value.modelPattern || undefined,
@@ -197,36 +216,59 @@ async function executePreview() {
       logIds: ids,
     })
     previewResults.value = resp.results
+    lastPreviewLogIds = ids
     showLogSelector.value = false
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : "Preview failed"
+    if (!silent) error.value = e instanceof Error ? e.message : "Preview failed"
   }
   previewLoading.value = false
+}
+
+/** 响应式预览：表单变化后延迟自动刷新预览结果 */
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+watch(form, () => {
+  if (!lastPreviewLogIds.length) return
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = setTimeout(() => { void runPreview(lastPreviewLogIds, true) }, 400)
+}, { deep: true })
+
+/** 预览视图：预计算每个步骤的 diff 片段和增删统计 */
+interface StepView {
+  step: RewritePreviewStep
+  index: number
+  spans: { text: string; type: "same" | "add" | "del" }[]
+  addChars: number
+  delChars: number
+  changed: boolean
+}
+
+const previewViews = computed(() => previewResults.value.map(item => {
+  const stepViews: StepView[] = item.steps.map((step, index) => {
+    const spans = step.before === step.after ? [] : diffWords(step.before, step.after)
+    let addChars = 0, delChars = 0
+    for (const s of spans) {
+      if (s.type === "add") addChars += s.text.trim().length
+      else if (s.type === "del") delChars += s.text.trim().length
+    }
+    return { step, index, spans, addChars, delChars, changed: step.before !== step.after }
+  })
+  return { item, stepViews, changedStepViews: stepViews.filter(s => s.changed) }
+}))
+
+/** 滚动定位到某个改动步骤（Git diff 式快速导航） */
+function jumpToChange(logId: number, stepIndex: number) {
+  document.getElementById(`preview-step-${logId}-${stepIndex}`)?.scrollIntoView({ behavior: "smooth", block: "center" })
 }
 
 /** 动作标签文本 */
 function actionTag(type: string): string {
   const map: Record<string, string> = {
-    replace: t('rewrites.actionTagReplace'),
-    replace_all: t('rewrites.actionTagReplaceAll'),
+    regex_replace: t('rewrites.actionTagRegexReplace'),
+    text_replace: t('rewrites.actionTagTextReplace'),
     prepend: t('rewrites.actionTagPrepend'),
     append: t('rewrites.actionTagAppend'),
   }
   return map[type] ?? type
-}
-
-/** 简单 diff 高亮：找出原文和替换后文本的差异部分 */
-function diffLines(original: string, rewritten: string): { original: string; rewritten: string; changed: boolean }[] {
-  const origLines = original.split("\n")
-  const rewrLines = rewritten.split("\n")
-  const maxLen = Math.max(origLines.length, rewrLines.length)
-  const result: { original: string; rewritten: string; changed: boolean }[] = []
-  for (let i = 0; i < maxLen; i++) {
-    const o = origLines[i] ?? ""
-    const r = rewrLines[i] ?? ""
-    result.push({ original: o, rewritten: r, changed: o !== r })
-  }
-  return result
 }
 
 function formatTime(ts: string): string {
@@ -257,7 +299,7 @@ function formatTime(ts: string): string {
           <tr>
             <th>#</th>
             <th>{{ t('rewrites.ruleName') }}</th>
-            <th>{{ t('rewrites.matchConditionLabel') }}</th>
+            <th>{{ t('rewrites.applyConditionLabel') }}</th>
             <th>{{ t('rewrites.actionLabel') }}</th>
             <th>{{ t('rewrites.actionsCol') }}</th>
           </tr>
@@ -286,11 +328,15 @@ function formatTime(ts: string): string {
               <span v-if="!rule.match?.length" class="muted">-</span>
             </td>
             <td>
-              <span class="action-tag" :class="'action-' + rule.action.type">{{ actionTag(rule.action.type) }}</span>
-              <span v-if="rule.action.type === 'replace' || rule.action.type === 'replace_all'" class="action-detail">
-                "{{ rule.action.pattern || rule.match?.[0]?.pattern || '' }}" → "{{ rule.action.replacement }}"
-              </span>
-              <span v-else class="action-detail">"{{ rule.action.replacement.slice(0, 50) }}{{ rule.action.replacement.length > 50 ? '...' : '' }}"</span>
+              <div v-for="(act, ai) in rule.actions" :key="ai" class="action-line">
+                <span class="action-tag" :class="'action-' + act.type">{{ actionTag(act.type) }}</span>
+                <span v-if="act.name" class="action-name">{{ act.name }}</span>
+                <span v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="action-detail">
+                  "{{ act.pattern || '' }}" → "{{ act.replacement }}"
+                </span>
+                <span v-else class="action-detail">"{{ act.replacement.slice(0, 50) }}{{ act.replacement.length > 50 ? '...' : '' }}"</span>
+              </div>
+              <span v-if="!rule.actions?.length" class="muted">-</span>
             </td>
             <td>
               <div class="actions-cell">
@@ -320,9 +366,10 @@ function formatTime(ts: string): string {
           </label>
         </div>
 
-        <!-- 匹配条件 -->
+        <!-- 生效条件 -->
         <div class="match-section">
-          <div class="section-label">{{ t('rewrites.matchConditionLabel') }}</div>
+          <div class="section-label">{{ t('rewrites.applyConditionLabel') }}</div>
+          <p class="section-hint">{{ t('rewrites.applyConditionHint') }}</p>
 
           <!-- 模型过滤 -->
           <div class="condition-row">
@@ -387,45 +434,72 @@ function formatTime(ts: string): string {
           </div>
         </div>
 
-        <!-- 执行动作 -->
+        <!-- 执行动作组 -->
         <div class="match-section">
           <div class="section-label">{{ t('rewrites.actionLabel') }}</div>
 
-          <div class="condition-row">
-            <label>
-              {{ t('rewrites.actionType') }}
-              <select v-model="form.action.type" class="cond-type">
-                <option value="replace">{{ t('rewrites.actionReplace') }}</option>
-                <option value="replace_all">{{ t('rewrites.actionReplaceAll') }}</option>
-                <option value="prepend">{{ t('rewrites.actionPrepend') }}</option>
-                <option value="append">{{ t('rewrites.actionAppend') }}</option>
-              </select>
-            </label>
+          <div v-for="(act, i) in form.actions" :key="i" class="action-editor">
+            <div class="action-editor-header">
+              <span class="action-index">#{{ i + 1 }}</span>
+              <button v-if="form.actions.length > 1" class="btn-sm btn-danger" type="button" @click="removeAction(i)">&times;</button>
+            </div>
+
+            <div class="condition-row">
+              <label>
+                {{ t('rewrites.actionNameLabel') }}
+                <input v-model="act.name" :placeholder="t('rewrites.actionNamePlaceholder')" class="cond-pattern" />
+              </label>
+            </div>
+
+            <div class="condition-row">
+              <label>
+                {{ t('rewrites.actionType') }}
+                <select v-model="act.type" class="cond-type">
+                  <option value="regex_replace">{{ t('rewrites.actionRegexReplace') }}</option>
+                  <option value="text_replace">{{ t('rewrites.actionTextReplace') }}</option>
+                  <option value="prepend">{{ t('rewrites.actionPrepend') }}</option>
+                  <option value="append">{{ t('rewrites.actionAppend') }}</option>
+                </select>
+              </label>
+              <label>
+                {{ t('rewrites.actionScope') }}
+                <select v-model="act.scope" class="cond-scope">
+                  <option :value="undefined">{{ t('rewrites.actionScopeFollow') }}</option>
+                  <option value="all">{{ t('rewrites.scopeAll') }}</option>
+                  <option value="system">{{ t('rewrites.scopeSystem') }}</option>
+                  <option value="user">{{ t('rewrites.scopeUser') }}</option>
+                  <option value="assistant">{{ t('rewrites.scopeAssistant') }}</option>
+                </select>
+              </label>
+            </div>
+
+            <!-- 替换类动作的查找内容 -->
+            <div v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="condition-row" style="align-items: flex-start">
+              <label style="flex: 1">
+                {{ act.type === 'text_replace' ? t('rewrites.actionFindText') : t('rewrites.actionFindRegex') }}
+                <textarea v-model="act.pattern" :placeholder="act.type === 'text_replace' ? t('rewrites.actionFindTextPlaceholder') : t('rewrites.actionFindRegexPlaceholder')" class="find-textarea" rows="2"></textarea>
+              </label>
+            </div>
+
+            <!-- 正则 flags -->
+            <div v-if="act.type === 'regex_replace' && act.pattern" class="condition-row">
+              <label>
+                {{ t('rewrites.actionFlags') }}
+                <input v-model="act.flags" :placeholder="t('rewrites.actionFlagsPlaceholder')" class="cond-flags" />
+              </label>
+            </div>
+
+            <!-- 替换/注入内容 -->
+            <div class="condition-row" style="align-items: flex-start">
+              <label style="flex: 1">
+                {{ t('rewrites.replacement') }}
+                <textarea v-model="act.replacement" :placeholder="t('rewrites.replacementPlaceholder')" class="replacement-textarea" rows="3"></textarea>
+              </label>
+            </div>
+            <p v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="action-hint">{{ t('rewrites.emptyReplacementHint') }}</p>
           </div>
 
-          <!-- 替换类动作的匹配模式 -->
-          <div v-if="form.action.type === 'replace' || form.action.type === 'replace_all'" class="condition-row">
-            <label>
-              {{ t('rewrites.actionPattern') }}
-              <input v-model="form.action.pattern" :placeholder="t('rewrites.actionPatternPlaceholder')" class="cond-pattern" />
-            </label>
-          </div>
-
-          <!-- 正则 flags -->
-          <div v-if="(form.action.type === 'replace' || form.action.type === 'replace_all') && form.action.pattern" class="condition-row">
-            <label>
-              {{ t('rewrites.actionFlags') }}
-              <input v-model="form.action.flags" :placeholder="t('rewrites.actionFlagsPlaceholder')" class="cond-flags" />
-            </label>
-          </div>
-
-          <!-- 替换/注入内容 -->
-          <div class="condition-row" style="align-items: flex-start">
-            <label style="flex: 1">
-              {{ t('rewrites.replacement') }}
-              <textarea v-model="form.action.replacement" :placeholder="t('rewrites.replacementPlaceholder')" class="replacement-textarea" rows="3"></textarea>
-            </label>
-          </div>
+          <button class="btn-sm" type="button" @click="addAction" style="margin-left: 24px">{{ t('rewrites.addAction') }}</button>
         </div>
 
         <!-- 预览区 -->
@@ -461,29 +535,52 @@ function formatTime(ts: string): string {
 
           <!-- 预览结果 -->
           <div v-if="previewResults.length" class="preview-results">
-            <div v-for="item in previewResults" :key="item.logId" class="preview-item">
+            <div v-for="pv in previewViews" :key="pv.item.logId" class="preview-item">
               <div class="preview-header">
-                <span class="preview-model">{{ item.model }}</span>
-                <span class="preview-path">{{ item.path }}</span>
-                <span :class="['preview-badge', item.matched ? 'matched' : 'not-matched']">
-                  {{ item.matched ? t('rewrites.matched') : t('rewrites.notMatched') }}
+                <span class="preview-model">{{ pv.item.model }}</span>
+                <span class="preview-path">{{ pv.item.path }}</span>
+                <span v-if="previewLoading" class="preview-refreshing">...</span>
+                <span :class="['preview-badge', pv.item.matched ? 'matched' : 'not-matched']">
+                  {{ pv.item.matched ? t('rewrites.matched') : t('rewrites.notMatched') }}
                 </span>
               </div>
-              <div v-if="item.matched && item.matchedRules.length" class="preview-matched-rules">
-                {{ item.matchedRules.join(", ") }}
+              <div v-if="pv.item.matched && pv.item.matchedRules.length" class="preview-matched-rules">
+                {{ pv.item.matchedRules.join(", ") }}
               </div>
-              <div v-if="item.original && item.rewritten" class="preview-diff">
-                <div v-for="(line, li) in diffLines(item.original, item.rewritten)" :key="li" class="diff-line" :class="{ changed: line.changed }">
-                  <template v-if="line.changed">
-                    <div class="diff-orig"><span class="diff-marker">-</span>{{ line.original }}</div>
-                    <div class="diff-new"><span class="diff-marker">+</span>{{ line.rewritten }}</div>
+
+              <!-- 改动快速导航：点击跳到对应 diff 区块 -->
+              <div v-if="pv.changedStepViews.length" class="step-nav">
+                <button
+                  v-for="csv in pv.changedStepViews"
+                  :key="csv.index"
+                  class="step-nav-chip"
+                  :title="csv.step.actionName || csv.step.ruleName"
+                  @click="jumpToChange(pv.item.logId, csv.index)"
+                >
+                  #{{ csv.index + 1 }}{{ csv.step.actionName ? ` ${csv.step.actionName}` : ` ${csv.step.ruleName}` }}
+                  <span class="chip-add">+{{ csv.addChars }}</span>
+                  <span class="chip-del">-{{ csv.delChars }}</span>
+                </button>
+              </div>
+
+              <!-- 按动作逐步展示 diff -->
+              <div v-for="sv in pv.stepViews" :id="`preview-step-${pv.item.logId}-${sv.index}`" :key="sv.index" class="step-block" :class="{ changed: sv.changed }">
+                <div class="step-header">
+                  <span class="step-rule-name">#{{ sv.index + 1 }} {{ sv.step.ruleName }}</span>
+                  <span v-if="sv.step.actionName" class="step-action-name">{{ sv.step.actionName }}</span>
+                  <template v-if="sv.changed">
+                    <span class="chip-add">+{{ sv.addChars }}</span>
+                    <span class="chip-del">-{{ sv.delChars }}</span>
                   </template>
-                  <template v-else>
-                    <span class="diff-unchanged">{{ line.original }}</span>
-                  </template>
+                  <span v-else class="step-no-change">{{ t('rewrites.stepNoChange') }}</span>
+                </div>
+                <div v-if="sv.changed" class="step-diff">
+                  <span v-for="(span, spi) in sv.spans" :key="spi" :class="'dw-' + span.type">{{ span.text }}</span>
                 </div>
               </div>
-              <div v-else-if="!item.original" class="preview-no-content">{{ t('rewrites.noContent') }}</div>
+
+              <div v-if="!pv.item.matched && pv.item.original" class="preview-no-content">{{ t('rewrites.notMatched') }}</div>
+              <div v-else-if="!pv.item.original" class="preview-no-content">{{ t('rewrites.noContent') }}</div>
             </div>
           </div>
         </div>
@@ -770,8 +867,8 @@ tr.disabled {
   font-weight: 600;
 }
 
-.action-tag.action-replace { background: var(--tag-blue-bg); color: var(--tag-blue); }
-.action-tag.action-replace_all { background: var(--tag-blue-bg); color: var(--tag-blue); }
+.action-tag.action-regex_replace { background: var(--tag-blue-bg); color: var(--tag-blue); }
+.action-tag.action-text_replace { background: var(--tag-blue-bg); color: var(--tag-blue); }
 .action-tag.action-prepend { background: var(--tag-green-bg); color: var(--tag-green); }
 .action-tag.action-append { background: var(--tag-purple-bg); color: var(--tag-purple); }
 
@@ -784,6 +881,36 @@ tr.disabled {
   white-space: nowrap;
   display: inline-block;
   vertical-align: middle;
+}
+
+/** 规则列表中的动作行 */
+.action-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 2px;
+}
+
+/** 动作组编辑器 */
+.action-editor {
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.action-editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.action-index {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
 }
 
 /** 替换内容输入框 */
@@ -987,6 +1114,156 @@ tr.disabled {
 
 .diff-unchanged {
   color: var(--text-dim);
+}
+
+/** 按规则分步的 diff 展示 */
+.step-block {
+  border-top: 1px solid var(--border);
+}
+
+.step-block.changed {
+  border-left: 3px solid var(--primary);
+}
+
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--surface);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.step-rule-name {
+  font-weight: 600;
+  color: var(--primary);
+}
+
+.step-action-name {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--surface2);
+  padding: 1px 8px;
+  border-radius: 4px;
+}
+
+.step-no-change {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/** 改动快速导航 */
+.step-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.step-nav-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+
+.step-nav-chip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.chip-add {
+  color: var(--tag-green);
+  font-weight: 600;
+  font-size: 10px;
+}
+
+.chip-del {
+  color: var(--tag-red);
+  font-weight: 600;
+  font-size: 10px;
+}
+
+.preview-refreshing {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/** 查找内容输入框（textarea 版） */
+.find-textarea {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: monospace;
+  resize: vertical;
+  transition: border-color 0.15s;
+}
+
+.find-textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.action-hint {
+  margin: -2px 0 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+
+.action-name {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.step-diff {
+  padding: 8px 12px;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.step-diff .dw-same {
+  color: var(--text-dim);
+}
+
+.step-diff .dw-del {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--tag-red);
+  text-decoration: line-through;
+  border-radius: 2px;
+}
+
+.step-diff .dw-add {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--tag-green);
+  border-radius: 2px;
+  font-weight: 600;
 }
 
 .preview-no-content {

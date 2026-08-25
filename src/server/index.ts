@@ -212,6 +212,8 @@ async function main() {
       const indexPath = embeddedAssets["/"]
       if (indexPath) {
         const content = await Bun.file(indexPath).bytes()
+        /** SPA 入口必须禁止缓存，否则浏览器缓存旧 index.html 会一直加载旧 hash 的 JS，新版本永远不生效 */
+        reply.header("Cache-Control", "no-cache")
         return reply.type("text/html").send(content)
       }
       return reply.status(404).send({ error: "Not found" })
@@ -228,6 +230,7 @@ async function main() {
       })
 
       fastify.setNotFoundHandler(async (_request, reply) => {
+        reply.header("Cache-Control", "no-cache")
         return reply.status(200).send(await Bun.file(`${staticDir}/index.html`).text())
       })
     }

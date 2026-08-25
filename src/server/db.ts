@@ -1,7 +1,8 @@
 import { Database, Statement } from "bun:sqlite"
+import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, ConditionNode, ConditionLeaf, ConditionGroup } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, ConditionNode, ConditionLeaf, ConditionGroup } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -210,6 +211,12 @@ export class GatewayDB {
     } catch {
       // 列已存在
     }
+    try {
+      this.db.run("ALTER TABLE request_logs ADD COLUMN matched_rewrite_rules TEXT DEFAULT NULL")
+      this.db.run("ALTER TABLE request_logs ADD COLUMN rewrite_diffs TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
 
     /** API Key 分组表 */
     this.db.run(`
@@ -316,6 +323,30 @@ export class GatewayDB {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `)
+
+    /** 消息内容块（内容寻址存储：同内容只存一份，hit_count 记录被多少条日志引用） */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS messages (
+        hash TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        size INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT
+      )
+    `)
+
+    /** 日志 ↔ 消息块关联（保序） */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS log_messages (
+        log_id INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        PRIMARY KEY (log_id, seq)
+      )
+    `)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_messages_hash ON log_messages(hash)`)
   }
 
   private prepareStatements() {
@@ -575,7 +606,7 @@ export class GatewayDB {
   addRewriteRule(rule: RewriteRule) {
     this.stmt(
       "INSERT INTO rewrite_rules (id, name, match_conditions, action, enabled, priority, model_pattern, path_pattern) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, rule.name, JSON.stringify(rule.match ?? []), JSON.stringify(rule.action ?? {}), rule.enabled !== false ? 1 : 0, rule.priority, rule.modelPattern ?? null, rule.pathPattern ?? null)
+    ).run(rule.id, rule.name, JSON.stringify(rule.match ?? []), JSON.stringify(rule.actions ?? []), rule.enabled !== false ? 1 : 0, rule.priority, rule.modelPattern ?? null, rule.pathPattern ?? null)
   }
 
   updateRewriteRule(id: string, rule: Partial<RewriteRule>): boolean {
@@ -585,7 +616,7 @@ export class GatewayDB {
       const updated = { ...existing, ...rule, id }
       this.stmt(
         "UPDATE rewrite_rules SET name=?, match_conditions=?, action=?, enabled=?, priority=?, model_pattern=?, path_pattern=? WHERE id=?"
-      ).run(updated.name, JSON.stringify(updated.match ?? []), JSON.stringify(updated.action ?? {}), updated.enabled !== false ? 1 : 0, updated.priority, updated.modelPattern ?? null, updated.pathPattern ?? null, id)
+      ).run(updated.name, JSON.stringify(updated.match ?? []), JSON.stringify(updated.actions ?? []), updated.enabled !== false ? 1 : 0, updated.priority, updated.modelPattern ?? null, updated.pathPattern ?? null, id)
       return true
     })
   }
@@ -595,11 +626,40 @@ export class GatewayDB {
   }
 
   private rowToRewriteRule(row: Record<string, unknown>): RewriteRule {
+    /** action 列存动作组 JSON 数组；兼容旧版单动作对象格式，并归一化旧动作类型 */
+    const parsedAction: unknown = JSON.parse((row.action as string) || "[]")
+    const rawActions: Record<string, unknown>[] = Array.isArray(parsedAction) ? parsedAction : [parsedAction]
+    const matchConditions: RewriteMatchCondition[] = JSON.parse((row.match_conditions as string) || "[]")
+    const actions = rawActions
+      .filter(a => !!a && typeof a === "object")
+      .map((a): RewriteAction => {
+        /** type 来自反序列化的 JSON，先按 unknown 收窄（旧版可能是 replace/replace_all） */
+        const rawType: unknown = a.type
+        const type = (typeof rawType === "string" ? rawType : "") as RewriteAction["type"] | "replace" | "replace_all"
+        const pattern = typeof a.pattern === "string" ? a.pattern : undefined
+        const flags = typeof a.flags === "string" ? a.flags : undefined
+        /** 旧版 replace/replace_all 归一化为 regex_replace；无 pattern 时物化匹配条件的 pattern */
+        const normalizedType: RewriteAction["type"] = type === "replace" || type === "replace_all" ? "regex_replace" : type
+        if (normalizedType === "regex_replace" && !pattern && matchConditions[0]?.pattern) {
+          return {
+            type: normalizedType,
+            replacement: typeof a.replacement === "string" ? a.replacement : "",
+            pattern: matchConditions[0].pattern,
+            flags: flags ?? matchConditions[0].flags,
+          }
+        }
+        return {
+          type: normalizedType,
+          replacement: typeof a.replacement === "string" ? a.replacement : "",
+          ...(pattern !== undefined ? { pattern } : {}),
+          ...(flags !== undefined ? { flags } : {}),
+        }
+      })
     return {
       id: row.id as string,
       name: row.name as string,
-      match: JSON.parse((row.match_conditions as string) || "[]"),
-      action: JSON.parse((row.action as string) || "{}"),
+      match: matchConditions,
+      actions,
       enabled: row.enabled !== 0,
       priority: row.priority as number,
       modelPattern: (row.model_pattern as string) || undefined,
@@ -616,37 +676,48 @@ export class GatewayDB {
   addLog(log: Omit<RequestLogEntry, "id" | "timestamp">) {
     /** DB 已关闭（优雅关机期间流式请求可能仍在写入日志） */
     if (this.closed) return
-    /** 裁剪过长的日志内容，避免单条记录过大 */
-    const MAX_CONTENT_LEN = 50000
-    const inputContent = log.inputContent && log.inputContent.length > MAX_CONTENT_LEN
-      ? log.inputContent.slice(0, MAX_CONTENT_LEN) + `...[truncated ${log.inputContent.length - MAX_CONTENT_LEN} chars]`
-      : log.inputContent ?? null
-    const outputContent = log.outputContent && log.outputContent.length > MAX_CONTENT_LEN
-      ? log.outputContent.slice(0, MAX_CONTENT_LEN) + `...[truncated ${log.outputContent.length - MAX_CONTENT_LEN} chars]`
-      : log.outputContent ?? null
+    /** 完整保留内容，数据量由 pruneLogContent / pruneOldLogs 按保留策略清理 */
+    const inputContent = log.inputContent ?? null
+    const outputContent = log.outputContent ?? null
+    const messages = log.inputMessagesForWrite ?? []
 
-    this.stmt(
-      "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id, fallback_attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(
-      log.method,
-      log.path,
-      log.model,
-      log.providerId,
-      log.targetModel,
-      log.stream ? 1 : 0,
-      log.statusCode,
-      log.durationMs,
-      log.inputTokens,
-      log.outputTokens,
-      log.cacheCreationTokens,
-      log.cacheReadTokens,
-      log.error,
-      inputContent,
-      outputContent,
-      log.apiKeyId ?? null,
-      log.groupId ?? null,
-      log.fallbackAttempts ?? null,
-    )
+    this.tx(() => {
+      const result = this.stmt(
+        "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id, fallback_attempts, matched_rewrite_rules, rewrite_diffs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(
+        log.method,
+        log.path,
+        log.model,
+        log.providerId,
+        log.targetModel,
+        log.stream ? 1 : 0,
+        log.statusCode,
+        log.durationMs,
+        log.inputTokens,
+        log.outputTokens,
+        log.cacheCreationTokens,
+        log.cacheReadTokens,
+        log.error,
+        inputContent,
+        outputContent,
+        log.apiKeyId ?? null,
+        log.groupId ?? null,
+        log.fallbackAttempts ?? null,
+        log.matchedRewriteRules ?? null,
+        log.rewriteDiffs ?? null,
+      )
+      const logId = Number(result.lastInsertRowid)
+
+      /** 消息级内容寻址存储：同 role+内容 只存一份，hit_count 记该块被引用的总出现次数（与 prune 的 COUNT(*) 递减对称） */
+      for (const [seq, msg] of messages.entries()) {
+        const hash = createHash("sha256").update(`${msg.role}${msg.content}`).digest("hex")
+        this.stmt(`
+          INSERT INTO messages (hash, role, content, hit_count, size, last_used_at) VALUES (?, ?, ?, 1, ?, datetime('now'))
+          ON CONFLICT(hash) DO UPDATE SET hit_count = hit_count + 1, last_used_at = datetime('now')
+        `).run(hash, msg.role, msg.content, msg.content.length)
+        this.stmt("INSERT INTO log_messages (log_id, seq, hash) VALUES (?, ?, ?)").run(logId, seq, hash)
+      }
+    })
   }
 
   /** 清理超出保留数量的旧日志 content 字段 */
@@ -660,22 +731,43 @@ export class GatewayDB {
     })
   }
 
-  /** 删除超量旧日志行，保留最近 maxLogRows 条 */
+  /** 删除超量旧日志行，保留最近 maxLogRows 条；同时维护消息块引用计数并清理无引用块 */
   private pruneOldLogs() {
     const maxRows = Math.max(1000, this.getConfig().maxLogRows ?? 100000)
     this.tx(() => {
       const row = this.stmt("SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET ?").get(maxRows - 1) as { id: number } | undefined
       if (row) {
+        /** 待删日志中各消息块的引用数 */
+        const refs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_messages WHERE log_id <= ? GROUP BY hash").all(row.id) as { hash: string; n: number }[]
+        for (const ref of refs) {
+          this.stmt("UPDATE messages SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
+        }
+        this.stmt("DELETE FROM log_messages WHERE log_id <= ?").run(row.id)
+        this.stmt("DELETE FROM messages WHERE hit_count <= 0").run()
         this.stmt("DELETE FROM request_logs WHERE id <= ?").run(row.id)
       }
     })
+  }
+
+  /** 高频消息块统计（按引用数或累计字节量排序） */
+  getTopMessages(limit = 20, by: "refs" | "bytes" = "bytes"): (LogMessage & { size: number; lastUsedAt: string | null })[] {
+    const orderBy = by === "refs" ? "hit_count DESC" : "hit_count * size DESC"
+    const rows = this.stmt(`SELECT hash, role, content, hit_count, size, last_used_at FROM messages WHERE hit_count > 0 ORDER BY ${orderBy} LIMIT ?`).all(limit) as Record<string, unknown>[]
+    return rows.map(r => ({
+      hash: r.hash as string,
+      role: r.role as string,
+      content: r.content as string,
+      hitCount: r.hit_count as number,
+      size: r.size as number,
+      lastUsedAt: (r.last_used_at as string) ?? null,
+    }))
   }
 
   getLogs(options: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: boolean } = {}): RequestLogEntry[] {
     const { limit = 100, offset = 0, model, providerId, apiKeyId, groupId, status, sort, startTime, endTime, hasFallback } = options
 
     /** 列表查询排除大字段 input_content/output_content，按需通过 getLogDetail 加载 */
-    let sql = "SELECT id, timestamp, method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, api_key_id, group_id, fallback_attempts FROM request_logs WHERE 1=1"
+    let sql = "SELECT id, timestamp, method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, api_key_id, group_id, fallback_attempts, matched_rewrite_rules FROM request_logs WHERE 1=1"
     const params: (string | number)[] = []
 
     if (model) {
@@ -728,10 +820,28 @@ export class GatewayDB {
     return (rows as Record<string, unknown>[]).map(this.rowToLog)
   }
 
-  /** 获取单条日志详情（包含 input_content/output_content） */
+  /** 获取单条日志详情（包含 input_content/output_content；消息块存储的日志重组出结构化消息数组） */
   getLogDetail(id: number): RequestLogEntry | null {
     const row = this.stmt("SELECT * FROM request_logs WHERE id = ?").get(id) as Record<string, unknown> | undefined
-    return row ? this.rowToLog(row) : null
+    if (!row) return null
+    const entry = this.rowToLog(row)
+
+    const msgRows = this.stmt(`
+      SELECT m.hash, m.role, m.content, m.hit_count
+      FROM log_messages lm JOIN messages m ON m.hash = lm.hash
+      WHERE lm.log_id = ? ORDER BY lm.seq
+    `).all(id) as Record<string, unknown>[]
+    if (msgRows.length) {
+      entry.inputMessages = msgRows.map(r => ({
+        hash: r.hash as string,
+        role: r.role as string,
+        content: r.content as string,
+        hitCount: r.hit_count as number,
+      }))
+      /** 兼容旧读取方：无原始 input_content 时拼接重组 */
+      if (!entry.inputContent) entry.inputContent = entry.inputMessages.map(m => m.content).join("\n")
+    }
+    return entry
   }
 
   getLogStats(filters?: { apiKeyId?: string; groupId?: string; skipTotal?: boolean }): { total: number; today: number; todayErrors: number; todayAvgMs: number; todayP50Ms: number; todayP95Ms: number; todayP99Ms: number } {
@@ -818,6 +928,8 @@ export class GatewayDB {
       apiKeyId: (row.api_key_id as string) || null,
       groupId: (row.group_id as string) || null,
       fallbackAttempts: (row.fallback_attempts as string) || null,
+      matchedRewriteRules: (row.matched_rewrite_rules as string) || null,
+      rewriteDiffs: (row.rewrite_diffs as string) || null,
     }
   }
 

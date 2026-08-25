@@ -498,8 +498,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     fastify.post<{ Body: Omit<import("../types").RewriteRule, "id" | "createdAt"> }>("/admin/rewrite-rules", async (request, reply) => {
       const body = request.body
       if (!body.name) return reply.status(400).send({ error: "name is required" })
-      if (!body.match?.length) return reply.status(400).send({ error: "match conditions are required" })
-      if (!body.action) return reply.status(400).send({ error: "action is required" })
+      if (!body.actions?.length) return reply.status(400).send({ error: "actions are required" })
       const { v4: uuid } = await import("uuid")
       const rule: import("../types").RewriteRule = { ...body, id: uuid(), enabled: body.enabled !== false, priority: body.priority ?? 0, createdAt: new Date().toISOString() }
       fastify.db.addRewriteRule(rule)
@@ -549,21 +548,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
         if (!r) return reply.status(404).send({ error: "Rewrite rule not found" })
         rules = [r]
       } else if (tempRule) {
-        rules = [{ id: "preview", name: tempRule.name ?? "preview", match: tempRule.match ?? [], action: tempRule.action ?? { type: "replace", replacement: "" }, enabled: true, priority: 0, createdAt: "", modelPattern: tempRule.modelPattern, pathPattern: tempRule.pathPattern }]
+        rules = [{ id: "preview", name: tempRule.name ?? "preview", match: tempRule.match ?? [], actions: tempRule.actions ?? [], enabled: true, priority: 0, createdAt: "", modelPattern: tempRule.modelPattern, pathPattern: tempRule.pathPattern }]
       } else {
         return reply.status(400).send({ error: "ruleId or rule is required" })
       }
 
-      const { rewriteTextWithResult } = await import("../utils/rewrite-engine")
+      const { rewriteTextWithSteps } = await import("../utils/rewrite-engine")
       const results = []
       for (const logId of logIds) {
         const log = fastify.db.getLogDetail(logId)
         if (!log || !log.inputContent) {
-          results.push({ logId, model: log?.model ?? "", path: log?.path ?? "", original: null, rewritten: null, matched: false, matchedRules: [] })
+          results.push({ logId, model: log?.model ?? "", path: log?.path ?? "", original: null, rewritten: null, matched: false, matchedRules: [], steps: [] })
           continue
         }
-        const { result: rr, rewritten } = rewriteTextWithResult(log.inputContent, rules, { path: log.path, model: log.model })
-        results.push({ logId, model: log.model, path: log.path, original: log.inputContent, rewritten, matched: rr.matched, matchedRules: rr.matchedRules })
+        const { result: rr, steps, rewritten } = rewriteTextWithSteps(log.inputContent, rules, { path: log.path, model: log.model })
+        results.push({ logId, model: log.model, path: log.path, original: log.inputContent, rewritten, matched: rr.matched, matchedRules: rr.matchedRules, steps })
       }
       return { results }
     })
@@ -728,6 +727,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.get<{ Querystring: { apiKeyId?: string; groupId?: string } }>("/admin/stats", async (request) => {
     const { apiKeyId, groupId } = request.query
     return fastify.db.getLogStats({ apiKeyId, groupId })
+  })
+
+  /** 高频消息块统计（按引用数或累计字节量排序） */
+  fastify.get<{ Querystring: { limit?: string; by?: string } }>("/admin/messages/top", async (request) => {
+    const limit = Math.max(1, Math.min(100, parseInt(request.query.limit ?? "20", 10) || 20))
+    const by = request.query.by === "refs" ? "refs" : "bytes"
+    return fastify.db.getTopMessages(limit, by)
   })
 
   // ========== Token 统计 ==========

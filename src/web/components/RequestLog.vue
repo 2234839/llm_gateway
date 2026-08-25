@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, onActivated, onDeactivated } from "vue"
-import { logApi, providerApi, apiKeyApi, keyGroupApi, type LogEntry, type ProviderInfo, type ApiKeyInfo, type KeyGroupInfo } from "../api"
+import { logApi, providerApi, apiKeyApi, keyGroupApi, type LogEntry, type LogMessageInfo, type TopMessageInfo, type ProviderInfo, type ApiKeyInfo, type KeyGroupInfo } from "../api"
 import { t } from "../i18n"
 import { formatDuration, formatNumber } from "../format"
+import { diffWords, type DiffSpan } from "../utils/diff"
 import { subscribeSSE } from "../sse-manager"
 
 const logs = ref<LogEntry[]>([])
@@ -227,7 +228,7 @@ function statusClass(code: number): string {
 
 /** 按需加载的 content 缓存：logId -> { inputContent, outputContent }，最多保留 30 条 */
 const MAX_CONTENT_CACHE = 30
-const contentCache = new Map<number, { inputContent: string | null; outputContent: string | null }>()
+const contentCache = new Map<number, { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null }>()
 /** 正在加载的 log id 集合 */
 const loadingContent = ref<Set<number>>(new Set())
 
@@ -242,11 +243,15 @@ async function toggleExpand(id: number) {
     loadingContent.value = new Set([...loadingContent.value, id])
     try {
       const detail = await logApi.detail(id)
-      contentCache.set(id, { inputContent: detail.inputContent, outputContent: detail.outputContent })
+      contentCache.set(id, { inputContent: detail.inputContent, outputContent: detail.outputContent, inputMessages: detail.inputMessages, rewriteDiffs: detail.rewriteDiffs })
+      messageViewCache.delete(id)
       /** 淘汰最旧的缓存条目 */
       if (contentCache.size > MAX_CONTENT_CACHE) {
         const firstKey = contentCache.keys().next().value
-        if (firstKey !== undefined) contentCache.delete(firstKey)
+        if (firstKey !== undefined) {
+          contentCache.delete(firstKey)
+          messageViewCache.delete(firstKey)
+        }
       }
     } catch { /* 加载失败，静默处理 */ }
     loadingContent.value = new Set([...loadingContent.value].filter(i => i !== id))
@@ -254,8 +259,64 @@ async function toggleExpand(id: number) {
 }
 
 /** 获取缓存的 content */
-function getContent(id: number): { inputContent: string | null; outputContent: string | null } {
+function getContent(id: number): { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null } {
   return contentCache.get(id) ?? { inputContent: null, outputContent: null }
+}
+
+/** 高频消息面板 */
+const showTopMessages = ref(false)
+const topMessages = ref<TopMessageInfo[]>([])
+const topMessagesLoading = ref(false)
+const topMessagesBy = ref<"bytes" | "refs">("bytes")
+
+async function loadTopMessages() {
+  topMessagesLoading.value = true
+  try {
+    topMessages.value = await logApi.topMessages(20, topMessagesBy.value)
+  } catch { /* silent */ }
+  topMessagesLoading.value = false
+}
+
+function toggleTopMessages() {
+  showTopMessages.value = !showTopMessages.value
+  if (showTopMessages.value && !topMessages.value.length) void loadTopMessages()
+}
+
+function switchTopMessagesBy(by: "bytes" | "refs") {
+  if (topMessagesBy.value === by) return
+  topMessagesBy.value = by
+  void loadTopMessages()
+}
+
+/** 收起的输入消息序号集合：log id → 消息序号集合（默认展开，点 header 收起） */
+const collapsedMessages = ref<Map<number, Set<number>>>(new Map())
+
+function toggleMessage(logId: number, seq: number) {
+  const set = collapsedMessages.value.get(logId) ?? new Set<number>()
+  if (set.has(seq)) set.delete(seq)
+  else set.add(seq)
+  collapsedMessages.value.set(logId, set)
+  collapsedMessages.value = new Map(collapsedMessages.value)
+}
+
+function isMessageExpanded(logId: number, seq: number): boolean {
+  return !collapsedMessages.value.get(logId)?.has(seq)
+}
+
+/** 消息角色标签颜色 */
+function roleClass(role: string): string {
+  if (role === "system") return "role-system"
+  if (role === "user") return "role-user"
+  if (role === "assistant") return "role-assistant"
+  if (role.startsWith("tool:")) return "role-other"
+  return "role-other"
+}
+
+/** 人性化字节大小 */
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
 }
 
 /** 尝试 JSON pretty-print，失败则原样返回（超过 100KB 跳过解析避免卡顿） */
@@ -282,6 +343,91 @@ function formatFallbackAttempts(raw: string | null): string {
   } catch {
     return raw
   }
+}
+
+/** 解析命中的内容改写规则名列表 */
+function parseMatchedRewrites(raw: string | null): string[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter(n => typeof n === "string") : []
+  } catch {
+    return []
+  }
+}
+
+/** 单条消息的改写差异（改写前/后快照，带快照序号） */
+interface RewriteDiffInfo {
+  idx: number
+  role: string
+  before: string
+  after: string
+}
+
+/** 解析日志中存储的消息级改写差异 */
+function parseRewriteDiffs(raw: string | null): RewriteDiffInfo[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((d): d is RewriteDiffInfo =>
+      typeof d === "object" && d !== null && typeof (d as RewriteDiffInfo).before === "string" && typeof (d as RewriteDiffInfo).after === "string" && typeof (d as RewriteDiffInfo).idx === "number")
+  } catch {
+    return []
+  }
+}
+
+/** 展开了工具声明组的日志 id 集合（默认收起） */
+const expandedTools = ref<Set<number>>(new Set())
+
+/** 切换某条日志的工具声明组展开状态 */
+function toggleTools(logId: number) {
+  const next = new Set(expandedTools.value)
+  if (next.has(logId)) next.delete(logId)
+  else next.add(logId)
+  expandedTools.value = next
+}
+
+/** 消息视图缓存：按日志 id 缓存一次性的分组与 diff 解析结果，避免模板每张卡片重复计算（大日志会卡死页面） */
+interface MessageView {
+  /** 工具声明条目（带原始序号） */
+  tools: { msg: LogMessageInfo; idx: number }[]
+  /** 对话消息条目（带原始序号） */
+  msgs: { msg: LogMessageInfo; idx: number }[]
+  /** 序号 → 改写差异 */
+  diffMap: Map<number, RewriteDiffInfo>
+  /** 序号 → 词级 diff 片段（懒计算，展开时才算且只算一次） */
+  spansMap: Map<number, DiffSpan[]>
+}
+const messageViewCache = new Map<number, MessageView>()
+
+/** 获取（或构建）某条日志的消息视图：工具/消息分组 + diff 解析只做一次 */
+function messageView(logId: number): MessageView {
+  const cached = messageViewCache.get(logId)
+  if (cached) return cached
+  const source = contentCache.get(logId)?.inputMessages ?? []
+  const view: MessageView = {
+    tools: [],
+    msgs: [],
+    diffMap: new Map(parseRewriteDiffs(contentCache.get(logId)?.rewriteDiffs ?? null).map(d => [d.idx, d])),
+    spansMap: new Map(),
+  }
+  source.forEach((msg, idx) => {
+    if (msg.role.startsWith("tool:")) view.tools.push({ msg, idx })
+    else view.msgs.push({ msg, idx })
+  })
+  messageViewCache.set(logId, view)
+  return view
+}
+
+/** 计算并缓存某条日志中指定序号消息的词级 diff 片段（Git diff 式高亮，只算一次） */
+function diffSpans(logId: number, idx: number, d: RewriteDiffInfo): DiffSpan[] {
+  const view = messageView(logId)
+  const cached = view.spansMap.get(idx)
+  if (cached) return cached
+  const spans = d.before === d.after ? [] : diffWords(d.before, d.after)
+  view.spansMap.set(idx, spans)
+  return spans
 }
 
 /** 复制文本到剪贴板，成功后显示 toast 提示 */
@@ -312,11 +458,37 @@ async function copyContent(text: string) {
     <div v-if="copyToast" class="copy-toast">{{ copyToast }}</div>
     <div class="toolbar">
       <h2>{{ t('log.title') }}</h2>
+      <button class="btn" @click="toggleTopMessages">{{ t('log.topMessages') }}</button>
       <button class="btn" @click="load">{{ t('log.refresh') }}</button>
       <label class="filter-checkbox auto-refresh-toggle">
         <input type="checkbox" v-model="autoRefresh" @change="onAutoRefreshChange" />
         {{ t('log.autoRefresh') }}
       </label>
+    </div>
+
+    <!-- 高频消息面板：消息块引用统计 -->
+    <div v-if="showTopMessages" class="top-messages-panel">
+      <div class="top-messages-header">
+        <strong>{{ t('log.topMessages') }}</strong>
+        <div class="top-messages-sort">
+          <button :class="['btn-sm', { active: topMessagesBy === 'bytes' }]" @click="switchTopMessagesBy('bytes')">{{ t('log.sortByBytes') }}</button>
+          <button :class="['btn-sm', { active: topMessagesBy === 'refs' }]" @click="switchTopMessagesBy('refs')">{{ t('log.sortByRefs') }}</button>
+        </div>
+        <button class="btn-sm" @click="showTopMessages = false">&times;</button>
+      </div>
+      <div v-if="topMessagesLoading" class="top-messages-empty">{{ t('log.loading') }}</div>
+      <div v-else-if="!topMessages.length" class="top-messages-empty">{{ t('log.noTopMessages') }}</div>
+      <div v-else class="top-messages-list">
+        <div v-for="(m, i) in topMessages" :key="m.hash" class="top-message-item">
+          <span class="top-message-rank">#{{ i + 1 }}</span>
+          <span class="message-role" :class="roleClass(m.role)">{{ m.role }}</span>
+          <span class="top-message-stats">
+            <span class="chip-add">×{{ m.hitCount }}</span>
+            <span class="top-message-size">{{ formatSize(m.size) }} / {{ formatSize(m.size * m.hitCount) }}</span>
+          </span>
+          <pre class="top-message-preview">{{ m.content.slice(0, 300) }}{{ m.content.length > 300 ? '...' : '' }}</pre>
+        </div>
+      </div>
     </div>
 
     <!-- 筛选栏 -->
@@ -387,7 +559,7 @@ async function copyContent(text: string) {
             <tr class="log-row" @click="toggleExpand(log.id)">
               <td class="mono">{{ formatTime(log.timestamp) }}</td>
               <td><code>{{ log.model }}</code></td>
-              <td>{{ log.providerName }}<span v-if="log.fallbackAttempts" class="fallback-badge" :title="log.fallbackAttempts">FB</span></td>
+              <td>{{ log.providerName }}<span v-if="log.fallbackAttempts" class="fallback-badge" :title="log.fallbackAttempts">FB</span><span v-if="log.matchedRewriteRules" class="rewrite-badge" :title="log.matchedRewriteRules">RW</span></td>
               <td><code>{{ log.targetModel }}</code></td>
               <td>{{ log.keyName || '-' }}</td>
               <td>{{ log.stream ? t('log.yes') : t('log.no') }}</td>
@@ -419,7 +591,56 @@ async function copyContent(text: string) {
                     <div class="content-label">{{ t('log.fallbackAttempts') }}</div>
                     <pre class="content-text">{{ formatFallbackAttempts(log.fallbackAttempts) }}</pre>
                   </div>
-                  <div v-if="getContent(log.id).inputContent" class="content-block">
+                  <div v-if="log.matchedRewriteRules && parseMatchedRewrites(log.matchedRewriteRules).length" class="content-block">
+                    <div class="content-label">{{ t('log.matchedRewriteRules') }}</div>
+                    <div class="rewrite-rule-tags">
+                      <span v-for="name in parseMatchedRewrites(log.matchedRewriteRules)" :key="name" class="rewrite-rule-tag">{{ name }}</span>
+                    </div>
+                  </div>
+                  <!-- 改写差异：Git diff 式词级高亮，内联在对应消息卡片上（数据来自按需加载的日志详情） -->
+                  <!-- 输入：消息数组渲染（消息块去重存储） -->
+                  <div v-if="getContent(log.id).inputMessages?.length" class="content-block">
+                    <div class="content-label">{{ t('log.prompt') }} <button class="btn-copy" @click.stop="copyContent(getContent(log.id).inputMessages!.map(m => m.content).join('\n'))">{{ t('log.copy') }}</button></div>
+                    <div class="message-list">
+                      <!-- 工具声明：整体折叠为一组卡片，默认收起 -->
+                      <div v-if="messageView(log.id).tools.length" class="tools-group">
+                        <div class="tools-group-header" @click="toggleTools(log.id)">
+                          <span class="message-role role-other">{{ t('log.toolsGroup', { n: messageView(log.id).tools.length }) }}</span>
+                          <span class="message-toggle">{{ expandedTools.has(log.id) ? '▾' : '▸' }}</span>
+                        </div>
+                        <template v-if="expandedTools.has(log.id)">
+                          <div v-for="e in messageView(log.id).tools" :key="e.msg.hash + e.idx" class="message-card" :class="{ rewritten: messageView(log.id).diffMap.has(e.idx) }">
+                            <div class="message-header" @click="toggleMessage(log.id, e.idx)">
+                              <span class="message-role" :class="roleClass(e.msg.role)">{{ e.msg.role }}</span>
+                              <span v-if="messageView(log.id).diffMap.has(e.idx)" class="message-rewritten-badge">{{ t('log.rewritten') }}</span>
+                              <span v-if="e.msg.hitCount > 1" class="message-hits" :title="t('log.messageHitsTitle')">{{ t('log.messageHits', { n: e.msg.hitCount }) }}</span>
+                              <span class="message-size">{{ formatSize(e.msg.content.length) }}</span>
+                              <span class="message-toggle">{{ isMessageExpanded(log.id, e.idx) ? '▾' : '▸' }}</span>
+                            </div>
+                            <pre v-if="isMessageExpanded(log.id, e.idx) && messageView(log.id).diffMap.has(e.idx)" class="message-content diff"><template v-for="(s, si) in diffSpans(log.id, e.idx, messageView(log.id).diffMap.get(e.idx)!)" :key="si"><span v-if="s.type === 'same'" class="diff-same">{{ s.text }}</span><span v-else-if="s.type === 'del'" class="diff-del">{{ s.text }}</span><span v-else class="diff-add">{{ s.text }}</span></template></pre>
+                            <pre v-else-if="isMessageExpanded(log.id, e.idx)" class="message-content">{{ e.msg.content }}</pre>
+                            <pre v-else class="message-content collapsed">{{ e.msg.content }}</pre>
+                          </div>
+                        </template>
+                      </div>
+                      <!-- 对话消息 -->
+                      <div v-for="e in messageView(log.id).msgs" :key="e.msg.hash + e.idx" class="message-card" :class="{ rewritten: messageView(log.id).diffMap.has(e.idx) }">
+                        <div class="message-header" @click="toggleMessage(log.id, e.idx)">
+                          <span class="message-role" :class="roleClass(e.msg.role)">{{ e.msg.role }}</span>
+                          <span v-if="messageView(log.id).diffMap.has(e.idx)" class="message-rewritten-badge">{{ t('log.rewritten') }}</span>
+                          <span v-if="e.msg.hitCount > 1" class="message-hits" :title="t('log.messageHitsTitle')">{{ t('log.messageHits', { n: e.msg.hitCount }) }}</span>
+                          <span class="message-size">{{ formatSize(e.msg.content.length) }}</span>
+                          <span class="message-toggle">{{ isMessageExpanded(log.id, e.idx) ? '▾' : '▸' }}</span>
+                        </div>
+                        <!-- 被改写的消息：展开时直接在卡片内渲染 Git diff 式词级高亮 -->
+                        <pre v-if="isMessageExpanded(log.id, e.idx) && messageView(log.id).diffMap.has(e.idx)" class="message-content diff"><template v-for="(s, si) in diffSpans(log.id, e.idx, messageView(log.id).diffMap.get(e.idx)!)" :key="si"><span v-if="s.type === 'same'" class="diff-same">{{ s.text }}</span><span v-else-if="s.type === 'del'" class="diff-del">{{ s.text }}</span><span v-else class="diff-add">{{ s.text }}</span></template></pre>
+                        <pre v-else-if="isMessageExpanded(log.id, e.idx)" class="message-content">{{ e.msg.content }}</pre>
+                        <pre v-else class="message-content collapsed">{{ e.msg.content }}</pre>
+                      </div>
+                    </div>
+                  </div>
+                  <!-- 兼容旧日志：纯文本输入 -->
+                  <div v-else-if="getContent(log.id).inputContent" class="content-block">
                     <div class="content-label">{{ t('log.prompt') }} <button class="btn-copy" @click.stop="copyContent(formatContent(getContent(log.id).inputContent!))">{{ t('log.copy') }}</button></div>
                     <pre class="content-text">{{ formatContent(getContent(log.id).inputContent) }}</pre>
                   </div>
@@ -671,6 +892,282 @@ th.sortable:hover {
   border-radius: 3px;
   cursor: help;
   vertical-align: middle;
+}
+
+.rewrite-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--primary, #3b82f6);
+  background: rgba(59, 130, 246, 0.15);
+  border-radius: 3px;
+  cursor: help;
+  vertical-align: middle;
+}
+
+.rewrite-rule-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rewrite-rule-tag {
+  display: inline-block;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary, #3b82f6);
+  background: rgba(59, 130, 246, 0.12);
+  border-radius: 4px;
+}
+
+/** 工具声明折叠组 */
+.tools-group {
+  border: 1px dashed var(--border, #d1d5db);
+  border-radius: 6px;
+  overflow: hidden;
+  /** 列表容器滚动时工具组自身不收缩（否则被大量消息卡片压缩到不可见） */
+  flex-shrink: 0;
+}
+
+.tools-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  cursor: pointer;
+  background: var(--bg-soft, rgba(0, 0, 0, 0.03));
+  user-select: none;
+}
+
+.tools-group .message-card {
+  border: none;
+  border-top: 1px solid var(--border, #e5e7eb);
+  border-radius: 0;
+}
+
+/** 被改写的消息卡片标记 */
+.message-card.rewritten {
+  border-color: rgba(59, 130, 246, 0.5);
+}
+
+.message-rewritten-badge {
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary, #3b82f6);
+  background: rgba(59, 130, 246, 0.12);
+  border-radius: 4px;
+}
+
+/** 消息卡片内的 Git diff 式词级高亮 */
+.message-content .diff-same {
+  color: var(--text-dim);
+}
+
+.message-content .diff-del {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--tag-red);
+  text-decoration: line-through;
+  border-radius: 2px;
+}
+
+.message-content .diff-add {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--tag-green);
+  border-radius: 2px;
+  font-weight: 600;
+}
+
+/** 消息数组渲染 */
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /** 整个列表容器可滚动 */
+  max-height: 520px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.message-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  /** 卡片列表容器滚动时卡片自身不收缩 */
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.message-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--surface);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.message-role {
+  font-weight: 600;
+  padding: 0 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.role-system { background: var(--tag-purple-bg); color: var(--tag-purple); }
+.role-user { background: var(--tag-blue-bg); color: var(--tag-blue); }
+.role-assistant { background: var(--tag-green-bg); color: var(--tag-green); }
+.role-other { background: var(--surface2); color: var(--text-dim); }
+
+.message-hits {
+  color: var(--primary, #3b82f6);
+  font-weight: 600;
+}
+
+.message-size {
+  color: var(--text-dim);
+}
+
+.message-toggle {
+  margin-left: auto;
+  color: var(--text-dim);
+}
+
+.message-content {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.5;
+  /** 展开态：默认约 5-6 行，内部滚动，右下角可拖拽调高 */
+  height: calc(6 * 1.5em + 16px);
+  max-height: 60vh;
+  min-height: calc(3 * 1.5em + 16px);
+  overflow-y: auto;
+  resize: vertical;
+}
+
+.message-content.collapsed {
+  /** 收起态：单行摘要 */
+  height: auto;
+  max-height: calc(1.5em + 16px);
+  min-height: 0;
+  overflow: hidden;
+  resize: none;
+  color: var(--text-dim);
+}
+
+/** 高频消息面板 */
+.top-messages-panel {
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.top-messages-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.top-messages-sort {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.top-messages-sort .btn-sm.active {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.top-messages-empty {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.top-messages-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.top-message-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.top-message-item:last-child {
+  border-bottom: none;
+}
+
+.top-message-rank {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 28px;
+}
+
+.top-message-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.top-message-size {
+  color: var(--text-dim);
+}
+
+.top-message-preview {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 60px;
+  overflow: hidden;
+}
+
+.btn-sm {
+  padding: 3px 10px;
+  font-size: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 5px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.btn-sm:hover {
+  color: var(--text);
+  border-color: var(--primary);
+}
+
+.chip-add {
+  color: var(--tag-green);
+  font-weight: 600;
 }
 
 @media (max-width: 768px) {

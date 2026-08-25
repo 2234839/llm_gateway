@@ -44,7 +44,10 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     let cacheCreationTokens = 0
     let cacheReadTokens = 0
     let outputText = ""
-    let fullMessageText = ""
+    /** 命中的内容改写规则名（JSON 数组），写入请求日志 */
+    let matchedRewriteRules: string | null = null
+    /** 内容改写产生的消息级差异（JSON RewriteDiff[]） */
+    let rewriteDiffs: string | null = null
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -99,7 +102,6 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 
     try {
       const messageText = extractOpenAIText(body)
-      fullMessageText = messageText
       const contentTypes = extractOpenAIContentTypes(body)
       const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + (body.max_tokens ?? body.max_completion_tokens ?? 0) })
 
@@ -129,13 +131,21 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
 
-      /** 内容改写管道 */
+      /** 内容改写管道：改写前先留一份消息快照，改写后对比生成差异供日志展示 */
       {
         const rewriteRules = fastify.db.getRewriteRules()
         if (rewriteRules.length > 0) {
           const { rewriteOpenAI } = await import("../utils/rewrite-engine")
+          const beforeMsgs = extractOpenAIMessages(body)
           const rr = rewriteOpenAI(body, rewriteRules, { path: "/v1/chat/completions", model })
-          if (rr.matched) fullMessageText = extractOpenAIText(body)
+          if (rr.matched) {
+            matchedRewriteRules = rr.matchedRules.length > 0 ? JSON.stringify(rr.matchedRules) : null
+            const afterMsgs = extractOpenAIMessages(body)
+            const diffs = beforeMsgs
+              .map((m, i) => afterMsgs[i]?.content !== m.content ? { idx: i, role: m.role, before: m.content, after: afterMsgs[i]?.content ?? "" } : null)
+              .filter(d => d !== null)
+            rewriteDiffs = diffs.length > 0 ? JSON.stringify(diffs) : null
+          }
         }
       }
 
@@ -281,9 +291,12 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         apiKeyId: auth?.keyId ?? null,
         groupId: auth?.groupId ?? null,
         error: errorMsg,
-        inputContent: fullMessageText,
+        inputContent: null,
+        inputMessagesForWrite: extractOpenAIMessages(body),
         outputContent: outputText || null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
+        matchedRewriteRules,
+        rewriteDiffs,
       })
       recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
@@ -292,6 +305,49 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       })
     }
   })
+}
+
+/** 提取结构化消息数组（messages + 工具描述），供日志消息块去重存储与改写 diff 对比 */
+function extractOpenAIMessages(body: OpenAIChatCompletionRequest): { role: string; content: string }[] {
+  const result: { role: string; content: string }[] = []
+  /** 工具声明在协议中位于 system 之后、对话消息之前，展示保持同样顺序 */
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool.function?.description) result.push({ role: `tool:${tool.function.name}`, content: tool.function.description })
+    }
+  }
+  for (const msg of body.messages) {
+    /** assistant 的工具调用与文本一起记录；tool 消息的 content 也纳入 */
+    if (msg.role === "assistant") {
+      const parts: string[] = []
+      if (typeof msg.content === "string" && msg.content) parts.push(msg.content)
+      else if (Array.isArray(msg.content)) {
+        const text = (msg.content as { type: string; text?: string }[])
+          .filter(p => p.type === "text" && p.text)
+          .map(p => p.text!)
+          .join("\n")
+        if (text) parts.push(text)
+      }
+      if (msg.reasoning_content) parts.push(`[thinking] ${msg.reasoning_content} [/thinking]`)
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          parts.push(`[tool_call: ${tc.function.name}(${tc.function.arguments})]`)
+        }
+      }
+      if (parts.length) result.push({ role: "assistant", content: parts.join("\n") })
+      continue
+    }
+    if (typeof msg.content === "string") {
+      if (msg.content) result.push({ role: msg.role, content: msg.content })
+    } else if (Array.isArray(msg.content)) {
+      const text = (msg.content as { type: string; text?: string }[])
+        .filter(p => p.type === "text" && p.text)
+        .map(p => p.text!)
+        .join("\n")
+      if (text) result.push({ role: msg.role, content: text })
+    }
+  }
+  return result
 }
 
 /** 处理单个 OpenAI 上游请求，返回统一的结果对象 */

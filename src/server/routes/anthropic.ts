@@ -49,7 +49,10 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let cacheCreationTokens = 0
     let cacheReadTokens = 0
     let outputText = ""
-    let fullMessageText = ""
+    /** 命中的内容改写规则名（JSON 数组），写入请求日志 */
+    let matchedRewriteRules: string | null = null
+    /** 内容改写产生的消息级差异（JSON RewriteDiff[]） */
+    let rewriteDiffs: string | null = null
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -86,7 +89,6 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
 
     try {
       const messageText = extractAnthropicText(body)
-      fullMessageText = messageText
       const contentTypes = extractAnthropicContentTypes(body)
       const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + body.max_tokens })
 
@@ -117,6 +119,24 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       }
 
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
+
+      /** 内容改写管道：改写前先留一份消息快照，改写后对比生成差异供日志展示 */
+      {
+        const rewriteRules = fastify.db.getRewriteRules()
+        if (rewriteRules.length > 0) {
+          const { rewriteAnthropic } = await import("../utils/rewrite-engine")
+          const beforeMsgs = extractAnthropicMessages(body)
+          const rr = rewriteAnthropic(body, rewriteRules, { path: "/v1/messages", model })
+          if (rr.matched) {
+            matchedRewriteRules = rr.matchedRules.length > 0 ? JSON.stringify(rr.matchedRules) : null
+            const afterMsgs = extractAnthropicMessages(body)
+            const diffs = beforeMsgs
+              .map((m, i) => afterMsgs[i]?.content !== m.content ? { idx: i, role: m.role, before: m.content, after: afterMsgs[i]?.content ?? "" } : null)
+              .filter(d => d !== null)
+            rewriteDiffs = diffs.length > 0 ? JSON.stringify(diffs) : null
+          }
+        }
+      }
 
       /** 构建尝试列表：主 provider + fallbacks */
       const candidates: { provider: Provider; providerConfig: ProviderConfig; targetModel: string }[] = [
@@ -256,9 +276,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         apiKeyId: auth?.keyId ?? null,
         groupId: auth?.groupId ?? null,
         error: errorMsg,
-        inputContent: fullMessageText,
+        inputContent: null,
+        inputMessagesForWrite: extractAnthropicMessages(body),
         outputContent: outputText || null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
+        matchedRewriteRules,
+        rewriteDiffs,
       })
       recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
@@ -274,6 +297,50 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       input_tokens: estimateInputTokens(request.body as AnthropicMessagesRequest),
     })
   })
+}
+
+/** 提取结构化消息数组（system 顶层字段 + messages + 工具描述），供日志消息块去重存储与改写 diff 对比 */
+function extractAnthropicMessages(body: AnthropicMessagesRequest): { role: string; content: string }[] {
+  const result: { role: string; content: string }[] = []
+  const system = body.system
+  if (typeof system === "string" && system) {
+    result.push({ role: "system", content: system })
+  } else if (Array.isArray(system)) {
+    const text = system.filter(b => b.type === "text").map(b => b.text).join("\n")
+    if (text) result.push({ role: "system", content: text })
+  }
+  /** 工具声明在协议中位于 system 之后、对话消息之前，展示保持同样顺序 */
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool.description) result.push({ role: `tool:${tool.name}`, content: tool.description })
+    }
+  }
+  for (const msg of body.messages) {
+    if (typeof msg.content === "string") {
+      result.push({ role: msg.role, content: msg.content })
+    } else if (Array.isArray(msg.content)) {
+      /** 逐块提取：text / thinking / tool_use / tool_result 都记录，忠实还原对话内容 */
+      const parts: string[] = []
+      for (const block of msg.content as { type: string; text?: string; thinking?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean }[]) {
+        if (block.type === "text" && block.text) {
+          parts.push(block.text)
+        } else if (block.type === "thinking" && block.thinking) {
+          parts.push(`[thinking] ${block.thinking} [/thinking]`)
+        } else if (block.type === "tool_use") {
+          parts.push(`[tool_call: ${block.name}(${JSON.stringify(block.input ?? {})})]`)
+        } else if (block.type === "tool_result") {
+          const inner = typeof block.content === "string"
+            ? block.content
+            : Array.isArray(block.content)
+              ? (block.content as { type: string; text?: string }[]).filter(b => b.type === "text" && b.text).map(b => b.text!).join("\n")
+              : ""
+          parts.push(`[tool_result${block.is_error ? " (error)" : ""}: ${inner}]`)
+        }
+      }
+      if (parts.length) result.push({ role: msg.role, content: parts.join("\n") })
+    }
+  }
+  return result
 }
 
 /** 处理单个 Anthropic 上游请求，返回统一的结果对象 */

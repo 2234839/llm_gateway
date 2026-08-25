@@ -134,6 +134,24 @@ export interface LogEntry {
   keyName: string | null
   groupName: string | null
   fallbackAttempts: string | null
+  /** 命中的内容改写规则名列表，JSON 字符串数组 */
+  matchedRewriteRules: string | null
+  /** 内容改写实际产生的消息级差异（带快照序号），JSON 数组；未改写时为 null */
+  rewriteDiffs: string | null
+  /** 结构化输入消息（消息块去重存储重组），旧日志为空 */
+  inputMessages?: LogMessageInfo[]
+}
+
+export interface LogMessageInfo {
+  hash: string
+  role: string
+  content: string
+  hitCount: number
+}
+
+export interface TopMessageInfo extends LogMessageInfo {
+  size: number
+  lastUsedAt: string | null
 }
 
 export interface HealthInfo {
@@ -324,25 +342,37 @@ export interface RewriteMatchCondition {
   scope?: "all" | "system" | "user" | "assistant"
 }
 
-export type RewriteActionType = "replace" | "replace_all" | "prepend" | "append"
+export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append"
 
 export interface RewriteAction {
+  /** 用户自定义的动作备注名，可选 */
+  name?: string
   type: RewriteActionType
   replacement: string
+  /** regex_replace 时的正则模式；text_replace 时的纯文本查找内容 */
   pattern?: string
   flags?: string
+  scope?: "all" | "system" | "user" | "assistant"
 }
 
 export interface RewriteRuleInfo {
   id: string
   name: string
   match: RewriteMatchCondition[]
-  action: RewriteAction
+  /** 动作组：命中后按顺序依次执行 */
+  actions: RewriteAction[]
   enabled: boolean
   priority: number
   modelPattern?: string
   pathPattern?: string
   createdAt: string
+}
+
+export interface RewritePreviewStep {
+  ruleName: string
+  actionName?: string
+  before: string
+  after: string
 }
 
 export interface RewritePreviewItem {
@@ -353,6 +383,7 @@ export interface RewritePreviewItem {
   rewritten: string | null
   matched: boolean
   matchedRules: string[]
+  steps: RewritePreviewStep[]
 }
 
 export const rewriteApi = {
@@ -385,6 +416,8 @@ export const logApi = {
     return api<LogEntry[]>(`/admin/logs?${params}`)
   },
   detail: (id: number) => api<LogEntry>(`/admin/logs/${id}`),
+  topMessages: (limit = 20, by: "refs" | "bytes" = "bytes") =>
+    api<TopMessageInfo[]>(`/admin/messages/top?limit=${limit}&by=${by}`),
   stats: (filters?: { apiKeyId?: string; groupId?: string }) => {
     const params = new URLSearchParams()
     if (filters?.apiKeyId) params.set("apiKeyId", filters.apiKeyId)

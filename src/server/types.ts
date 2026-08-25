@@ -405,7 +405,7 @@ export interface RouteFallback {
 export type RewriteScope = "all" | "system" | "user" | "assistant"
 
 /** 内容改写动作类型 */
-export type RewriteActionType = "replace" | "replace_all" | "prepend" | "append"
+export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append"
 
 /** 内容改写的匹配条件 */
 export interface RewriteMatchCondition {
@@ -423,14 +423,18 @@ export interface RewriteMatchCondition {
 
 /** 内容改写的执行动作 */
 export interface RewriteAction {
+  /** 用户自定义的动作备注名，用于标注这个动作的用途，可选 */
+  name?: string
   /** 动作类型 */
   type: RewriteActionType
   /** 替换/注入的文本内容 */
   replacement: string
-  /** replace/replace_all 时的匹配模式，不填则使用 match 条件中第一个的 pattern */
+  /** regex_replace 时的正则模式（必填）；text_replace 时的纯文本查找内容（必填） */
   pattern?: string
-  /** 正则标志位 */
+  /** regex_replace 时的正则标志位，如 i */
   flags?: string
+  /** 动作作用范围：限定处理的消息角色，不填则使用 match 条件涉及的 scopes */
+  scope?: RewriteScope
 }
 
 /** 内容改写规则 */
@@ -440,8 +444,8 @@ export interface RewriteRule {
   name: string
   /** 匹配条件组 */
   match: RewriteMatchCondition[]
-  /** 执行动作 */
-  action: RewriteAction
+  /** 执行动作组：命中后按顺序依次执行 */
+  actions: RewriteAction[]
   /** 是否启用 */
   enabled: boolean
   /** 优先级，数值越大越先执行 */
@@ -502,8 +506,40 @@ export interface RequestLogEntry {
   error: string | null
   inputContent: string | null
   outputContent: string | null
+  /** 结构化输入消息（内容寻址存储重组），旧日志为空 */
+  inputMessages?: LogMessage[]
+  /** 写入时提供的结构化消息，存入消息块表做哈希去重 */
+  inputMessagesForWrite?: { role: string; content: string }[]
   /** fallback 尝试记录，JSON 数组：[{ providerId, providerName, targetModel, statusCode, error }] */
   fallbackAttempts: string | null
+  /** 命中的内容改写规则名列表，JSON 字符串数组 */
+  matchedRewriteRules?: string | null
+  /** 内容改写实际产生的消息级差异，JSON 数组 RewriteDiff；未改写时为 null */
+  rewriteDiffs?: string | null
+}
+
+/** 单条消息的内容改写差异（改写前/后快照对比） */
+export interface RewriteDiff {
+  /** 快照中的序号：小于消息数时直接对位消息卡片，>= 消息数为工具描述 */
+  idx: number
+  /** 消息角色（工具描述为 tool:工具名） */
+  role: string
+  /** 改写前文本 */
+  before: string
+  /** 改写后文本 */
+  after: string
+}
+
+/** 日志中的结构化消息（内容寻址存储重组结果） */
+export interface LogMessage {
+  /** 内容哈希（role + content） */
+  hash: string
+  /** 消息角色 */
+  role: string
+  /** 消息文本内容 */
+  content: string
+  /** 该消息块被多少条日志引用（高频度指标） */
+  hitCount: number
 }
 
 /** Token 用量统计快照 */
