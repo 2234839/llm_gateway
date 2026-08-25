@@ -23,6 +23,7 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
   requestTimeout: 0,
   color: "",
   customHeaders: {},
+  allowedClientHeaders: [],
   flattenMidSystem: false,
 }
 
@@ -90,7 +91,7 @@ async function checkAllHealth() {
 
 function startEdit(p: ProviderInfo) {
   editing.value = p
-  form.value = { ...p, customHeaders: { ...(p.customHeaders ?? {}) } }
+  form.value = { ...p, customHeaders: { ...(p.customHeaders ?? {}) }, allowedClientHeaders: [...(p.allowedClientHeaders ?? [])] }
   creating.value = false
   testResult.value = null
   modelInput.value = ""
@@ -100,7 +101,7 @@ function startEdit(p: ProviderInfo) {
 function startCreate() {
   editing.value = null
   creating.value = true
-  form.value = { ...emptyProvider, customHeaders: {} }
+  form.value = { ...emptyProvider, customHeaders: {}, allowedClientHeaders: [] }
   testResult.value = null
   modelInput.value = ""
   headerEntries.value = []
@@ -211,6 +212,14 @@ const urlPlaceholder = computed(() => urlPlaceholders[form.value.type] ?? urlPla
 
 /** 自定义 Headers 编辑 */
 const headerEntries = ref<{ key: string; value: string }[]>([])
+
+/** allowedClientHeaders 单行输入（逗号分隔） */
+const allowedClientHeadersInput = computed({
+  get: () => (form.value.allowedClientHeaders ?? []).join(", "),
+  set: (v: string) => {
+    form.value.allowedClientHeaders = v.split(",").map(s => s.trim()).filter(Boolean)
+  },
+})
 
 function syncHeadersFromForm() {
   const h = form.value.customHeaders ?? {}
@@ -367,6 +376,9 @@ function removeHeader(index: number) {
         <div class="headers-section">
           <div class="section-label">{{ t('provider.customHeadersLabel') }}</div>
           <p class="section-hint">{{ t('provider.customHeadersHint') }}</p>
+          <div class="section-label">{{ t('provider.allowedClientHeadersLabel') }}</div>
+          <p class="section-hint">{{ t('provider.allowedClientHeadersHint') }}</p>
+          <input v-model="allowedClientHeadersInput" class="mono" :placeholder="t('provider.allowedClientHeadersPlaceholder')" />
           <div v-for="(entry, i) in headerEntries" :key="i" class="header-row">
             <input v-model="entry.key" :placeholder="t('provider.headerKeyPlaceholder')" class="header-key" @input="syncHeadersToForm" />
             <input v-model="entry.value" :placeholder="t('provider.headerValuePlaceholder')" class="header-value" @input="syncHeadersToForm" />

@@ -232,6 +232,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (body.enabled !== undefined && typeof body.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
     if (body.maxConcurrency !== undefined && (typeof body.maxConcurrency !== "number" || body.maxConcurrency < 0)) return reply.status(400).send({ error: "maxConcurrency must be a non-negative number" })
     if (body.requestTimeout !== undefined && (typeof body.requestTimeout !== "number" || body.requestTimeout < 0)) return reply.status(400).send({ error: "requestTimeout must be a non-negative number" })
+    if (body.allowedClientHeaders !== undefined && (!Array.isArray(body.allowedClientHeaders) || body.allowedClientHeaders.some((h: unknown) => typeof h !== "string" || !h.trim()))) return reply.status(400).send({ error: "allowedClientHeaders must be an array of non-empty strings" })
     const provider: ProviderConfig = {
       ...body,
       id: uuid(),
@@ -262,6 +263,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (update.enabled !== undefined && typeof update.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
     if (update.maxConcurrency !== undefined && (typeof update.maxConcurrency !== "number" || update.maxConcurrency < 0)) return reply.status(400).send({ error: "maxConcurrency must be a non-negative number" })
     if (update.requestTimeout !== undefined && (typeof update.requestTimeout !== "number" || update.requestTimeout < 0)) return reply.status(400).send({ error: "requestTimeout must be a non-negative number" })
+    if (update.allowedClientHeaders !== undefined && (!Array.isArray(update.allowedClientHeaders) || update.allowedClientHeaders.some((h: unknown) => typeof h !== "string" || !h.trim()))) return reply.status(400).send({ error: "allowedClientHeaders must be an array of non-empty strings" })
     fastify.db.updateProvider(id, update)
     fastify.registry.reload()
     invalidateNameCache()

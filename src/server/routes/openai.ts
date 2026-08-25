@@ -188,7 +188,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
           const result = await withUpstreamRetry(
-            () => handleOpenAIUpstream(currentProvider, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal),
+            () => handleOpenAIUpstream(currentProvider, currentConfig, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal),
             retryOptions,
             clientSignal,
             providerName,
@@ -297,6 +297,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 /** 处理单个 OpenAI 上游请求，返回统一的结果对象 */
 async function handleOpenAIUpstream(
   provider: Provider,
+  providerConfig: ProviderConfig,
   targetModel: string,
   body: OpenAIChatCompletionRequest,
   isStream: boolean,
@@ -320,9 +321,8 @@ async function handleOpenAIUpstream(
   streamHijacked?: boolean
 }> {
   try {
-  /** 提取需要透传的客户端 headers */
-  const clientHeaders = extractClientHeaders(reply.request.headers)
-
+  /** 提取需要透传的客户端 headers（默认仅 User-Agent，可按 provider 配置扩展） */
+  const clientHeaders = extractClientHeaders(reply.request.headers, providerConfig?.allowedClientHeaders)
   if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
     /** OpenAI 兼容提供商 — 透传 */
     if (isStream) {
@@ -549,10 +549,11 @@ function estimateOpenAIInputTokens(body: OpenAIChatCompletionRequest): number {
   return Math.ceil(chars / 4)
 }
 
-/** 从客户端请求头中提取兼容的 headers，避免把网关/代理头转发给上游。 */
-function extractClientHeaders(headers: import("fastify").FastifyRequest["headers"]): Record<string, string> {
+/** 从客户端请求头中提取兼容的 headers，避免把网关/代理头转发给上游。
+ * allowedHeadersExtra：该 provider 额外放行的客户端 header 列表（小写，合并进白名单） */
+function extractClientHeaders(headers: import("fastify").FastifyRequest["headers"], allowedHeadersExtra: string[] = []): Record<string, string> {
   const result: Record<string, string> = {}
-  const allowedHeaders = new Set(["user-agent"])
+  const allowedHeaders = new Set(["user-agent", ...allowedHeadersExtra.map(h => h.toLowerCase())])
   for (const [key, value] of Object.entries(headers)) {
     if (!allowedHeaders.has(key.toLowerCase())) continue
     if (!value) continue

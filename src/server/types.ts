@@ -320,6 +320,8 @@ export interface ProviderConfig {
   models: string[]
   enabled: boolean
   customHeaders?: Record<string, string>
+  /** 额外放行透传给该 provider 的客户端请求头列表（大小写不敏感，默认仅 User-Agent） */
+  allowedClientHeaders?: string[]
   /** 最大并发请求数，0 或不设置表示不限制 */
   maxConcurrency?: number
   /** 请求超时毫秒数，0 或不设置使用默认 300000 (5分钟) */

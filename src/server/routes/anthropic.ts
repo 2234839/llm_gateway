@@ -36,7 +36,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     reply.header("request-id", gatewayRequestId)
     reply.header("x-gateway-request-id", gatewayRequestId)
 
-    /** 提取上游 headers（需要透传的） */
+    /** 提取需要透传给上游的 headers（默认仅 User-Agent，provider 额外放行在 handleAnthropicUpstream 内合并） */
     const upstreamHeaders = extractClientHeaders(request.headers)
 
     let providerId = ""
@@ -303,6 +303,8 @@ async function handleAnthropicUpstream(
 }> {
   try {
   if (provider.type === "anthropic") {
+    /** 合并 provider 额外放行的客户端 header */
+    const finalUpstreamHeaders = mergeAllowedClientHeaders(upstreamHeaders, providerConfig.allowedClientHeaders, reply.request.headers)
     /** 兼容 Claude Code mid_conversation_system beta：
      *  若 provider 开启了 flattenMidSystem，将 messages 中的 system 消息转为 user
      *  注意：始终过滤掉 content 为空的 system 消息，避免 Anthropic API 拒绝 */
@@ -331,7 +333,7 @@ async function handleAnthropicUpstream(
 
     /** Anthropic 直连 — 透传 */
     if (isStream) {
-      const upstream = await provider.sendStreamRequest(sendBody, upstreamHeaders, signal)
+      const upstream = await provider.sendStreamRequest(sendBody, finalUpstreamHeaders, signal)
       console.log(`[anthropic] anthropic direct stream status: ${upstream.status}, body: ${upstream.body ? "present" : "null"}, content-type: ${upstream.headers.get("content-type")}`)
       if (!upstream.ok) {
         const errBody = await upstream.text()
@@ -354,7 +356,7 @@ async function handleAnthropicUpstream(
       return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest(sendBody, upstreamHeaders, signal)
+    const upstream = await provider.sendRequest(sendBody, finalUpstreamHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
@@ -626,6 +628,18 @@ function extractClientHeaders(headers: import("fastify").FastifyRequest["headers
     }
   }
   return result
+}
+
+/** 将 provider 额外放行的客户端 header 补进已提取的透传列表 */
+function mergeAllowedClientHeaders(base: Record<string, string>, allowed: string[] | undefined, requestHeaders: import("fastify").FastifyRequest["headers"]): Record<string, string> {
+  if (!allowed || allowed.length === 0) return base
+  const merged = { ...base }
+  for (const name of allowed) {
+    const value = requestHeaders[name.toLowerCase() as keyof typeof requestHeaders]
+    if (typeof value === "string") merged[name] = value
+    else if (Array.isArray(value)) merged[name] = value.join(", ")
+  }
+  return merged
 }
 
 /** 粗略估算输入 token 数 */

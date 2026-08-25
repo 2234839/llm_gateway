@@ -83,7 +83,8 @@ export class GatewayDB {
         models TEXT NOT NULL DEFAULT '[]',
         enabled INTEGER NOT NULL DEFAULT 1,
         custom_headers TEXT DEFAULT '{}',
-        sort_order INTEGER NOT NULL DEFAULT 0
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        allowed_client_headers TEXT DEFAULT '[]'
       )
     `)
 
@@ -181,6 +182,11 @@ export class GatewayDB {
     }
     try {
       this.db.run("ALTER TABLE providers ADD COLUMN flatten_mid_system INTEGER NOT NULL DEFAULT 0")
+    } catch {
+      // 列已存在
+    }
+    try {
+      this.db.run("ALTER TABLE providers ADD COLUMN allowed_client_headers TEXT DEFAULT '[]'")
     } catch {
       // 列已存在
     }
@@ -349,7 +355,7 @@ export class GatewayDB {
 
   addProvider(provider: ProviderConfig) {
     this.stmt(
-      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color, flatten_mid_system) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color, flatten_mid_system, allowed_client_headers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       provider.id,
       provider.name,
@@ -364,6 +370,7 @@ export class GatewayDB {
       provider.requestTimeout ?? 0,
       provider.color ?? null,
       provider.flattenMidSystem ? 1 : 0,
+      JSON.stringify(provider.allowedClientHeaders ?? []),
     )
   }
 
@@ -374,7 +381,7 @@ export class GatewayDB {
 
       const updated = { ...existing, ...provider, id }
       this.stmt(
-        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=? WHERE id=?"
+        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=?, allowed_client_headers=? WHERE id=?"
       ).run(
         updated.name,
         updated.type,
@@ -387,6 +394,7 @@ export class GatewayDB {
         updated.requestTimeout ?? 0,
         updated.color ?? null,
         updated.flattenMidSystem ? 1 : 0,
+        JSON.stringify(updated.allowedClientHeaders ?? []),
         id,
       )
     })
@@ -410,6 +418,7 @@ export class GatewayDB {
       requestTimeout: (row.request_timeout as number) || undefined,
       color: (row.color as string) || undefined,
       flattenMidSystem: (row.flatten_mid_system as number) === 1 || undefined,
+      allowedClientHeaders: JSON.parse((row.allowed_client_headers as string) || "[]"),
     }
   }
 
