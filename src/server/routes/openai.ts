@@ -549,25 +549,13 @@ function estimateOpenAIInputTokens(body: OpenAIChatCompletionRequest): number {
   return Math.ceil(chars / 4)
 }
 
-/** 从客户端请求头中提取需要透传给上游的 headers
- * 排除网关自己管理的字段（host、content-length、authorization 等）
- */
+/** 从客户端请求头中提取兼容的 headers，避免把网关/代理头转发给上游。 */
 function extractClientHeaders(headers: import("fastify").FastifyRequest["headers"]): Record<string, string> {
   const result: Record<string, string> = {}
-  const skipHeaders = new Set([
-    "host",
-    "connection",
-    "content-length",
-    "content-type",
-    "authorization",
-    "x-api-key",
-    "api-key",
-    "accept-encoding",
-    "accept",
-  ])
+  const allowedHeaders = new Set(["user-agent"])
   for (const [key, value] of Object.entries(headers)) {
+    if (!allowedHeaders.has(key.toLowerCase())) continue
     if (!value) continue
-    if (skipHeaders.has(key.toLowerCase())) continue
     if (typeof value === "string") {
       result[key] = value
     } else if (Array.isArray(value)) {
