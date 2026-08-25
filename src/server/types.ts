@@ -458,9 +458,23 @@ export interface RewriteRule {
   createdAt: string
 }
 
+/** 受保护密钥（Secret Vault）：请求出站时替换为占位符，响应入站时还原 */
+export interface SecretEntry {
+  id: string
+  /** 密钥名称（便于辨认用途） */
+  name: string
+  /** 占位符，如 GWKEY_x7k2m9a2，发给上游 LLM 的就是它 */
+  placeholder: string
+  /** 真实密钥值，仅网关持有 */
+  value: string
+  /** 是否启用保护 */
+  enabled: boolean
+  /** 创建时间 */
+  createdAt: string
+}
+
 /** CORS 跨域配置 */
-export interface CorsConfig {
-  /** 允许的来源：true = 允许所有（反射请求来源），字符串数组 = 指定白名单 */
+export interface CorsConfig {  /** 允许的来源：true = 允许所有（反射请求来源），字符串数组 = 指定白名单 */
   origin: true | string[]
   /** 允许的 HTTP 方法 */
   methods: string[]

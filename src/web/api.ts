@@ -399,6 +399,27 @@ export const rewriteApi = {
     api<{ results: RewritePreviewItem[] }>("/admin/rewrite-rules/preview", { method: "POST", body: JSON.stringify(data) }),
 }
 
+export interface SecretInfo {
+  id: string
+  /** 密钥名称（便于辨认用途） */
+  name: string
+  /** 占位符，如 GWKEY_x7k2m9a2 */
+  placeholder: string
+  /** 真实密钥值（管理面板可见，发给上游 LLM 的是占位符） */
+  value: string
+  enabled: boolean
+  createdAt: string
+}
+
+export const secretApi = {
+  list: () => api<SecretInfo[]>("/admin/secrets"),
+  create: (data: { name: string; placeholder?: string; value: string; enabled?: boolean }) =>
+    api<SecretInfo>("/admin/secrets", { method: "POST", body: JSON.stringify(data) }),
+  update: (id: string, data: Partial<SecretInfo>) =>
+    api<SecretInfo>(`/admin/secrets/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  delete: (id: string) => api<void>(`/admin/secrets/${id}`, { method: "DELETE" }),
+}
+
 export const logApi = {
   list: (options?: { limit?: number; offset?: number; model?: string; providerId?: string; apiKeyId?: string; groupId?: string; status?: string; sort?: string; startTime?: string; endTime?: string; hasFallback?: boolean }) => {
     const params = new URLSearchParams()

@@ -1,6 +1,7 @@
 import type { ServerResponse } from "node:http"
-import type { AnthropicStopReason, OpenAIStreamChunk } from "../types.ts"
+import type { AnthropicStopReason, OpenAIStreamChunk, SecretEntry } from "../types.ts"
 import { parseSSEBuffer, formatSSE, type SSEParsedEvent } from "../sse.ts"
+import { StreamRestorer } from "../utils/secret-vault.ts"
 
 interface ToolCallState {
   id: string
@@ -8,6 +9,8 @@ interface ToolCallState {
   claudeIndex: number
   started: boolean
   args: string
+  /** 工具参数流式还原器（占位符 → 真实密钥，仅写往客户端的内容做还原） */
+  restorer: StreamRestorer
 }
 
 /**
@@ -22,6 +25,8 @@ export async function streamOpenAIToAnthropic(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (finalInputTokens: number, finalOutputTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
+  /** 密钥保护：占位符 → 真实密钥（仅写往客户端的内容还原，日志回调仍是占位符版） */
+  secrets?: SecretEntry[],
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -45,6 +50,10 @@ export async function streamOpenAIToAnthropic(
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  /** 文本/thinking 流式还原器（两种块顺序输出，共用一个） */
+  const textRestorer = new StreamRestorer(secrets ?? [])
+  /** 创建工具参数还原器 */
+  const makeRestorer = () => new StreamRestorer(secrets ?? [])
 
   function writeEvent(event: string, data: unknown) {
     raw.write(formatSSE(event, data))
@@ -110,6 +119,32 @@ export async function streamOpenAIToAnthropic(
 
   function closeCurrentBlock() {
     if (!hasOpenBlock) return
+    /** 关块前刷出还原器中可能滞留的占位符尾部（占位符被切断但最终未匹配的场景） */
+    if ((currentBlockType === "text" || currentBlockType === "thinking") && textRestorer.enabled) {
+      const tail = textRestorer.flush()
+      if (tail) {
+        writeEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: currentContentIndex,
+          delta: currentBlockType === "text"
+            ? { type: "text_delta", text: tail }
+            : { type: "thinking_delta", thinking: tail },
+        })
+      }
+    }
+    if (currentBlockType === "tool_use") {
+      const state = [...toolCallMap.values()].find(st => st.claudeIndex === currentContentIndex)
+      if (state?.restorer.enabled) {
+        const tail = state.restorer.flush()
+        if (tail) {
+          writeEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: currentContentIndex,
+            delta: { type: "input_json_delta", partial_json: tail },
+          })
+        }
+      }
+    }
     writeEvent("content_block_stop", {
       type: "content_block_stop",
       index: currentContentIndex,
@@ -122,7 +157,7 @@ export async function streamOpenAIToAnthropic(
     closeCurrentBlock()
     const claudeIndex = currentContentIndex + 1
     currentContentIndex = claudeIndex
-    toolCallMap.set(toolIndex, { id, name, claudeIndex, started: true, args: "" })
+    toolCallMap.set(toolIndex, { id, name, claudeIndex, started: true, args: "", restorer: makeRestorer() })
     hasOpenBlock = true
     currentBlockType = "tool_use"
     writeEvent("content_block_start", {
@@ -208,11 +243,15 @@ export async function streamOpenAIToAnthropic(
         /** 文本内容 */
         if (delta.content) {
           openTextBlock()
-          writeEvent("content_block_delta", {
-            type: "content_block_delta",
-            index: currentContentIndex,
-            delta: { type: "text_delta", text: delta.content },
-          })
+          /** 写往客户端的内容做密钥还原（日志回调仍传原始占位符版） */
+          const restoredText = textRestorer.feed(delta.content)
+          if (restoredText) {
+            writeEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: currentContentIndex,
+              delta: { type: "text_delta", text: restoredText },
+            })
+          }
           onText?.(delta.content)
           outputTokens++
         }
@@ -220,11 +259,14 @@ export async function streamOpenAIToAnthropic(
         /** reasoning_content（DeepSeek/OpenAI reasoning 扩展）映射为 thinking block */
         if (delta.reasoning_content) {
           openThinkingBlock()
-          writeEvent("content_block_delta", {
-            type: "content_block_delta",
-            index: currentContentIndex,
-            delta: { type: "thinking_delta", thinking: delta.reasoning_content },
-          })
+          const restoredThinking = textRestorer.feed(delta.reasoning_content)
+          if (restoredThinking) {
+            writeEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: currentContentIndex,
+              delta: { type: "thinking_delta", thinking: restoredThinking },
+            })
+          }
           onText?.(delta.reasoning_content)
           outputTokens++
         }
@@ -239,7 +281,7 @@ export async function streamOpenAIToAnthropic(
               openToolBlock(idx, tc.id, tc.function.name)
             } else if (tc.id && !existing) {
               /** id 先到但 name 未到，创建占位状态（延迟到 name 到达时 openToolBlock） */
-              toolCallMap.set(idx, { id: tc.id, name: "", claudeIndex: -1, started: false, args: "" })
+              toolCallMap.set(idx, { id: tc.id, name: "", claudeIndex: -1, started: false, args: "", restorer: makeRestorer() })
             }
 
             /** name 补充到达 */
@@ -252,11 +294,14 @@ export async function streamOpenAIToAnthropic(
             const state = toolCallMap.get(idx)
             if (state?.started && tc.function?.arguments) {
               state.args += tc.function.arguments
-              writeEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: state.claudeIndex,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-              })
+              const restoredArgs = state.restorer.feed(tc.function.arguments)
+              if (restoredArgs) {
+                writeEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: state.claudeIndex,
+                  delta: { type: "input_json_delta", partial_json: restoredArgs },
+                })
+              }
               outputTokens++
             }
           }

@@ -10,6 +10,8 @@ import { emitEvent } from "../utils/event-bus.ts"
 import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
+import { maskOpenAIBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
+import type { SecretEntry } from "../types.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -48,6 +50,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     let matchedRewriteRules: string | null = null
     /** 内容改写产生的消息级差异（JSON RewriteDiff[]） */
     let rewriteDiffs: string | null = null
+    /** 密钥保护条目（try 内加载，供出站脱敏与日志兜底脱敏） */
+    let secretEntries: SecretEntry[] = []
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -149,6 +153,12 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         }
       }
 
+      /** 密钥保护出站脱敏：真实密钥替换为占位符后再发给上游（日志记录的同样是脱敏后的 body） */
+      secretEntries = fastify.db.getSecrets()
+      if (secretEntries.some(sc => sc.enabled && sc.value)) {
+        maskOpenAIBody(body, secretEntries)
+      }
+
       /** 附加路由调试 header（RFC 7230 要求 header 值为可见 ASCII 字符） */
       reply.header("x-gateway-provider", encodeURIComponent(providerConfig.name))
       reply.header("x-gateway-model", encodeURIComponent(tm))
@@ -198,7 +208,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
           const result = await withUpstreamRetry(
-            () => handleOpenAIUpstream(currentProvider, currentConfig, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal),
+            () => handleOpenAIUpstream(currentProvider, currentConfig, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal, secretEntries),
             retryOptions,
             clientSignal,
             providerName,
@@ -293,7 +303,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         error: errorMsg,
         inputContent: null,
         inputMessagesForWrite: extractOpenAIMessages(body),
-        outputContent: outputText || null,
+        /** 输出兜底脱敏：非流式转换路径的摘要提取自还原后对象，这里统一再脱敏一次，确保真实密钥不落日志 */
+        outputContent: outputText ? maskText(outputText, secretEntries) || null : null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
@@ -364,6 +375,8 @@ async function handleOpenAIUpstream(
   onStreamError?: (err: string) => void,
   onAnthropicToolCall?: (name: string, input: string) => void,
   signal?: AbortSignal,
+  /** 密钥保护条目：入站还原占位符 → 真实密钥（空数组 = 无保护，直通零开销） */
+  secrets: SecretEntry[] = [],
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -392,7 +405,7 @@ async function handleOpenAIUpstream(
         return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
       reply.hijack()
-      await streamPassthroughOpenAI(upstream.body, reply.raw, onText, onToolCall, flushToolCalls, (i, o, cr) => {
+      await streamPassthroughOpenAI(upstream.body, reply.raw, secrets, onText, onToolCall, flushToolCalls, (i, o, cr) => {
         iTokens = i
         oTokens = o
         crTokens = cr
@@ -448,7 +461,7 @@ async function handleOpenAIUpstream(
       oTokens = o
       ccTokens = cc
       crTokens = cr
-    }, onStreamError)
+    }, onStreamError, secrets)
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
@@ -473,7 +486,7 @@ async function handleOpenAIUpstream(
   const oT = anthroUsage?.output_tokens ?? 0
   const ccT = anthroUsage?.cache_creation_input_tokens ?? 0
   const crT = anthroUsage?.cache_read_input_tokens ?? 0
-  const converted = convertResponseToOpenAI(anthropicResp as unknown as import("../types.ts").AnthropicMessagesResponse)
+  const converted = convertResponseToOpenAI(restoreObjectDeep(anthropicResp, secrets) as unknown as import("../types.ts").AnthropicMessagesResponse)
   const oText = converted.choices?.[0]?.message?.content ?? ""
   reply.send(converted)
   return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
@@ -487,6 +500,7 @@ async function handleOpenAIUpstream(
 function streamPassthroughOpenAI(
   upstream: ReadableStream<Uint8Array>,
   raw: import("node:http").ServerResponse,
+  secrets: SecretEntry[],
   onText?: (text: string) => void,
   onToolCall?: (idx: number, name: string | undefined, args: string | undefined) => void,
   onEnd?: () => void,
@@ -508,6 +522,9 @@ function streamPassthroughOpenAI(
   const decoder = new TextDecoder()
   /** SSE 行缓冲区，处理跨 chunk 的行分割 */
   let sseBuffer = ""
+  /** 密钥还原器：文本/推理内容共用一个，每个工具调用独立一个（写往客户端的内容还原，日志回调仍是占位符版） */
+  const textRestorer = new StreamRestorer(secrets)
+  const toolArgsRestorers = new Map<number, StreamRestorer>()
   /** 跟踪是否收到过 usage 报告（部分 provider 不支持 stream_options） */
   let hasUsageReport = false
   /** 手动计数 output delta 块数，作为无 usage 报告时的 fallback */
@@ -548,7 +565,15 @@ function streamPassthroughOpenAI(
       const lines = sseBuffer.split("\n")
       sseBuffer = lines.pop()!
       for (const line of lines) {
-        raw.write(line + "\n")
+        /** 密钥还原：data 行中的 delta 字段做占位符 → 真实密钥替换（有保护时才解析重写） */
+        let outLine = line
+        if (line.startsWith("data:") && textRestorer.enabled) {
+          try {
+            const ro = JSON.parse(line.slice(5).trim())
+            if (rewriteOpenAIDelta(ro, textRestorer, toolArgsRestorers, secrets)) outLine = `data: ${JSON.stringify(ro)}`
+          } catch { /* 保持原行 */ }
+        }
+        raw.write(outLine + "\n")
         /** 空行 = SSE 事件结束边界，立即 flush */
         if (line === "") raw.flushHeaders()
         const dataLine = line.startsWith("data:") ? line.slice(5).trim() : ""
@@ -588,6 +613,34 @@ function streamPassthroughOpenAI(
   }
 
   return pump()
+}
+
+/** 密钥还原：改写 OpenAI 流式 chunk 中 delta 的文本字段，返回是否有修改 */
+function rewriteOpenAIDelta(obj: Record<string, unknown>, textRestorer: StreamRestorer, toolArgsRestorers: Map<number, StreamRestorer>, secrets: SecretEntry[]): boolean {
+  const choices = obj.choices as { delta?: { content?: string; reasoning_content?: string; tool_calls?: { index?: number; function?: { arguments?: string } }[] } }[] | undefined
+  const delta = choices?.[0]?.delta
+  if (!delta) return false
+  let changed = false
+  if (typeof delta.content === "string" && delta.content) {
+    const restored = textRestorer.feed(delta.content)
+    if (restored !== delta.content) { delta.content = restored; changed = true }
+  }
+  if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+    const restored = textRestorer.feed(delta.reasoning_content)
+    if (restored !== delta.reasoning_content) { delta.reasoning_content = restored; changed = true }
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls) {
+      const args = tc.function?.arguments
+      if (typeof args !== "string" || !args) continue
+      const idx = tc.index ?? 0
+      let restorer = toolArgsRestorers.get(idx)
+      if (!restorer) { restorer = new StreamRestorer(secrets); toolArgsRestorers.set(idx, restorer) }
+      const restored = restorer.feed(args)
+      if (restored !== args) { tc.function!.arguments = restored; changed = true }
+    }
+  }
+  return changed
 }
 
 /** 粗略估算 OpenAI 请求的 input token 数（chars / 4） */

@@ -10,6 +10,8 @@ import { emitEvent } from "../utils/event-bus.ts"
 import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
+import { maskAnthropicBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
+import type { SecretEntry } from "../types.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -53,6 +55,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let matchedRewriteRules: string | null = null
     /** 内容改写产生的消息级差异（JSON RewriteDiff[]） */
     let rewriteDiffs: string | null = null
+    /** 密钥保护条目（try 内加载，供出站脱敏与日志兜底脱敏） */
+    let secretEntries: SecretEntry[] = []
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -138,6 +142,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         }
       }
 
+      /** 密钥保护出站脱敏：真实密钥替换为占位符后再发给上游（日志记录的同样是脱敏后的 body） */
+      secretEntries = fastify.db.getSecrets()
+      if (secretEntries.some(sc => sc.enabled && sc.value)) {
+        maskAnthropicBody(body, secretEntries)
+      }
+
       /** 构建尝试列表：主 provider + fallbacks */
       const candidates: { provider: Provider; providerConfig: ProviderConfig; targetModel: string }[] = [
         { provider, providerConfig, targetModel: tm },
@@ -185,7 +195,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         try {
 
           const result = await withUpstreamRetry(
-            () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal),
+            () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal, secretEntries),
             retryOptions,
             clientSignal,
             providerName,
@@ -278,7 +288,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         error: errorMsg,
         inputContent: null,
         inputMessagesForWrite: extractAnthropicMessages(body),
-        outputContent: outputText || null,
+        /** 输出兜底脱敏：非流式转换路径的摘要提取自还原后对象，这里统一再脱敏一次，确保真实密钥不落日志 */
+        outputContent: outputText ? maskText(outputText, secretEntries) || null : null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
@@ -356,6 +367,8 @@ async function handleAnthropicUpstream(
   onToolCall: (name: string, input: string) => void,
   onStreamError?: (err: string) => void,
   signal?: AbortSignal,
+  /** 密钥保护条目：入站还原占位符 → 真实密钥（空数组 = 无保护，直通零开销） */
+  secrets: SecretEntry[] = [],
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -414,7 +427,7 @@ async function handleAnthropicUpstream(
         return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
       reply.hijack()
-      await streamPassthrough(upstream.body, reply.raw, onText, onToolCall, (tu) => {
+      await streamPassthrough(upstream.body, reply.raw, secrets, onText, onToolCall, (tu) => {
         iTokens = tu.inputTokens
         oTokens = tu.outputTokens
         ccTokens = tu.cacheCreationTokens
@@ -446,7 +459,7 @@ async function handleAnthropicUpstream(
     const ccT = respUsage?.cache_creation_input_tokens ?? 0
     const crT = respUsage?.cache_read_input_tokens ?? 0
     const oText = extractAnthropicResponseSummary(respBody as import("../types.ts").AnthropicMessagesResponse)
-    reply.send(respBody)
+    reply.send(restoreObjectDeep(respBody, secrets))
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
   }
 
@@ -474,7 +487,7 @@ async function handleAnthropicUpstream(
       iTokens = finalInput
       oTokens = finalOutput
       crTokens = finalCr
-    }, onStreamError)
+    }, onStreamError, secrets)
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
   }
 
@@ -495,7 +508,7 @@ async function handleAnthropicUpstream(
     return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
   }
   const converted = convertResponseToAnthropic(
-    openaiResp as unknown as import("../types.ts").OpenAIChatCompletionResponse,
+    restoreObjectDeep(openaiResp, secrets) as unknown as import("../types.ts").OpenAIChatCompletionResponse,
     body.model,
   )
   const iT = converted.usage.input_tokens
@@ -522,6 +535,7 @@ async function handleAnthropicUpstream(
 function streamPassthrough(
   upstream: ReadableStream<Uint8Array>,
   raw: import("node:http").ServerResponse,
+  secrets: SecretEntry[],
   onText?: (text: string) => void,
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (usage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }) => void,
@@ -542,6 +556,11 @@ function streamPassthrough(
   /** 工具调用累积状态 */
   let currentToolName = ""
   let currentToolArgs = ""
+  /** 密钥还原器：文本/thinking 共用一个，每个工具调用独立一个（写往客户端的内容还原，日志回调仍是占位符版） */
+  const textRestorer = new StreamRestorer(secrets)
+  let argsRestorer = new StreamRestorer(secrets)
+  /** 当前内容块类型（content_block_stop 时按块类型刷对应还原器的尾巴） */
+  const blockState: { type: string | null } = { type: null }
   /** SSE 行缓冲区，处理跨 chunk 的行分割 */
   let sseBuffer = ""
   /** token 用量累积：message_start 提供 input+cache，message_delta 覆盖为最终值 */
@@ -587,7 +606,9 @@ function streamPassthrough(
       const lines = sseBuffer.split("\n")
       sseBuffer = lines.pop()!
       for (const line of lines) {
-        raw.write(line + "\n")
+        /** 密钥还原：data 行中的 delta 文本字段做占位符 → 真实密钥替换（有保护时才解析重写） */
+        const outLines = rewriteAnthropicSSELine(line, textRestorer, argsRestorer, () => { argsRestorer = new StreamRestorer(secrets) }, blockState)
+        for (const ol of outLines) raw.write(ol + "\n")
         /** 空行 = SSE 事件结束边界，立即 flush */
         if (line === "") raw.flushHeaders()
         if (!line.startsWith("data:")) continue
@@ -641,6 +662,74 @@ function streamPassthrough(
   }
 
   return pump()
+}
+
+/**
+ * 密钥还原：对 Anthropic SSE data 行做事件级改写。
+ * - text_delta / thinking_delta：过文本还原器后重写
+ * - input_json_delta：过当前工具参数还原器后重写
+ * - content_block_start(tool_use)：重置工具参数还原器
+ * - content_block_stop：还原器尾巴以补发的 delta 事件形式刷出
+ * 返回实际要写出的行（无修改时返回原行）。
+ */
+function rewriteAnthropicSSELine(line: string, textRestorer: StreamRestorer, argsRestorer: StreamRestorer, resetArgsRestorer: () => void, blockState: { type: string | null }): string[] {
+  if (!line.startsWith("data:")) return [line]
+  if (!textRestorer.enabled) return [line]
+  let obj: Record<string, unknown>
+  try {
+    obj = JSON.parse(line.slice(5).trim()) as Record<string, unknown>
+  } catch {
+    return [line]
+  }
+  const type = obj.type
+  if (type === "content_block_start") {
+    const cb = obj.content_block as { type?: string } | undefined
+    blockState.type = cb?.type ?? null
+    if (cb?.type === "tool_use") resetArgsRestorer()
+    return [line]
+  }
+  if (type === "content_block_delta") {
+    const delta = obj.delta as { type?: string; text?: string; thinking?: string; partial_json?: string } | undefined
+    if (!delta) return [line]
+    if (delta.type === "text_delta" && typeof delta.text === "string") {
+      const restored = textRestorer.feed(delta.text)
+      if (restored === delta.text) return [line]
+      delta.text = restored
+      return [`data: ${JSON.stringify(obj)}`]
+    }
+    if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+      const restored = textRestorer.feed(delta.thinking)
+      if (restored === delta.thinking) return [line]
+      delta.thinking = restored
+      return [`data: ${JSON.stringify(obj)}`]
+    }
+    if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+      const restored = argsRestorer.feed(delta.partial_json)
+      if (restored === delta.partial_json) return [line]
+      delta.partial_json = restored
+      return [`data: ${JSON.stringify(obj)}`]
+    }
+    return [line]
+  }
+  if (type === "content_block_stop") {
+    /** 关块前刷出还原器中可能滞留的尾部（占位符被切断但最终未匹配的场景），按块类型发对应 delta */
+    const out: string[] = []
+    if (blockState.type === "tool_use") {
+      const argsTail = argsRestorer.flush()
+      if (argsTail) {
+        out.push(`data: ${JSON.stringify({ type: "content_block_delta", index: obj.index, delta: { type: "input_json_delta", partial_json: argsTail } })}`)
+      }
+    } else {
+      const textTail = textRestorer.flush()
+      if (textTail) {
+        out.push(`data: ${JSON.stringify({ type: "content_block_delta", index: obj.index, delta: blockState.type === "thinking" ? { type: "thinking_delta", thinking: textTail } : { type: "text_delta", text: textTail } })}`)
+      }
+    }
+    blockState.type = null
+    out.push(line)
+    return out
+  }
+  return [line]
 }
 
 function convertErrorToAnthropic(errorBody: string, status: number): AnthropicErrorResponse {

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify"
-import type { KeyGroup, ApiKey, ProviderConfig, RouteRule, ConditionNode, ConditionLeaf, ConditionGroup } from "../types.ts"
+import type { KeyGroup, ApiKey, ProviderConfig, RouteRule, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "../types.ts"
 import { v4 as uuid } from "uuid"
 import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
@@ -566,6 +566,57 @@ export async function adminRoutes(fastify: FastifyInstance) {
       }
       return { results }
     })
+
+  // ========== Secrets (Vault) ==========
+
+  fastify.get("/admin/secrets", async () => {
+    return fastify.db.getSecrets()
+  })
+
+  fastify.post<{ Body: { name: string; placeholder?: string; value: string; enabled?: boolean } }>("/admin/secrets", async (request, reply) => {
+    const { name, placeholder, value, enabled } = request.body
+    if (!name) return reply.status(400).send({ error: "name is required" })
+    if (!value) return reply.status(400).send({ error: "value is required" })
+    /** 占位符未指定时自动生成；指定时校验格式与唯一性 */
+    const { generatePlaceholder, isValidPlaceholder } = await import("../utils/secret-vault.ts")
+    const ph = placeholder?.trim() || generatePlaceholder()
+    if (!isValidPlaceholder(ph)) return reply.status(400).send({ error: `placeholder must match ${ph.length > 0 ? "GWKEY_ + 6-16 lowercase alphanumeric" : ""} (e.g. GWKEY_x7k2m9a2)` })
+    if (fastify.db.getSecrets().some(s => s.placeholder === ph)) return reply.status(400).send({ error: `placeholder "${ph}" already exists` })
+    /** 不允许真实值与占位符相同 */
+    if (value === ph) return reply.status(400).send({ error: "value must differ from placeholder" })
+    const secret: SecretEntry = {
+      id: uuid(),
+      name,
+      placeholder: ph,
+      value,
+      enabled: enabled !== false,
+      createdAt: new Date().toISOString(),
+    }
+    fastify.db.addSecret(secret)
+    return reply.status(201).send(secret)
+  })
+
+  fastify.put<{ Params: { id: string }; Body: Partial<SecretEntry> }>("/admin/secrets/:id", async (request, reply) => {
+    const { id } = request.params
+    const existing = fastify.db.getSecret(id)
+    if (!existing) return reply.status(404).send({ error: "Secret not found" })
+    const body = request.body
+    if (body.name !== undefined && !body.name) return reply.status(400).send({ error: "name must not be empty" })
+    if (body.placeholder !== undefined) {
+      const { isValidPlaceholder } = await import("../utils/secret-vault.ts")
+      if (!isValidPlaceholder(body.placeholder)) return reply.status(400).send({ error: "placeholder must match GWKEY_ + 6-16 lowercase alphanumeric" })
+      if (fastify.db.getSecrets().some(s => s.id !== id && s.placeholder === body.placeholder)) return reply.status(400).send({ error: `placeholder "${body.placeholder}" already exists` })
+    }
+    if (body.value !== undefined && !body.value) return reply.status(400).send({ error: "value must not be empty" })
+    fastify.db.updateSecret(id, body)
+    return fastify.db.getSecret(id)
+  })
+
+  fastify.delete<{ Params: { id: string } }>("/admin/secrets/:id", async (request, reply) => {
+    if (!fastify.db.getSecret(request.params.id)) return reply.status(404).send({ error: "Secret not found" })
+    fastify.db.deleteSecret(request.params.id)
+    return reply.status(204).send()
+  })
 
   // ========== Key Groups ==========
 

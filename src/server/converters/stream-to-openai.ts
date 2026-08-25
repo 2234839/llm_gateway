@@ -1,6 +1,7 @@
 import type { ServerResponse } from "node:http"
-import type { AnthropicSSEEvent, OpenAIFinishReason } from "../types.ts"
+import type { AnthropicSSEEvent, OpenAIFinishReason, SecretEntry } from "../types.ts"
 import { parseSSEBuffer, parseAnthropicEvent, formatSSEData, formatSSEDone, type SSEParsedEvent } from "../sse.ts"
+import { StreamRestorer } from "../utils/secret-vault.ts"
 
 /**
  * 将 Anthropic SSE 流实时转换为 OpenAI SSE 流，写入 Fastify reply.raw
@@ -13,6 +14,8 @@ export async function streamAnthropicToOpenAI(
   onToolCall?: (name: string, input: string) => void,
   onTokenUsage?: (inputTokens: number, outputTokens: number, cacheCreationTokens: number, cacheReadTokens: number) => void,
   onStreamError?: (err: string) => void,
+  /** 密钥保护：占位符 → 真实密钥（仅写往客户端的内容还原，日志回调仍是占位符版） */
+  secrets?: SecretEntry[],
 ) {
   raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -44,6 +47,10 @@ export async function streamAnthropicToOpenAI(
   const reader = upstream.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  /** 文本/thinking 流式还原器（两种块顺序输出，共用一个；块结束时 flush 后重建） */
+  let textRestorer = new StreamRestorer(secrets ?? [])
+  /** 当前工具参数还原器（每个 tool_use 块独立） */
+  let argsRestorer = new StreamRestorer(secrets ?? [])
 
   function writeChunk(delta: Record<string, unknown>, finishReason: OpenAIFinishReason = null) {
     const chunk = {
@@ -119,6 +126,7 @@ export async function streamAnthropicToOpenAI(
               const toolBlock = block as { type: "tool_use"; id: string; name: string }
               currentToolName = toolBlock.name
               currentToolArgs = ""
+              argsRestorer = new StreamRestorer(secrets ?? [])
               writeChunk({
                 tool_calls: [{
                   index: currentToolCallIndex,
@@ -139,11 +147,14 @@ export async function streamAnthropicToOpenAI(
           case "content_block_delta": {
             const delta = anthropicEvent.delta
             if (delta.type === "text_delta") {
-              writeChunk({ content: delta.text })
+              /** 写往客户端的内容做密钥还原（日志回调仍传原始占位符版） */
+              const restored = textRestorer.feed(delta.text)
+              if (restored) writeChunk({ content: restored })
               onText?.(delta.text)
             } else if (delta.type === "thinking_delta") {
               /** thinking 内容映射到 reasoning_content（DeepSeek/OpenAI reasoning 扩展） */
-              writeChunk({ reasoning_content: delta.thinking })
+              const restored = textRestorer.feed(delta.thinking)
+              if (restored) writeChunk({ reasoning_content: restored })
               onText?.(delta.thinking)
             } else if (delta.type === "signature_delta") {
               /** 保存 thinking signature，写入流供客户端回传（DeepSeek AnthropicFB 要求） */
@@ -152,12 +163,15 @@ export async function streamAnthropicToOpenAI(
             } else if (delta.type === "input_json_delta") {
               currentToolArgs += delta.partial_json
               if (currentToolCallIndex > 0) {
-                writeChunk({
-                  tool_calls: [{
-                    index: currentToolCallIndex - 1,
-                    function: { arguments: delta.partial_json },
-                  }],
-                })
+                const restored = argsRestorer.feed(delta.partial_json)
+                if (restored) {
+                  writeChunk({
+                    tool_calls: [{
+                      index: currentToolCallIndex - 1,
+                      function: { arguments: restored },
+                    }],
+                  })
+                }
               }
             }
             /** signature_delta 在 OpenAI 格式中无对应，跳过 */
@@ -169,9 +183,17 @@ export async function streamAnthropicToOpenAI(
               onToolCall?.(currentToolName, currentToolArgs)
               currentToolName = ""
               currentToolArgs = ""
+            } else if (argsRestorer.enabled) {
+              /** 非工具块结束时刷出文本还原器尾巴（占位符被切断但未匹配的场景） */
+              const tail = textRestorer.flush()
+              if (tail) writeChunk({ content: tail })
+              textRestorer = new StreamRestorer(secrets ?? [])
             }
             if (inThinkingBlock) {
               inThinkingBlock = false
+              const tail = textRestorer.flush()
+              if (tail) writeChunk({ reasoning_content: tail })
+              textRestorer = new StreamRestorer(secrets ?? [])
             }
             break
 

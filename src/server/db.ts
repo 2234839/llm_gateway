@@ -2,7 +2,7 @@ import { Database, Statement } from "bun:sqlite"
 import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, ConditionNode, ConditionLeaf, ConditionGroup } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -347,6 +347,18 @@ export class GatewayDB {
       )
     `)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_messages_hash ON log_messages(hash)`)
+
+    /** 受保护密钥表（Secret Vault：出站脱敏为占位符，入站还原） */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS secrets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        placeholder TEXT NOT NULL UNIQUE,
+        value TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `)
   }
 
   private prepareStatements() {
@@ -355,8 +367,58 @@ export class GatewayDB {
     this.stmt("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")
   }
 
-  // ========== Config ==========
+  // ========== Secrets (Vault) ==========
 
+  /** 获取受保护密钥列表 */
+  getSecrets(): SecretEntry[] {
+    const rows = this.stmt("SELECT * FROM secrets ORDER BY created_at").all() as Record<string, unknown>[]
+    return rows.map(row => ({
+      id: row.id as string,
+      name: row.name as string,
+      placeholder: row.placeholder as string,
+      value: row.value as string,
+      enabled: row.enabled !== 0,
+      createdAt: row.created_at as string,
+    }))
+  }
+
+  addSecret(secret: SecretEntry) {
+    this.stmt("INSERT INTO secrets (id, name, placeholder, value, enabled) VALUES (?, ?, ?, ?, ?)").run(
+      secret.id, secret.name, secret.placeholder, secret.value, secret.enabled !== false ? 1 : 0,
+    )
+  }
+
+  updateSecret(id: string, secret: Partial<SecretEntry>): boolean {
+    const sets: string[] = []
+    const params: unknown[] = []
+    if (secret.name !== undefined) { sets.push("name=?"); params.push(secret.name) }
+    if (secret.placeholder !== undefined) { sets.push("placeholder=?"); params.push(secret.placeholder) }
+    if (secret.value !== undefined) { sets.push("value=?"); params.push(secret.value) }
+    if (secret.enabled !== undefined) { sets.push("enabled=?"); params.push(secret.enabled !== false ? 1 : 0) }
+    if (sets.length === 0) return this.getSecret(id) !== null
+    params.push(id)
+    this.stmt(`UPDATE secrets SET ${sets.join(", ")} WHERE id=?`).run(...params)
+    return true
+  }
+
+  getSecret(id: string): SecretEntry | null {
+    const row = this.stmt("SELECT * FROM secrets WHERE id = ?").get(id) as Record<string, unknown> | null
+    if (!row) return null
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      placeholder: row.placeholder as string,
+      value: row.value as string,
+      enabled: row.enabled !== 0,
+      createdAt: row.created_at as string,
+    }
+  }
+
+  deleteSecret(id: string) {
+    this.stmt("DELETE FROM secrets WHERE id = ?").run(id)
+  }
+
+  // ========== Config ==========
   getConfig(): GatewayConfig {
     const row = this.stmt("SELECT value FROM config WHERE key = 'gateway'").get() as { value: string } | null
     if (!row) return { ...DEFAULT_CONFIG }
