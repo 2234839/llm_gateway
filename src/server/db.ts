@@ -2,7 +2,7 @@ import { Database, Statement } from "bun:sqlite"
 import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "./types.ts"
+import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, LogImage, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "./types.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -347,6 +347,32 @@ export class GatewayDB {
       )
     `)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_messages_hash ON log_messages(hash)`)
+
+    /** 消息块附带图片（内容寻址存储：同内容只存一份，hit_count 记录被多少条日志引用） */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS message_images (
+        hash TEXT PRIMARY KEY,
+        media_type TEXT NOT NULL,
+        width INTEGER NOT NULL DEFAULT 0,
+        height INTEGER NOT NULL DEFAULT 0,
+        size INTEGER NOT NULL DEFAULT 0,
+        data BLOB NOT NULL,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `)
+
+    /** 日志 ↔ 消息块图片关联（seq 对应消息块的序号，idx 区分同一条消息内的多张图） */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS log_message_images (
+        log_id INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        idx INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        PRIMARY KEY (log_id, seq, idx)
+      )
+    `)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_message_images_hash ON log_message_images(hash)`)
 
     /** 受保护密钥表（Secret Vault：出站脱敏为占位符，入站还原） */
     this.db.run(`
@@ -735,15 +761,15 @@ export class GatewayDB {
   /** 日志清理间隔 */
   private static PRUNE_INTERVAL_MS = 60_000
 
-  addLog(log: Omit<RequestLogEntry, "id" | "timestamp">) {
+  addLog(log: Omit<RequestLogEntry, "id" | "timestamp">): number | null {
     /** DB 已关闭（优雅关机期间流式请求可能仍在写入日志） */
-    if (this.closed) return
+    if (this.closed) return null
     /** 完整保留内容，数据量由 pruneLogContent / pruneOldLogs 按保留策略清理 */
     const inputContent = log.inputContent ?? null
     const outputContent = log.outputContent ?? null
     const messages = log.inputMessagesForWrite ?? []
 
-    this.tx(() => {
+    return this.tx(() => {
       const result = this.stmt(
         "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id, fallback_attempts, matched_rewrite_rules, rewrite_diffs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       ).run(
@@ -779,7 +805,50 @@ export class GatewayDB {
         `).run(hash, msg.role, msg.content, msg.content.length)
         this.stmt("INSERT INTO log_messages (log_id, seq, hash) VALUES (?, ?, ?)").run(logId, seq, hash)
       }
+      return logId
     })
+  }
+
+  /** 写入消息块图片附件：内容寻址去重 + 关联到具体日志的消息块序号（异步旁路调用，与消息块同生命周期） */
+  addMessageImages(logId: number, images: { seq: number; mediaType: string; width: number; height: number; data: Buffer }[]) {
+    if (images.length === 0) return
+    this.tx(() => {
+      for (const [idx, img] of images.entries()) {
+        const hash = createHash("sha256").update(img.data).digest("hex")
+        this.stmt(`
+          INSERT INTO message_images (hash, media_type, width, height, size, data, hit_count) VALUES (?, ?, ?, ?, ?, ?, 1)
+          ON CONFLICT(hash) DO UPDATE SET hit_count = hit_count + 1
+        `).run(hash, img.mediaType, img.width, img.height, img.data.length, img.data)
+        this.stmt("INSERT INTO log_message_images (log_id, seq, idx, hash) VALUES (?, ?, ?, ?)").run(logId, img.seq, idx, hash)
+      }
+    })
+  }
+  /** 获取单条日志所有图片的元数据（不含字节流，字节流走 getImageBytes 按需取） */
+  getLogImages(logId: number): (LogImage & { seq: number })[] {
+    const rows = this.stmt(`
+      SELECT lmi.seq AS seq, mi.hash, mi.media_type, mi.width, mi.height, mi.size
+      FROM log_message_images lmi JOIN message_images mi ON mi.hash = lmi.hash
+      WHERE lmi.log_id = ? ORDER BY lmi.seq, lmi.idx
+    `).all(logId) as Record<string, unknown>[]
+    return rows.map(r => ({
+      seq: r.seq as number,
+      hash: r.hash as string,
+      mediaType: r.media_type as string,
+      width: r.width as number,
+      height: r.height as number,
+      size: r.size as number,
+    }))
+  }
+
+  /** 获取图片字节流（校验 hash 确实关联到该日志） */
+  getImageBytes(logId: number, hash: string): { mediaType: string; data: Buffer } | null {
+    const row = this.stmt(`
+      SELECT mi.media_type, mi.data FROM log_message_images lmi
+      JOIN message_images mi ON mi.hash = lmi.hash
+      WHERE lmi.log_id = ? AND lmi.hash = ?
+    `).get(logId, hash) as Record<string, unknown> | undefined
+    if (!row) return null
+    return { mediaType: row.media_type as string, data: row.data as Buffer }
   }
 
   /** 清理超出保留数量的旧日志 content 字段 */
@@ -800,12 +869,20 @@ export class GatewayDB {
       const row = this.stmt("SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET ?").get(maxRows - 1) as { id: number } | undefined
       if (row) {
         /** 待删日志中各消息块的引用数 */
-        const refs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_messages WHERE log_id <= ? GROUP BY hash").all(row.id) as { hash: string; n: number }[]
-        for (const ref of refs) {
+        const refs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_messages WHERE log_id <= ? GROUP BY hash").all(row.id)
+        for (const ref of refs as { hash: string; n: number }[]) {
           this.stmt("UPDATE messages SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
         }
         this.stmt("DELETE FROM log_messages WHERE log_id <= ?").run(row.id)
         this.stmt("DELETE FROM messages WHERE hit_count <= 0").run()
+
+        /** 图片附件同生命周期：递减引用计数，无引用即删除字节流 */
+        const imgRefs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_message_images WHERE log_id <= ? GROUP BY hash").all(row.id)
+        for (const ref of imgRefs as { hash: string; n: number }[]) {
+          this.stmt("UPDATE message_images SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
+        }
+        this.stmt("DELETE FROM log_message_images WHERE log_id <= ?").run(row.id)
+        this.stmt("DELETE FROM message_images WHERE hit_count <= 0").run()
         this.stmt("DELETE FROM request_logs WHERE id <= ?").run(row.id)
       }
     })
@@ -900,6 +977,24 @@ export class GatewayDB {
         content: r.content as string,
         hitCount: r.hit_count as number,
       }))
+      /** 多轮对话标记：hash 在更早的日志中已出现过 → 历史上下文（本轮非新增） */
+      const earlierRows = this.stmt(`
+        SELECT lm.hash FROM log_messages lm
+        WHERE lm.log_id < ? AND lm.hash IN (${entry.inputMessages.map(() => "?").join(",")})
+        GROUP BY lm.hash
+      `).all(id, ...entry.inputMessages.map(m => m.hash)) as { hash: string }[]
+      const earlierSet = new Set(earlierRows.map(r => r.hash))
+      for (const msg of entry.inputMessages) {
+        if (earlierSet.has(msg.hash)) msg.seenBefore = true
+      }
+      /** 图片附件按 seq 挂回对应消息块 */
+      const images = this.getLogImages(id)
+      for (const img of images) {
+        const msg = entry.inputMessages[img.seq]
+        if (!msg) continue
+        if (!msg.images) msg.images = []
+        msg.images.push({ hash: img.hash, mediaType: img.mediaType, width: img.width, height: img.height, size: img.size })
+      }
       /** 兼容旧读取方：无原始 input_content 时拼接重组 */
       if (!entry.inputContent) entry.inputContent = entry.inputMessages.map(m => m.content).join("\n")
     }

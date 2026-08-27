@@ -444,6 +444,7 @@ export default {
     noTopMessages: "暂无消息统计数据",
     messageHits: "×{n} 次复用",
     messageHitsTitle: "这条消息内容在多条请求日志中被复用（内容寻址去重）",
+    historyContext: "历史上下文（{n} 条消息，更早轮次已出现）",
     keyCol: "密钥",
     yes: "是",
     no: "否",

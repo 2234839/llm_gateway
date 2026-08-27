@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify"
-import type { OpenAIChatCompletionRequest, Provider, ProviderConfig } from "../types.ts"
+import type { OpenAIChatCompletionRequest, Provider, ProviderConfig, PendingLogImage } from "../types.ts"
+import { persistLogImages } from "../utils/log-images.ts"
 import { convertRequestToAnthropic } from "../converters/to-anthropic.ts"
 import { convertResponseToOpenAI } from "../converters/resp-to-openai.ts"
 import { streamAnthropicToOpenAI } from "../converters/stream-to-openai.ts"
@@ -285,7 +286,10 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       if (fallbackAttempts.length > 0) {
         reply.header("x-gateway-fallback-attempts", fallbackAttempts.length)
       }
-      fastify.db.addLog({
+      /** 消息块提取 + 图片附件收集（写日志时一次性完成） */
+      const pendingImages: PendingLogImage[] = []
+      const extractedMessages = extractOpenAIMessages(body, pendingImages)
+      const logId = fastify.db.addLog({
         method: "POST",
         path: "/v1/chat/completions",
         model,
@@ -302,13 +306,15 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         groupId: auth?.groupId ?? null,
         error: errorMsg,
         inputContent: null,
-        inputMessagesForWrite: extractOpenAIMessages(body),
+        inputMessagesForWrite: extractedMessages,
         /** 输出兜底脱敏：非流式转换路径的摘要提取自还原后对象，这里统一再脱敏一次，确保真实密钥不落日志 */
         outputContent: outputText ? maskText(outputText, secretEntries) || null : null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
       })
+      /** 图片压缩+落库为异步旁路：不阻塞响应返回；失败让它抛出（let it crash） */
+      if (logId !== null && pendingImages.length > 0) void persistLogImages(fastify.db, logId, pendingImages)
       recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
@@ -319,7 +325,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
 }
 
 /** 提取结构化消息数组（messages + 工具描述），供日志消息块去重存储与改写 diff 对比 */
-function extractOpenAIMessages(body: OpenAIChatCompletionRequest): { role: string; content: string }[] {
+function extractOpenAIMessages(body: OpenAIChatCompletionRequest, imagesOut?: PendingLogImage[]): { role: string; content: string }[] {
   const result: { role: string; content: string }[] = []
   /** 工具声明在协议中位于 system 之后、对话消息之前，展示保持同样顺序 */
   if (Array.isArray(body.tools)) {
@@ -351,17 +357,28 @@ function extractOpenAIMessages(body: OpenAIChatCompletionRequest): { role: strin
     if (typeof msg.content === "string") {
       if (msg.content) result.push({ role: msg.role, content: msg.content })
     } else if (Array.isArray(msg.content)) {
-      const text = (msg.content as { type: string; text?: string }[])
-        .filter(p => p.type === "text" && p.text)
-        .map(p => p.text!)
-        .join("\n")
-      if (text) result.push({ role: msg.role, content: text })
+      const parts: string[] = []
+      let hasImage = false
+      for (const part of msg.content as { type: string; text?: string; image_url?: { url: string } }[]) {
+        if (part.type === "text" && part.text) {
+          parts.push(part.text)
+        } else if (part.type === "image_url" && part.image_url?.url) {
+          hasImage = true
+          /** data URL 直接取 base64；http(s) URL 只记录 URL 文本，不下载不压 */
+          const url = part.image_url.url
+          const dataUrl = url.match(/^data:(image\/[^;]+);base64,(.+)$/)
+          if (dataUrl) {
+            imagesOut?.push({ seq: result.length, mediaType: dataUrl[1]!, base64: dataUrl[2]! })
+          } else {
+            parts.push(`[image_url] ${url}`)
+          }
+        }
+      }
+      if (parts.length || hasImage) result.push({ role: msg.role, content: parts.join("\n") })
     }
   }
   return result
 }
-
-/** 处理单个 OpenAI 上游请求，返回统一的结果对象 */
 async function handleOpenAIUpstream(
   provider: Provider,
   providerConfig: ProviderConfig,

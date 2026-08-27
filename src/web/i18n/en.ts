@@ -444,6 +444,7 @@ export default {
     noTopMessages: "No message stats yet",
     messageHits: "reused ×{n}",
     messageHitsTitle: "This message content is reused across multiple request logs (content-addressed dedup)",
+    historyContext: "History context ({n} messages, seen in earlier rounds)",
     keyCol: "Key",
     yes: "Yes",
     no: "No",

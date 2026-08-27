@@ -1,6 +1,6 @@
 {
   "name": "llm-gateway",
-  "version": "0.6.8",
+  "version": "0.7.0",
   "type": "module",
   "scripts": {
     "dev": "bun run scripts/dev.ts",
@@ -18,6 +18,7 @@
     "@fastify/static": "^10.1.0",
     "chart.js": "^4.5.1",
     "fastify": "^5.10.0",
+    "jimp": "^1.6.1",
     "picomatch": "^4.0.5",
     "uuid": "^14.0.1",
     "vue": "^3.5.40"

@@ -142,11 +142,24 @@ export interface LogEntry {
   inputMessages?: LogMessageInfo[]
 }
 
+export interface LogImageInfo {
+  /** 图片内容哈希，同时用于拼取图 URL */
+  hash: string
+  mediaType: string
+  width: number
+  height: number
+  size: number
+}
+
 export interface LogMessageInfo {
   hash: string
   role: string
   content: string
   hitCount: number
+  /** 挂在该消息块上的图片附件 */
+  images?: LogImageInfo[]
+  /** 该消息块在更早的日志中已出现过（多轮对话中的历史消息，本轮非新增） */
+  seenBefore?: boolean
 }
 
 export interface TopMessageInfo extends LogMessageInfo {

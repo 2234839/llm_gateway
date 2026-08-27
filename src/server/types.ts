@@ -554,6 +554,34 @@ export interface LogMessage {
   content: string
   /** 该消息块被多少条日志引用（高频度指标） */
   hitCount: number
+  /** 挂在该消息块上的图片附件（内容寻址，通过 /admin/logs/:id/images/:hash 获取字节流） */
+  images?: LogImage[]
+  /** 该消息块在更早的日志中已出现过（多轮对话中的历史消息，本轮非新增） */
+  seenBefore?: boolean
+}
+
+/** 日志消息块附带的图片元数据 */
+export interface LogImage {
+  /** 图片内容哈希（sha256 of bytes），同时是取图 URL 的一部分 */
+  hash: string
+  /** MIME 类型（如 image/png、image/jpeg） */
+  mediaType: string
+  /** 像素宽（压缩后） */
+  width: number
+  /** 像素高（压缩后） */
+  height: number
+  /** 存储字节数 */
+  size: number
+}
+
+/** 写入侧的待处理图片附件（提取自请求中的 base64 图片，落库前可能需要压缩） */
+export interface PendingLogImage {
+  /** 所属消息在 inputMessagesForWrite 提取结果中的下标 */
+  seq: number
+  /** MIME 类型 */
+  mediaType: string
+  /** base64 编码的原始图片数据 */
+  base64: string
 }
 
 /** Token 用量统计快照 */

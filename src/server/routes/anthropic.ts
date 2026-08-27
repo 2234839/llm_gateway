@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify"
-import type { AnthropicMessagesRequest, AnthropicErrorResponse, Provider, ProviderConfig } from "../types.ts"
+import type { AnthropicMessagesRequest, AnthropicErrorResponse, Provider, ProviderConfig, PendingLogImage } from "../types.ts"
 import { convertRequestToOpenAI } from "../converters/to-openai.ts"
 import { convertResponseToAnthropic } from "../converters/resp-to-anthropic.ts"
 import { streamOpenAIToAnthropic } from "../converters/stream-to-anthropic.ts"
@@ -11,6 +11,7 @@ import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../qu
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
 import { maskAnthropicBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
+import { persistLogImages } from "../utils/log-images.ts"
 import type { SecretEntry } from "../types.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
@@ -270,7 +271,10 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       if (fallbackAttempts.length > 0) {
         reply.header("x-gateway-fallback-attempts", fallbackAttempts.length)
       }
-      fastify.db.addLog({
+      /** 消息块提取 + 图片附件收集（写日志时一次性完成） */
+      const pendingImages: PendingLogImage[] = []
+      const extractedMessages = extractAnthropicMessages(body, pendingImages)
+      const logId = fastify.db.addLog({
         method: "POST",
         path: "/v1/messages",
         model,
@@ -287,13 +291,15 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         groupId: auth?.groupId ?? null,
         error: errorMsg,
         inputContent: null,
-        inputMessagesForWrite: extractAnthropicMessages(body),
+        inputMessagesForWrite: extractedMessages,
         /** 输出兜底脱敏：非流式转换路径的摘要提取自还原后对象，这里统一再脱敏一次，确保真实密钥不落日志 */
         outputContent: outputText ? maskText(outputText, secretEntries) || null : null,
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
       })
+      /** 图片压缩+落库为异步旁路：不阻塞响应返回；失败让它抛出（let it crash） */
+      if (logId !== null && pendingImages.length > 0) void persistLogImages(fastify.db, logId, pendingImages)
       recordUsage(auth?.keyId ?? null, inputTokens + outputTokens)
       logRequestSummary({
         reqId, model, targetModel, provider: providerName, input: inputSummary,
@@ -310,8 +316,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
   })
 }
 
-/** 提取结构化消息数组（system 顶层字段 + messages + 工具描述），供日志消息块去重存储与改写 diff 对比 */
-function extractAnthropicMessages(body: AnthropicMessagesRequest): { role: string; content: string }[] {
+/** 提取结构化消息数组（system 顶层字段 + messages + tools + 图片附件），供日志消息块去重存储与改写 diff 对比 */
+function extractAnthropicMessages(body: AnthropicMessagesRequest, imagesOut?: PendingLogImage[]): { role: string; content: string }[] {
   const result: { role: string; content: string }[] = []
   const system = body.system
   if (typeof system === "string" && system) {
@@ -330,11 +336,19 @@ function extractAnthropicMessages(body: AnthropicMessagesRequest): { role: strin
     if (typeof msg.content === "string") {
       result.push({ role: msg.role, content: msg.content })
     } else if (Array.isArray(msg.content)) {
-      /** 逐块提取：text / thinking / tool_use / tool_result 都记录，忠实还原对话内容 */
+      /** 逐块提取：text/thinking/tool_use/tool_result/image 都记录，忠实还原对话内容 */
       const parts: string[] = []
-      for (const block of msg.content as { type: string; text?: string; thinking?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean }[]) {
+      let hasImage = false
+      for (const block of msg.content as { type: string; text?: string; thinking?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean; source?: { type: string; media_type?: string; data?: string; url?: string } }[]) {
         if (block.type === "text" && block.text) {
           parts.push(block.text)
+        } else if (block.type === "image" && block.source) {
+          hasImage = true
+          if (block.source.type === "base64" && block.source.media_type && block.source.data) {
+            imagesOut?.push({ seq: result.length, mediaType: block.source.media_type, base64: block.source.data })
+          } else if (block.source.type !== "base64" && block.source.url) {
+            parts.push(`[image_url] ${block.source.url}`)
+          }
         } else if (block.type === "thinking" && block.thinking) {
           parts.push(`[thinking] ${block.thinking} [/thinking]`)
         } else if (block.type === "tool_use") {
@@ -348,7 +362,7 @@ function extractAnthropicMessages(body: AnthropicMessagesRequest): { role: strin
           parts.push(`[tool_result${block.is_error ? " (error)" : ""}: ${inner}]`)
         }
       }
-      if (parts.length) result.push({ role: msg.role, content: parts.join("\n") })
+      if (parts.length || hasImage) result.push({ role: msg.role, content: parts.join("\n") })
     }
   }
   return result

@@ -760,6 +760,18 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }))
   })
 
+  /** 获取日志消息块附带的图片字节流（校验 hash 属于该日志，防止越权枚举） */
+  fastify.get<{ Params: { id: string; hash: string } }>("/admin/logs/:id/images/:hash", async (request, reply) => {
+    const id = parseInt(request.params.id, 10)
+    if (Number.isNaN(id)) return reply.status(400).send({ error: "Invalid log id" })
+    const img = fastify.db.getImageBytes(id, request.params.hash)
+    if (!img) return reply.status(404).send({ error: "Image not found" })
+    reply.header("Content-Type", img.mediaType)
+    /** 内容寻址不可变，可长缓存 */
+    reply.header("Cache-Control", "public, max-age=31536000, immutable")
+    return reply.send(img.data)
+  })
+
   /** 获取单条日志详情（包含 input/output content） */
   fastify.get<{ Params: { id: string } }>("/admin/logs/:id", async (request, reply) => {
     const id = parseInt(request.params.id, 10)

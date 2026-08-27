@@ -388,12 +388,25 @@ function toggleTools(logId: number) {
   expandedTools.value = next
 }
 
+/** 展开了历史上下文分组的日志 id 集合（默认收起，只展示本轮新增消息） */
+const expandedHistory = ref<Set<number>>(new Set())
+
+/** 切换某条日志的历史上下文分组展开状态 */
+function toggleHistory(logId: number) {
+  const next = new Set(expandedHistory.value)
+  if (next.has(logId)) next.delete(logId)
+  else next.add(logId)
+  expandedHistory.value = next
+}
+
 /** 消息视图缓存：按日志 id 缓存一次性的分组与 diff 解析结果，避免模板每张卡片重复计算（大日志会卡死页面） */
 interface MessageView {
   /** 工具声明条目（带原始序号） */
   tools: { msg: LogMessageInfo; idx: number }[]
   /** 对话消息条目（带原始序号） */
   msgs: { msg: LogMessageInfo; idx: number }[]
+  /** 历史上下文条目：更早轮次已出现过的消息（默认收起，只展示本轮新增） */
+  historyMsgs: { msg: LogMessageInfo; idx: number }[]
   /** 序号 → 改写差异 */
   diffMap: Map<number, RewriteDiffInfo>
   /** 序号 → 词级 diff 片段（懒计算，展开时才算且只算一次） */
@@ -409,11 +422,13 @@ function messageView(logId: number): MessageView {
   const view: MessageView = {
     tools: [],
     msgs: [],
+    historyMsgs: [],
     diffMap: new Map(parseRewriteDiffs(contentCache.get(logId)?.rewriteDiffs ?? null).map(d => [d.idx, d])),
     spansMap: new Map(),
   }
   source.forEach((msg, idx) => {
     if (msg.role.startsWith("tool:")) view.tools.push({ msg, idx })
+    else if (msg.seenBefore) view.historyMsgs.push({ msg, idx })
     else view.msgs.push({ msg, idx })
   })
   messageViewCache.set(logId, view)
@@ -620,6 +635,12 @@ async function copyContent(text: string) {
                             <pre v-if="isMessageExpanded(log.id, e.idx) && messageView(log.id).diffMap.has(e.idx)" class="message-content diff"><template v-for="(s, si) in diffSpans(log.id, e.idx, messageView(log.id).diffMap.get(e.idx)!)" :key="si"><span v-if="s.type === 'same'" class="diff-same">{{ s.text }}</span><span v-else-if="s.type === 'del'" class="diff-del">{{ s.text }}</span><span v-else class="diff-add">{{ s.text }}</span></template></pre>
                             <pre v-else-if="isMessageExpanded(log.id, e.idx)" class="message-content">{{ e.msg.content }}</pre>
                             <pre v-else class="message-content collapsed">{{ e.msg.content }}</pre>
+                            <!-- 图片附件 -->
+                            <div v-if="e.msg.images?.length" class="message-images">
+                              <a v-for="img in e.msg.images" :key="img.hash" :href="`/admin/logs/${log.id}/images/${img.hash}`" target="_blank">
+                                <img class="message-image-thumb" :src="`/admin/logs/${log.id}/images/${img.hash}`" loading="lazy" alt="image">
+                              </a>
+                            </div>
                           </div>
                         </template>
                       </div>
@@ -636,6 +657,38 @@ async function copyContent(text: string) {
                         <pre v-if="isMessageExpanded(log.id, e.idx) && messageView(log.id).diffMap.has(e.idx)" class="message-content diff"><template v-for="(s, si) in diffSpans(log.id, e.idx, messageView(log.id).diffMap.get(e.idx)!)" :key="si"><span v-if="s.type === 'same'" class="diff-same">{{ s.text }}</span><span v-else-if="s.type === 'del'" class="diff-del">{{ s.text }}</span><span v-else class="diff-add">{{ s.text }}</span></template></pre>
                         <pre v-else-if="isMessageExpanded(log.id, e.idx)" class="message-content">{{ e.msg.content }}</pre>
                         <pre v-else class="message-content collapsed">{{ e.msg.content }}</pre>
+                        <!-- 图片附件 -->
+                        <div v-if="e.msg.images?.length" class="message-images">
+                          <a v-for="img in e.msg.images" :key="img.hash" :href="`/admin/logs/${log.id}/images/${img.hash}`" target="_blank">
+                            <img class="message-image-thumb" :src="`/admin/logs/${log.id}/images/${img.hash}`" loading="lazy" alt="image">
+                          </a>
+                        </div>
+                      </div>
+                      <!-- 历史上下文：更早轮次已出现过的消息，默认收起 -->
+                      <div v-if="messageView(log.id).historyMsgs.length" class="tools-group">
+                        <div class="tools-group-header" @click="toggleHistory(log.id)">
+                          <span class="message-role role-other">{{ t('log.historyContext', { n: messageView(log.id).historyMsgs.length }) }}</span>
+                          <span class="message-toggle">{{ expandedHistory.has(log.id) ? '▾' : '▸' }}</span>
+                        </div>
+                        <template v-if="expandedHistory.has(log.id)">
+                          <div v-for="e in messageView(log.id).historyMsgs" :key="e.msg.hash + e.idx" class="message-card" :class="{ rewritten: messageView(log.id).diffMap.has(e.idx) }">
+                            <div class="message-header" @click="toggleMessage(log.id, e.idx)">
+                              <span class="message-role" :class="roleClass(e.msg.role)">{{ e.msg.role }}</span>
+                              <span v-if="messageView(log.id).diffMap.has(e.idx)" class="message-rewritten-badge">{{ t('log.rewritten') }}</span>
+                              <span v-if="e.msg.hitCount > 1" class="message-hits" :title="t('log.messageHitsTitle')">{{ t('log.messageHits', { n: e.msg.hitCount }) }}</span>
+                              <span class="message-size">{{ formatSize(e.msg.content.length) }}</span>
+                              <span class="message-toggle">{{ isMessageExpanded(log.id, e.idx) ? '▾' : '▸' }}</span>
+                            </div>
+                            <pre v-if="isMessageExpanded(log.id, e.idx) && messageView(log.id).diffMap.has(e.idx)" class="message-content diff"><template v-for="(s, si) in diffSpans(log.id, e.idx, messageView(log.id).diffMap.get(e.idx)!)" :key="si"><span v-if="s.type === 'same'" class="diff-same">{{ s.text }}</span><span v-else-if="s.type === 'del'" class="diff-del">{{ s.text }}</span><span v-else class="diff-add">{{ s.text }}</span></template></pre>
+                            <pre v-else-if="isMessageExpanded(log.id, e.idx)" class="message-content">{{ e.msg.content }}</pre>
+                            <pre v-else class="message-content collapsed">{{ e.msg.content }}</pre>
+                            <div v-if="e.msg.images?.length" class="message-images">
+                              <a v-for="img in e.msg.images" :key="img.hash" :href="`/admin/logs/${log.id}/images/${img.hash}`" target="_blank">
+                                <img class="message-image-thumb" :src="`/admin/logs/${log.id}/images/${img.hash}`" loading="lazy" alt="image">
+                              </a>
+                            </div>
+                          </div>
+                        </template>
                       </div>
                     </div>
                   </div>
@@ -1031,6 +1084,23 @@ th.sortable:hover {
 
 .message-size {
   color: var(--text-dim);
+}
+
+/* 消息卡片内图片附件缩略图 */
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.message-image-thumb {
+  max-width: 160px;
+  max-height: 120px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: 1px solid var(--border, #e5e7eb);
+  cursor: zoom-in;
 }
 
 .message-toggle {
