@@ -12,7 +12,8 @@ import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../qu
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
 import { maskOpenAIBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
-import type { SecretEntry } from "../types.ts"
+import { applyThinkingOverride, extractThinkingSnapshot } from "../utils/thinking-override.ts"
+import type { SecretEntry, ThinkingOverride, ThinkingLogEntry } from "../types.ts"
 
 export async function openaiRoutes(fastify: FastifyInstance) {
   /** POST /v1/chat/completions — OpenAI Chat Completions API 入口 */
@@ -53,6 +54,10 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     let rewriteDiffs: string | null = null
     /** 密钥保护条目（try 内加载，供出站脱敏与日志兜底脱敏） */
     let secretEntries: SecretEntry[] = []
+    /** 命中路由规则的思考选项改写配置（转发给上游前应用于出站体） */
+    let thinkingOverride: ThinkingOverride | undefined
+    /** 思考参数快照：入站原始值 + 出站最终值，写入请求日志 */
+    const thinkingLog: ThinkingLogEntry = { inbound: null, outbound: null, summary: null }
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -135,6 +140,9 @@ export async function openaiRoutes(fastify: FastifyInstance) {
       }
 
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
+      thinkingOverride = routeResult.routeRule?.thinkingOverride
+      /** 记录客户端原始思考参数（协议转换前的入站体） */
+      thinkingLog.inbound = extractThinkingSnapshot(body as unknown as Record<string, unknown>)
 
       /** 内容改写管道：改写前先留一份消息快照，改写后对比生成差异供日志展示 */
       {
@@ -209,7 +217,10 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         emitEvent({ type: "upstream_start", requestId: reqId, providerId, providerName: currentConfig.name })
         try {
           const result = await withUpstreamRetry(
-            () => handleOpenAIUpstream(currentProvider, currentConfig, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal, secretEntries),
+            () => handleOpenAIUpstream(currentProvider, currentConfig, currentTarget, body, isStream, reply, collectStreamText, collectStreamToolCall, flushToolCalls, setStreamError, collectAnthropicToolCall, clientSignal, secretEntries, thinkingOverride, (summary, outbound) => {
+              thinkingLog.summary = summary
+              thinkingLog.outbound = outbound
+            }),
             retryOptions,
             clientSignal,
             providerName,
@@ -312,6 +323,8 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
+        /** 思考参数快照：有入站值或发生了改写才记录 */
+        thinkingLog: (thinkingLog.inbound !== null || thinkingLog.outbound !== null) ? JSON.stringify(thinkingLog) : null,
       })
       /** 图片压缩+落库为异步旁路：不阻塞响应返回；失败让它抛出（let it crash） */
       if (logId !== null && pendingImages.length > 0) void persistLogImages(fastify.db, logId, pendingImages)
@@ -394,6 +407,10 @@ async function handleOpenAIUpstream(
   signal?: AbortSignal,
   /** 密钥保护条目：入站还原占位符 → 真实密钥（空数组 = 无保护，直通零开销） */
   secrets: SecretEntry[] = [],
+  /** 命中路由规则的思考选项改写配置（应用于出站体） */
+  thinkingOverride?: ThinkingOverride,
+  /** 思考改写生效时的回调（携带摘要与出站快照，用于日志标记） */
+  onThinkingRewrite?: (summary: string, outbound: Record<string, unknown> | null) => void,
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -411,6 +428,11 @@ async function handleOpenAIUpstream(
   const clientHeaders = extractClientHeaders(reply.request.headers, providerConfig?.allowedClientHeaders)
   if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
     /** OpenAI 兼容提供商 — 透传 */
+    /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+    const thinkingResult = applyThinkingOverride(body as unknown as Record<string, unknown>, thinkingOverride, "openai")
+    if (thinkingResult?.applied) {
+      onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(body as unknown as Record<string, unknown>))
+    }
     if (isStream) {
       const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, clientHeaders, signal)
       if (!upstream.ok) {
@@ -457,6 +479,11 @@ async function handleOpenAIUpstream(
 
   /** Anthropic 提供商 — 转换格式 */
   const anthropicBody = convertRequestToAnthropic(body, targetModel)
+  /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+  const thinkingResult = applyThinkingOverride(anthropicBody as unknown as Record<string, unknown>, thinkingOverride, "anthropic")
+  if (thinkingResult?.applied) {
+    onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(anthropicBody as unknown as Record<string, unknown>))
+  }
   const upstreamHeaders: Record<string, string> = { "anthropic-version": "2023-06-01" }
   /** 透传 User-Agent，让上游识别客户端类型 */
   const reqHeaders = reply.request.headers
@@ -601,6 +628,8 @@ function streamPassthroughOpenAI(
           hasReceivedEvent = true
           const delta = obj.choices?.[0]?.delta
           if (delta?.content) { onText?.(delta.content); outputChunks++ }
+          /** 思考内容（reasoning 扩展）同样计入输出速率，与其他流式路径保持一致 */
+          if (delta?.reasoning_content) { onText?.(delta.reasoning_content) }
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
               onToolCall?.(tc.index, tc.function?.name, tc.function?.arguments)

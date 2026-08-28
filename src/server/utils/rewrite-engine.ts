@@ -114,6 +114,9 @@ function applyAction(text: string, action: RewriteAction): string {
       return action.replacement + text
     case "append":
       return text + action.replacement
+    case "remove_tool":
+      /** 文本内容不受影响，工具移除由专门的 removeTool 逻辑处理 */
+      return text
   }
 }
 
@@ -123,6 +126,103 @@ function actionScopes(action: RewriteAction, matchConditions: RewriteMatchCondit
   const scopes = new Set<RewriteScope>(matchConditions.map(c => c.scope || "all"))
   if (scopes.size === 0) scopes.add("all")
   return scopes
+}
+
+// ========== 工具移除（remove_tool） ==========
+
+/** 供工具匹配使用的规范化视图 */
+interface NormalizedTool {
+  /** 规范化的 name，用于展示与精确匹配 */
+  readonly name: string
+  readonly description: string
+  /** 参数定义序列化后的文本 */
+  readonly schemaText: string
+}
+
+export interface RemoveToolResult {
+  removed: boolean
+  removedNames: string[]
+}
+
+/** 判断单个工具是否被 remove_tool 动作命中 */
+function toolMatchesAction(action: RewriteAction, tool: NormalizedTool): boolean {
+  const pattern = action.pattern
+  if (!pattern) return false
+  const field = action.toolField ?? "name"
+  const target = field === "name" ? tool.name : field === "description" ? tool.description : tool.schemaText
+  const mode = action.toolMatchMode ?? "exact"
+
+  if (mode === "exact") return target === pattern
+  if (mode === "contains") return target.includes(pattern)
+  const re = getCachedSafeRegex(pattern, "")
+  return re ? re.test(target) : false
+}
+
+/** 对工具列表执行一组 remove_tool 动作，返回保留的工具与被移除的工具名 */
+export function filterToolsByRemoveActions<T>(tools: T[], normalize: (tool: T) => NormalizedTool, actions: RewriteAction[]): { kept: T[]; removed: boolean; removedNames: string[] } {
+  const removedNames: string[] = []
+  const kept = tools.filter(tool => {
+    const view = normalize(tool)
+    for (const action of actions) {
+      if (action.type !== "remove_tool") continue
+      if (toolMatchesAction(action, view)) {
+        removedNames.push(view.name || "(unnamed)")
+        return false
+      }
+    }
+    return true
+  })
+  return { kept, removed: kept.length !== tools.length, removedNames }
+}
+
+/** 从原始请求 JSON 中解析出工具列表；不是合法的带工具请求则返回空数组 */
+function readRawTools(rawText: string): Record<string, unknown>[] {
+  let parsed
+  try {
+    parsed = JSON.parse(rawText)
+  } catch {
+    return []
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.tools)) return []
+  return parsed.tools.filter((item: unknown): item is Record<string, unknown> => !!item && typeof item === "object")
+}
+
+/** 从原始请求 JSON 中宽松读取单个工具的规范化视图（兼容 Anthropic 与 OpenAI 两种形态） */
+function readLooseTool(tool: Record<string, unknown>): NormalizedTool {
+  /** OpenAI 嵌套形态 */
+  const inner = typeof tool.function === "object" && tool.function !== null ? (tool.function as Record<string, unknown>) : null
+  const name = inner && typeof inner.name === "string" ? inner.name : typeof tool.name === "string" ? tool.name : ""
+  const description = inner && typeof inner.description === "string" ? inner.description : typeof tool.description === "string" ? tool.description : ""
+  const schema = inner && "parameters" in inner ? inner.parameters : "input_schema" in tool ? tool.input_schema : undefined
+  return { name, description, schemaText: JSON.stringify(schema ?? {}) }
+}
+
+/** 从日志保存的原始请求体中提取工具声明清单（用于前端勾选要移除的工具） */
+export function extractToolsFromRaw(rawText: string): { name: string; description: string }[] {
+  return readRawTools(rawText).map(readLooseTool)
+    .map(t => ({ name: t.name, description: t.description }))
+    .filter(t => !!t.name)
+}
+
+/** 对原始请求 JSON 文本执行 remove_tool 动作组（预览用），返回移除前后的工具名列表 */
+export function applyRemoveToolActionsToRaw(rawText: string, actions: RewriteAction[]): { beforeNames: string[]; afterNames: string[]; removedNames: string[] } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawText)
+  } catch {
+    return { beforeNames: [], afterNames: [], removedNames: [] }
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, unknown>).tools)) {
+    return { beforeNames: [], afterNames: [], removedNames: [] }
+  }
+  /** JSON.parse 产出的对象结构与类型定义一致，这里仅做运行时形状校验后交给通用过滤逻辑 */
+  const rawTools = ((parsed as Record<string, unknown>).tools as unknown[]).filter(
+    (item): item is Record<string, unknown> => !!item && typeof item === "object",
+  )
+  const beforeNames = rawTools.map(t => readLooseTool(t).name).filter(Boolean)
+  const { kept, removed, removedNames } = filterToolsByRemoveActions(rawTools, readLooseTool, actions)
+  const afterNames = kept.map(t => readLooseTool(t).name).filter(Boolean)
+  return { beforeNames, afterNames, removedNames: removed ? removedNames : [] }
 }
 
 // ========== 匹配条件检查 ==========
@@ -238,9 +338,31 @@ export function rewriteOpenAI(body: OpenAIChatCompletionRequest, rules: RewriteR
     const matchConditions = rule.match ?? []
     if (!matchesConditions(matchConditions, textByScope)) continue
 
-    /** 规则命中，按顺序执行动作组；只有内容实际发生变化才计入命中（避免"命中但没改任何东西"的误导） */
+    /** 规则命中，按顺序执行动作组；内容或工具列表任一实际变化才计入命中 */
     const beforeText = textByScope.all
+    let toolsRemovedByRule = false
     for (const action of rule.actions) {
+      /** remove_tool：不处理文本，直接从 body.tools 中移除匹配的工具声明 */
+      if (action.type === "remove_tool") {
+        if (Array.isArray(body.tools) && body.tools.length) {
+          const { kept, removed, removedNames } = filterToolsByRemoveActions(
+            body.tools,
+            t => ({ name: t.function?.name ?? "", description: t.function?.description ?? "", schemaText: JSON.stringify(t.function?.parameters ?? {}) }),
+            [action],
+          )
+          if (removed) {
+            body.tools = kept
+            toolsRemovedByRule = true
+            /** tool_choice 强制指定了被移除的工具，回退为 auto 避免上游报错 */
+            const choice = body.tool_choice
+            if (choice && typeof choice === "object" && choice.type === "function" && removedNames.includes(choice.function.name)) {
+              body.tool_choice = "auto"
+            }
+          }
+        }
+        continue
+      }
+
       const targetScopes = actionScopes(action, matchConditions)
       for (const msg of body.messages) {
         const role = msg.role as string
@@ -258,7 +380,7 @@ export function rewriteOpenAI(body: OpenAIChatCompletionRequest, rules: RewriteR
         }
       }
     }
-    if (extractOpenAITextByScope(body).all !== beforeText) {
+    if (toolsRemovedByRule || extractOpenAITextByScope(body).all !== beforeText) {
       result.matched = true
       result.matchedRules.push(rule.name)
     }
@@ -355,10 +477,31 @@ export function rewriteAnthropic(body: AnthropicMessagesRequest, rules: RewriteR
     const matchConditions = rule.match ?? []
     if (!matchesConditions(matchConditions, textByScope)) continue
 
-    /** 只有内容实际发生变化才计入命中（避免"命中但没改任何东西"的误导） */
+    /** 只有内容或工具列表任一实际变化才计入命中 */
     const beforeText = textByScope.all
+    let toolsRemovedByRule = false
 
     for (const action of rule.actions) {
+      /** remove_tool：不处理文本，直接从 body.tools 中移除匹配的工具声明；若 tool_choice 指向被移除的工具则回退为 auto */
+      if (action.type === "remove_tool") {
+        if (Array.isArray(body.tools) && body.tools.length) {
+          const { kept, removed, removedNames } = filterToolsByRemoveActions(
+            body.tools,
+            t => ({ name: t.name, description: t.description ?? "", schemaText: JSON.stringify(t.input_schema ?? {}) }),
+            [action],
+          )
+          if (removed) {
+            body.tools = kept
+            toolsRemovedByRule = true
+            /** tool_choice 强制指定了被移除的工具，回退为 auto 避免上游报错 */
+            if (body.tool_choice?.type === "tool" && removedNames.includes(body.tool_choice.name)) {
+              body.tool_choice = { type: "auto" }
+            }
+          }
+        }
+        continue
+      }
+
       const targetScopes = actionScopes(action, matchConditions)
 
       /** 处理顶层 system 字段 */
@@ -399,7 +542,7 @@ export function rewriteAnthropic(body: AnthropicMessagesRequest, rules: RewriteR
         }
       }
     }
-    if (extractAnthropicTextByScope(body).all !== beforeText) {
+    if (toolsRemovedByRule || extractAnthropicTextByScope(body).all !== beforeText) {
       result.matched = true
       result.matchedRules.push(rule.name)
     }

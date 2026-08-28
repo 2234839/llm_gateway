@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, defineComponent, h } from "vue"
-import { routeApi, providerApi, keyGroupApi, type RouteRuleInfo, type ProviderInfo, type KeyGroupInfo } from "../api"
+import { routeApi, providerApi, keyGroupApi, type RouteRuleInfo, type ProviderInfo, type KeyGroupInfo, type ThinkingOverrideInfo } from "../api"
 import { t } from "../i18n"
 import ConditionTree from "./ConditionTree.vue"
 
@@ -89,9 +89,47 @@ const emptyRule: Omit<RouteRuleInfo, "id"> = {
   retryQpmLimit: false,
   retryOn529: false,
   retryAllFailures: false,
+  thinkingOverride: undefined,
 }
 
 const form = ref({ ...emptyRule })
+
+/** 思考改写是否启用（控制 thinkingOverride 对象的存在性，未启用时不下发该字段） */
+const thinkingEnabled = ref(false)
+/** 思考强度档位，空字符串表示不改写 */
+const thinkingEffort = ref("")
+/** 思考开关三态：""=不干预, "on"=强制开, "off"=强制关 */
+const thinkingEnabledState = ref("")
+/** 思考预算 token 数，空字符串表示不改写 */
+const thinkingBudget = ref("")
+/** 彻底移除思考字段 */
+const thinkingStrip = ref(false)
+/** 改写模式：override=网关配置永远覆盖，default=仅客户端未传时注入 */
+const thinkingMode = ref<"override" | "default">("override")
+
+/** 将表单中的思考改写 UI 状态组装为 thinkingOverride 对象（未启用或无实质配置时返回 undefined） */
+function buildThinkingOverride(): ThinkingOverrideInfo | undefined {
+  if (!thinkingEnabled.value) return undefined
+  const o: ThinkingOverrideInfo = { mode: thinkingMode.value }
+  if (thinkingStrip.value) return { mode: thinkingMode.value, strip: true }
+  if (thinkingEffort.value) o.effort = thinkingEffort.value as ThinkingOverrideInfo["effort"]
+  if (thinkingEnabledState.value === "on") o.enabled = true
+  else if (thinkingEnabledState.value === "off") o.enabled = false
+  const budget = parseInt(thinkingBudget.value, 10)
+  if (!Number.isNaN(budget) && budget > 0) o.budgetTokens = budget
+  if (o.effort === undefined && o.enabled === undefined && o.budgetTokens === undefined) return undefined
+  return o
+}
+
+/** 将已有规则的 thinkingOverride 拆解到表单 UI 状态 */
+function loadThinkingOverride(o: ThinkingOverrideInfo | undefined) {
+  thinkingEnabled.value = !!o
+  thinkingMode.value = o?.mode ?? "override"
+  thinkingStrip.value = o?.strip ?? false
+  thinkingEffort.value = o?.effort ?? ""
+  thinkingEnabledState.value = o?.enabled === true ? "on" : o?.enabled === false ? "off" : ""
+  thinkingBudget.value = o?.budgetTokens !== undefined ? String(o.budgetTokens) : ""
+}
 
 /** 选中的服务商下可用的模型列表 */
 const providerModels = computed(() => {
@@ -119,6 +157,7 @@ function startCreate() {
   editingId.value = null
   creating.value = true
   form.value = { ...emptyRule, keyGroups: [], fallbacks: [], modelMapping: {}, retryQpmLimit: false, retryOn529: false, retryAllFailures: false, fallbackOnClientError: false }
+  loadThinkingOverride(undefined)
   syncMappingFromForm()
 }
 
@@ -139,6 +178,7 @@ function startEdit(rule: RouteRuleInfo) {
     retryOn529: rule.retryOn529 ?? false,
     retryAllFailures: rule.retryAllFailures ?? false,
   }
+  loadThinkingOverride(rule.thinkingOverride)
   syncMappingFromForm()
 }
 
@@ -165,6 +205,8 @@ async function save() {
   if (!data.retryQpmLimit) data.retryQpmLimit = undefined
   if (!data.retryOn529) data.retryOn529 = undefined
   if (!data.retryAllFailures) data.retryAllFailures = undefined
+  /** 思考改写：由 UI 状态组装，未启用或无实质配置时显式置空（编辑场景下清除旧配置） */
+  data.thinkingOverride = buildThinkingOverride()
   error.value = ""
   saving.value = true
   try {
@@ -525,6 +567,61 @@ function syncMappingToForm() {
             {{ t('route.retryAllFailuresHint') }}
           </label>
         </div>
+
+        <!-- 思考选项改写 -->
+        <div class="match-section">
+          <div class="section-label">{{ t('route.thinkingOverrideLabel') }}</div>
+          <p class="section-hint">{{ t('route.thinkingOverrideHint') }}</p>
+
+          <label class="checkbox-label" style="margin-bottom: 10px">
+            <input type="checkbox" v-model="thinkingEnabled" />
+            {{ t('route.thinkingOverrideEnable') }}
+          </label>
+
+          <template v-if="thinkingEnabled">
+            <div class="thinking-config">
+              <div class="condition-row">
+                <span class="inline-label">{{ t('route.thinkingMode') }}</span>
+                <select v-model="thinkingMode" class="cond-type">
+                  <option value="override">{{ t('route.thinkingModeOverride') }}</option>
+                  <option value="default">{{ t('route.thinkingModeDefault') }}</option>
+                </select>
+              </div>
+
+              <label class="checkbox-label condition-row">
+                <input type="checkbox" v-model="thinkingStrip" />
+                {{ t('route.thinkingStrip') }}
+              </label>
+
+              <template v-if="!thinkingStrip">
+                <div class="condition-row">
+                  <span class="inline-label">{{ t('route.thinkingEffort') }}</span>
+                  <select v-model="thinkingEffort" class="cond-type" :disabled="thinkingEnabledState === 'off'">
+                    <option value="">{{ t('route.thinkingKeepOriginal') }}</option>
+                    <option value="minimal">minimal</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="max">max</option>
+                  </select>
+                </div>
+                <div class="condition-row">
+                  <span class="inline-label">{{ t('route.thinkingEnabled') }}</span>
+                  <select v-model="thinkingEnabledState" class="cond-type">
+                    <option value="">{{ t('route.thinkingKeepOriginal') }}</option>
+                    <option value="on">{{ t('route.thinkingEnabledOn') }}</option>
+                    <option value="off">{{ t('route.thinkingEnabledOff') }}</option>
+                  </select>
+                </div>
+                <div class="condition-row">
+                  <span class="inline-label">{{ t('route.thinkingBudget') }}</span>
+                  <input v-model="thinkingBudget" type="number" min="1" :placeholder="t('route.thinkingKeepOriginal')" class="cond-pattern thinking-budget-input" :disabled="thinkingEnabledState === 'off'" />
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
         <div class="form-actions">
           <button class="btn btn-primary" @click="save" :disabled="saving">{{ saving ? '...' : t('route.save') }}</button>
           <button class="btn" @click="cancel">{{ t('route.cancel') }}</button>
@@ -630,6 +727,28 @@ function syncMappingToForm() {
 
 .condition-row.indented {
   margin-left: 24px;
+}
+
+/** 思考改写区块内联字段标签 */
+.inline-label {
+  font-size: 13px;
+  color: var(--text-dim);
+  min-width: 110px;
+  flex-shrink: 0;
+}
+
+/** 思考改写子配置容器：统一缩进与分组边框，与开关主体区分层级 */
+.thinking-config {
+  margin: 2px 0 4px 24px;
+  padding: 10px 12px 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+/** 思考预算输入框固定宽度，避免拉伸撑破行布局 */
+.thinking-budget-input {
+  max-width: 160px;
 }
 
 .checkbox-label {

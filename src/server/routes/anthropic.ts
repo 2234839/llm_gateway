@@ -12,7 +12,8 @@ import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
 import { maskAnthropicBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
 import { persistLogImages } from "../utils/log-images.ts"
-import type { SecretEntry } from "../types.ts"
+import { applyThinkingOverride, extractThinkingSnapshot } from "../utils/thinking-override.ts"
+import type { SecretEntry, ThinkingOverride, ThinkingLogEntry } from "../types.ts"
 
 export async function anthropicRoutes(fastify: FastifyInstance) {
   /** POST /v1/messages — Anthropic Messages API 入口 */
@@ -58,6 +59,10 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     let rewriteDiffs: string | null = null
     /** 密钥保护条目（try 内加载，供出站脱敏与日志兜底脱敏） */
     let secretEntries: SecretEntry[] = []
+    /** 命中路由规则的思考选项改写配置（转发给上游前应用于出站体） */
+    let thinkingOverride: ThinkingOverride | undefined
+    /** 思考参数快照：入站原始值 + 出站最终值，写入请求日志 */
+    const thinkingLog: ThinkingLogEntry = { inbound: null, outbound: null, summary: null }
     /** fallback 中间尝试记录 */
     const fallbackAttempts: { providerId: string; providerName: string; targetModel: string; statusCode: number; error: string }[] = []
     const isStream = body.stream ?? false
@@ -124,6 +129,9 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
       }
 
       const { provider, targetModel: tm, providerConfig, rulePattern, fallbacks, fallbackOnClientError } = routeResult
+      thinkingOverride = routeResult.routeRule?.thinkingOverride
+      /** 记录客户端原始思考参数（协议转换前的入站体） */
+      thinkingLog.inbound = extractThinkingSnapshot(body as unknown as Record<string, unknown>)
 
       /** 内容改写管道：改写前先留一份消息快照，改写后对比生成差异供日志展示 */
       {
@@ -196,7 +204,10 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         try {
 
           const result = await withUpstreamRetry(
-            () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal, secretEntries),
+            () => handleAnthropicUpstream(currentProvider, currentTarget, currentConfig, body, isStream, upstreamHeaders, reply, collectStreamText, collectStreamToolCall, setStreamError, clientSignal, secretEntries, thinkingOverride, (summary, outbound) => {
+              thinkingLog.summary = summary
+              thinkingLog.outbound = outbound
+            }),
             retryOptions,
             clientSignal,
             providerName,
@@ -297,6 +308,8 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         fallbackAttempts: fallbackAttempts.length > 0 ? JSON.stringify(fallbackAttempts) : null,
         matchedRewriteRules,
         rewriteDiffs,
+        /** 思考参数快照：有入站值或发生了改写才记录 */
+        thinkingLog: (thinkingLog.inbound !== null || thinkingLog.outbound !== null) ? JSON.stringify(thinkingLog) : null,
       })
       /** 图片压缩+落库为异步旁路：不阻塞响应返回；失败让它抛出（let it crash） */
       if (logId !== null && pendingImages.length > 0) void persistLogImages(fastify.db, logId, pendingImages)
@@ -383,6 +396,10 @@ async function handleAnthropicUpstream(
   signal?: AbortSignal,
   /** 密钥保护条目：入站还原占位符 → 真实密钥（空数组 = 无保护，直通零开销） */
   secrets: SecretEntry[] = [],
+  /** 命中路由规则的思考选项改写配置（应用于出站体） */
+  thinkingOverride?: ThinkingOverride,
+  /** 思考改写生效时的回调（携带摘要与出站快照，用于日志标记） */
+  onThinkingRewrite?: (summary: string, outbound: Record<string, unknown> | null) => void,
 ): Promise<{
   ok: boolean
   statusCode: number
@@ -423,6 +440,12 @@ async function handleAnthropicUpstream(
       if (!hasContent) {
         delete sendBody.system
       }
+    }
+
+    /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+    const thinkingResult = applyThinkingOverride(sendBody, thinkingOverride, "anthropic")
+    if (thinkingResult?.applied) {
+      onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(sendBody))
     }
 
     /** Anthropic 直连 — 透传 */
@@ -479,6 +502,11 @@ async function handleAnthropicUpstream(
 
   /** 非 Anthropic 提供商 — 转换格式 */
   const openaiBody = convertRequestToOpenAI(body, targetModel, { flattenMidSystem: providerConfig.flattenMidSystem })
+  /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+  const thinkingResult = applyThinkingOverride(openaiBody as unknown as Record<string, unknown>, thinkingOverride, "openai")
+  if (thinkingResult?.applied) {
+    onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(openaiBody as unknown as Record<string, unknown>))
+  }
 
   if (isStream) {
     const upstream = await provider.sendStreamRequest(openaiBody as unknown as Record<string, unknown>, {}, signal)

@@ -279,6 +279,12 @@ export class GatewayDB {
     try {
       this.db.run("ALTER TABLE request_logs ADD COLUMN fallback_attempts TEXT DEFAULT NULL")
     } catch { /* 列已存在 */ }
+    try {
+      this.db.run("ALTER TABLE route_rules ADD COLUMN thinking_override TEXT DEFAULT NULL")
+    } catch { /* 列已存在 */ }
+    try {
+      this.db.run("ALTER TABLE request_logs ADD COLUMN thinking_log TEXT DEFAULT NULL")
+    } catch { /* 列已存在 */ }
     /** 复合索引：加速配额查询中的时间范围 + 密钥/分组条件 */
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_ts_apikey ON request_logs(timestamp, api_key_id)`)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_logs_ts_group ON request_logs(timestamp, group_id)`)
@@ -556,8 +562,8 @@ export class GatewayDB {
 
   addRouteRule(rule: RouteRule) {
     this.stmt(
-      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks, fallback_on_client_error, retry_qpm_limit, retry_on_529, retry_all_failures) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.fallbackOnClientError ? 1 : 0, rule.retryQpmLimit ? 1 : 0, rule.retryOn529 ? 1 : 0, rule.retryAllFailures ? 1 : 0)
+      "INSERT INTO route_rules (id, pattern, provider_id, model_mapping, priority, content_match, match_conditions, target_model, enabled, exclude_match, key_groups, fallbacks, fallback_on_client_error, retry_qpm_limit, retry_on_529, retry_all_failures, thinking_override) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(rule.id, this.extractModelPattern(rule.matchConditions) ?? "", rule.providerId, JSON.stringify(rule.modelMapping ?? {}), rule.priority, null, rule.matchConditions ? JSON.stringify(rule.matchConditions) : null, rule.targetModel ?? null, rule.enabled !== false ? 1 : 0, rule.excludeMatch ? JSON.stringify(rule.excludeMatch) : null, rule.keyGroups ? JSON.stringify(rule.keyGroups) : null, rule.fallbacks ? JSON.stringify(rule.fallbacks) : null, rule.fallbackOnClientError ? 1 : 0, rule.retryQpmLimit ? 1 : 0, rule.retryOn529 ? 1 : 0, rule.retryAllFailures ? 1 : 0, rule.thinkingOverride ? JSON.stringify(rule.thinkingOverride) : null)
   }
 
   updateRouteRule(id: string, rule: Partial<RouteRule>): boolean {
@@ -568,8 +574,8 @@ export class GatewayDB {
       const updated = { ...existing, ...rule, id }
       const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
-        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, fallback_on_client_error=?, retry_qpm_limit=?, retry_on_529=?, retry_all_failures=? WHERE id=?"
-      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.fallbackOnClientError ? 1 : 0, updated.retryQpmLimit ? 1 : 0, updated.retryOn529 ? 1 : 0, updated.retryAllFailures ? 1 : 0, id)
+        "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, fallback_on_client_error=?, retry_qpm_limit=?, retry_on_529=?, retry_all_failures=?, thinking_override=? WHERE id=?"
+      ).run(modelPattern, updated.providerId, JSON.stringify(updated.modelMapping ?? {}), updated.priority, null, updated.matchConditions ? JSON.stringify(updated.matchConditions) : null, updated.targetModel ?? null, updated.enabled !== false ? 1 : 0, updated.excludeMatch ? JSON.stringify(updated.excludeMatch) : null, updated.keyGroups ? JSON.stringify(updated.keyGroups) : null, updated.fallbacks ? JSON.stringify(updated.fallbacks) : null, updated.fallbackOnClientError ? 1 : 0, updated.retryQpmLimit ? 1 : 0, updated.retryOn529 ? 1 : 0, updated.retryAllFailures ? 1 : 0, updated.thinkingOverride ? JSON.stringify(updated.thinkingOverride) : null, id)
       return true
     })
   }
@@ -618,6 +624,7 @@ export class GatewayDB {
       retryAllFailures: (row.retry_all_failures as number) === 1 || undefined,
       fallbacks: row.fallbacks ? JSON.parse(row.fallbacks as string) : undefined,
       fallbackOnClientError: row.fallback_on_client_error === 1,
+      thinkingOverride: row.thinking_override ? JSON.parse(row.thinking_override as string) : undefined,
     }
   }
 
@@ -771,7 +778,7 @@ export class GatewayDB {
 
     return this.tx(() => {
       const result = this.stmt(
-        "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id, fallback_attempts, matched_rewrite_rules, rewrite_diffs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO request_logs (method, path, model, provider_id, target_model, stream, status_code, duration_ms, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, error, input_content, output_content, api_key_id, group_id, fallback_attempts, matched_rewrite_rules, rewrite_diffs, thinking_log) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       ).run(
         log.method,
         log.path,
@@ -793,6 +800,7 @@ export class GatewayDB {
         log.fallbackAttempts ?? null,
         log.matchedRewriteRules ?? null,
         log.rewriteDiffs ?? null,
+        log.thinkingLog ?? null,
       )
       const logId = Number(result.lastInsertRowid)
 
@@ -1087,6 +1095,7 @@ export class GatewayDB {
       fallbackAttempts: (row.fallback_attempts as string) || null,
       matchedRewriteRules: (row.matched_rewrite_rules as string) || null,
       rewriteDiffs: (row.rewrite_diffs as string) || null,
+      thinkingLog: (row.thinking_log as string) || null,
     }
   }
 

@@ -75,6 +75,20 @@ export interface RouteFallback {
   targetModel?: string
 }
 
+/** 思考选项改写配置（与服务端 ThinkingOverride 对齐） */
+export interface ThinkingOverrideInfo {
+  /** override（默认）：网关配置永远覆盖客户端；default：仅客户端未传思考参数时注入 */
+  mode?: "override" | "default"
+  /** 思考强度档位 */
+  effort?: "minimal" | "low" | "medium" | "high" | "max"
+  /** 强制开启/关闭思考 */
+  enabled?: boolean
+  /** 覆盖 thinking.budget_tokens（仅 Anthropic 协议出站体生效） */
+  budgetTokens?: number
+  /** 彻底移除出站体中所有思考相关字段 */
+  strip?: boolean
+}
+
 export interface RouteRuleInfo {
   id: string
   providerId: string
@@ -100,6 +114,8 @@ export interface RouteRuleInfo {
   fallbacks?: RouteFallback[]
   /** 客户端错误（4xx）也触发故障转移，默认仅 5xx/429/408 触发 */
   fallbackOnClientError?: boolean
+  /** 思考选项改写：在协议转换后、发往上游前覆盖/移除请求中的思考相关参数 */
+  thinkingOverride?: ThinkingOverrideInfo
 }
 
 /** Token 用量统计 */
@@ -138,6 +154,8 @@ export interface LogEntry {
   matchedRewriteRules: string | null
   /** 内容改写实际产生的消息级差异（带快照序号），JSON 数组；未改写时为 null */
   rewriteDiffs: string | null
+  /** 思考参数快照（JSON）：{ inbound, outbound, summary }，记录改写前后思考参数；无任何思考参数时为 null */
+  thinkingLog: string | null
   /** 结构化输入消息（消息块去重存储重组），旧日志为空 */
   inputMessages?: LogMessageInfo[]
 }
@@ -355,17 +373,33 @@ export interface RewriteMatchCondition {
   scope?: "all" | "system" | "user" | "assistant"
 }
 
-export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append"
+export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append" | "remove_tool"
+
+/** remove_tool 动作匹配的工具字段 */
+export type ToolMatchField = "name" | "description" | "input_schema"
+
+/** remove_tool 动作的匹配方式 */
+export type ToolMatchMode = "exact" | "contains" | "regex"
 
 export interface RewriteAction {
   /** 用户自定义的动作备注名，可选 */
   name?: string
   type: RewriteActionType
   replacement: string
-  /** regex_replace 时的正则模式；text_replace 时的纯文本查找内容 */
+  /** regex_replace 时的正则模式；text_replace 时的纯文本查找内容；remove_tool 时为工具匹配值 */
   pattern?: string
   flags?: string
   scope?: "all" | "system" | "user" | "assistant"
+  /** remove_tool 时匹配的工具字段，默认 name */
+  toolField?: ToolMatchField
+  /** remove_tool 的匹配方式，默认 exact */
+  toolMatchMode?: ToolMatchMode
+}
+
+/** 日志请求体中的工具声明 */
+export interface LogToolInfo {
+  name: string
+  description: string
 }
 
 export interface RewriteRuleInfo {
@@ -410,6 +444,8 @@ export const rewriteApi = {
   delete: (id: string) => api<void>(`/admin/rewrite-rules/${id}`, { method: "DELETE" }),
   preview: (data: { ruleId?: string; rule?: Partial<RewriteRuleInfo>; logIds: number[] }) =>
     api<{ results: RewritePreviewItem[] }>("/admin/rewrite-rules/preview", { method: "POST", body: JSON.stringify(data) }),
+  /** 提取某条日志请求体中的工具声明清单 */
+  logTools: (logId: number) => api<{ model: string; path: string; tools: LogToolInfo[] }>(`/admin/logs/${logId}/tools`),
 }
 
 export interface SecretInfo {
@@ -538,6 +574,12 @@ export interface SseConcurrencyEvent {
   outputRate: number
 }
 
+/** 输出速率秒级更新：只刷新折线最后一列的值，不新增柱子 */
+export interface SseOutputRateEvent {
+  type: "output_rate"
+  rate: number
+}
+
 export interface SseRequestStartEvent {
   type: "request_start"
   requestId: string
@@ -597,6 +639,7 @@ export type SseEvent =
   | SseConnectedEvent
   | SseConcurrencyHistoryEvent
   | SseConcurrencyEvent
+  | SseOutputRateEvent
   | SseRequestStartEvent
   | SseRequestStreamEvent
   | SseUpstreamStartEvent

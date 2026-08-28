@@ -392,6 +392,8 @@ export interface RouteRule {
   fallbacks?: RouteFallback[]
   /** 客户端错误（4xx）也触发故障转移，默认仅 5xx/429/408 触发 */
   fallbackOnClientError?: boolean
+  /** 思考选项改写：在协议转换后、发往上游前覆盖/移除请求中的思考相关参数 */
+  thinkingOverride?: ThinkingOverride
 }
 
 /** 路由规则的故障转移备选 */
@@ -401,11 +403,39 @@ export interface RouteFallback {
   targetModel?: string
 }
 
+/**
+ * 思考选项改写：在协议转换后、发往上游前，对出站请求体中的思考相关参数做统一改写
+ * 涉及的协议字段：Anthropic 的 thinking / output_config.effort，OpenAI 的 thinking / reasoning_effort
+ * 字段优先级：strip > enabled:false > 其余字段
+ */
+export interface ThinkingOverride {
+  /**
+   * 改写模式：
+   * - override（默认）：网关配置永远覆盖客户端传入的思考参数
+   * - default：仅当客户端未传任何思考参数（thinking/reasoning_effort/output_config 均不存在）时才注入
+   */
+  mode?: "override" | "default"
+  /** 思考强度档位，覆盖 reasoning_effort / output_config.effort */
+  effort?: "minimal" | "low" | "medium" | "high" | "max"
+  /** 强制开启/关闭思考（thinking.type），false 时忽略 effort 与 budgetTokens */
+  enabled?: boolean
+  /** 覆盖 thinking.budget_tokens（仅 Anthropic 协议出站体生效），设置时会强制开启思考 */
+  budgetTokens?: number
+  /** 彻底移除出站体中所有思考相关字段，忽略其余配置 */
+  strip?: boolean
+}
+
 /** 内容改写规则的消息作用范围 */
 export type RewriteScope = "all" | "system" | "user" | "assistant"
 
 /** 内容改写动作类型 */
-export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append"
+export type RewriteActionType = "regex_replace" | "text_replace" | "prepend" | "append" | "remove_tool"
+
+/** remove_tool 动作匹配的工具字段 */
+export type ToolMatchField = "name" | "description" | "input_schema"
+
+/** remove_tool 动作的匹配方式 */
+export type ToolMatchMode = "exact" | "contains" | "regex"
 
 /** 内容改写的匹配条件 */
 export interface RewriteMatchCondition {
@@ -435,6 +465,10 @@ export interface RewriteAction {
   flags?: string
   /** 动作作用范围：限定处理的消息角色，不填则使用 match 条件涉及的 scopes */
   scope?: RewriteScope
+  /** remove_tool 时匹配的工具字段，默认 name */
+  toolField?: ToolMatchField
+  /** remove_tool 的匹配方式，默认 exact（精确匹配） */
+  toolMatchMode?: ToolMatchMode
 }
 
 /** 内容改写规则 */
@@ -530,6 +564,18 @@ export interface RequestLogEntry {
   matchedRewriteRules?: string | null
   /** 内容改写实际产生的消息级差异，JSON 数组 RewriteDiff；未改写时为 null */
   rewriteDiffs?: string | null
+  /** 思考参数快照（JSON ThinkingLogEntry）：记录改写前后的思考相关参数，未配置改写时仅记录入站值 */
+  thinkingLog?: string | null
+}
+
+/** 日志中的思考参数快照：入站（客户端原始）与出站（发往上游最终）对照 */
+export interface ThinkingLogEntry {
+  /** 客户端原始请求中的思考参数（协议字段原样保留） */
+  inbound: Record<string, unknown> | null
+  /** 改写后实际发往上游的思考参数；未发生改写时为 null */
+  outbound: Record<string, unknown> | null
+  /** 改写摘要（如 "effort=low, thinking=disabled"）；未改写时为 null */
+  summary: string | null
 }
 
 /** 单条消息的内容改写差异（改写前/后快照对比） */

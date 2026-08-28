@@ -228,7 +228,7 @@ function statusClass(code: number): string {
 
 /** 按需加载的 content 缓存：logId -> { inputContent, outputContent }，最多保留 30 条 */
 const MAX_CONTENT_CACHE = 30
-const contentCache = new Map<number, { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null }>()
+const contentCache = new Map<number, { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null; thinkingLog?: string | null }>()
 /** 正在加载的 log id 集合 */
 const loadingContent = ref<Set<number>>(new Set())
 
@@ -243,7 +243,7 @@ async function toggleExpand(id: number) {
     loadingContent.value = new Set([...loadingContent.value, id])
     try {
       const detail = await logApi.detail(id)
-      contentCache.set(id, { inputContent: detail.inputContent, outputContent: detail.outputContent, inputMessages: detail.inputMessages, rewriteDiffs: detail.rewriteDiffs })
+      contentCache.set(id, { inputContent: detail.inputContent, outputContent: detail.outputContent, inputMessages: detail.inputMessages, rewriteDiffs: detail.rewriteDiffs, thinkingLog: detail.thinkingLog })
       messageViewCache.delete(id)
       /** 淘汰最旧的缓存条目 */
       if (contentCache.size > MAX_CONTENT_CACHE) {
@@ -259,8 +259,34 @@ async function toggleExpand(id: number) {
 }
 
 /** 获取缓存的 content */
-function getContent(id: number): { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null } {
+function getContent(id: number): { inputContent: string | null; outputContent: string | null; inputMessages?: LogMessageInfo[]; rewriteDiffs?: string | null; thinkingLog?: string | null } {
   return contentCache.get(id) ?? { inputContent: null, outputContent: null }
+}
+
+/** 解析思考参数快照（日志存储的 JSON 字符串） */
+interface ThinkingLogInfo {
+  inbound: Record<string, unknown> | null
+  outbound: Record<string, unknown> | null
+  summary: string | null
+}
+function parseThinkingLog(raw: string | null | undefined): ThinkingLogInfo | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (typeof parsed !== "object" || parsed === null) return null
+    return parsed as ThinkingLogInfo
+  } catch {
+    return null
+  }
+}
+
+/** 展开了思考参数面板的日志 id 集合（默认折叠） */
+const expandedThinking = ref<Set<number>>(new Set())
+function toggleThinking(logId: number) {
+  const next = new Set(expandedThinking.value)
+  if (next.has(logId)) next.delete(logId)
+  else next.add(logId)
+  expandedThinking.value = next
 }
 
 /** 高频消息面板 */
@@ -611,6 +637,26 @@ async function copyContent(text: string) {
                     <div class="rewrite-rule-tags">
                       <span v-for="name in parseMatchedRewrites(log.matchedRewriteRules)" :key="name" class="rewrite-rule-tag">{{ name }}</span>
                     </div>
+                  </div>
+                  <!-- 思考参数快照：默认折叠，展开可见改写前后的完整参数 -->
+                  <div v-if="parseThinkingLog(getContent(log.id).thinkingLog)" class="content-block">
+                    <div class="thinking-header" @click="toggleThinking(log.id)">
+                      <div class="content-label" style="margin: 0">{{ t('log.thinkingParams') }}</div>
+                      <span v-if="parseThinkingLog(getContent(log.id).thinkingLog)!.summary" class="thinking-summary">{{ parseThinkingLog(getContent(log.id).thinkingLog)!.summary }}</span>
+                      <span class="message-toggle">{{ expandedThinking.has(log.id) ? '▾' : '▸' }}</span>
+                    </div>
+                    <template v-if="expandedThinking.has(log.id)">
+                      <div class="thinking-panels">
+                        <div class="thinking-panel">
+                          <div class="thinking-panel-label">{{ t('log.thinkingInbound') }}</div>
+                          <pre class="content-text">{{ JSON.stringify(parseThinkingLog(getContent(log.id).thinkingLog)!.inbound ?? {}, null, 2) }}</pre>
+                        </div>
+                        <div class="thinking-panel">
+                          <div class="thinking-panel-label">{{ parseThinkingLog(getContent(log.id).thinkingLog)!.outbound ? t('log.thinkingOutbound') : t('log.thinkingOutboundUnchanged') }}</div>
+                          <pre class="content-text">{{ JSON.stringify(parseThinkingLog(getContent(log.id).thinkingLog)!.outbound ?? parseThinkingLog(getContent(log.id).thinkingLog)!.inbound ?? {}, null, 2) }}</pre>
+                        </div>
+                      </div>
+                    </template>
                   </div>
                   <!-- 改写差异：Git diff 式词级高亮，内联在对应消息卡片上（数据来自按需加载的日志详情） -->
                   <!-- 输入：消息数组渲染（消息块去重存储） -->
@@ -993,6 +1039,45 @@ th.sortable:hover {
   cursor: pointer;
   background: var(--bg-soft, rgba(0, 0, 0, 0.03));
   user-select: none;
+}
+
+/** 思考参数面板：头部可点击折叠 */
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/** 改写摘要徽标 */
+.thinking-summary {
+  font-size: 12px;
+  color: var(--primary, #6366f1);
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+  padding: 1px 8px;
+  border-radius: 4px;
+  font-family: monospace;
+}
+
+/** 思考参数双栏：入站 / 出站对照 */
+.thinking-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.thinking-panel-label {
+  font-size: 12px;
+  color: var(--text-dim, #888);
+  margin-bottom: 4px;
+}
+
+@media (max-width: 700px) {
+  .thinking-panels {
+    grid-template-columns: 1fr;
+  }
 }
 
 .tools-group .message-card {

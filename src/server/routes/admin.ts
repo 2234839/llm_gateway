@@ -537,6 +537,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
       return { success: true }
     })
 
+    /** 提取某条日志请求体中的工具声明清单（用于勾选要移除的工具） */
+    fastify.get<{ Params: { id: number } }>("/admin/logs/:id/tools", async (request, reply) => {
+      const log = fastify.db.getLogDetail(request.params.id)
+      if (!log || !log.inputContent) return reply.status(404).send({ error: "Log not found or no content" })
+      const { extractToolsFromRaw } = await import("../utils/rewrite-engine")
+      return { model: log.model, path: log.path, tools: extractToolsFromRaw(log.inputContent) }
+    })
+
     fastify.post<{ Body: { ruleId?: string; rule?: Partial<import("../types").RewriteRule>; logIds: number[] } }>("/admin/rewrite-rules/preview", async (request, reply) => {
       const { ruleId, rule: tempRule, logIds } = request.body
       if (!logIds?.length) return reply.status(400).send({ error: "logIds is required" })
@@ -553,7 +561,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: "ruleId or rule is required" })
       }
 
-      const { rewriteTextWithSteps } = await import("../utils/rewrite-engine")
+      const { rewriteTextWithSteps, applyRemoveToolActionsToRaw } = await import("../utils/rewrite-engine")
       const results = []
       for (const logId of logIds) {
         const log = fastify.db.getLogDetail(logId)
@@ -562,7 +570,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
           continue
         }
         const { result: rr, steps, rewritten } = rewriteTextWithSteps(log.inputContent, rules, { path: log.path, model: log.model })
-        results.push({ logId, model: log.model, path: log.path, original: log.inputContent, rewritten, matched: rr.matched, matchedRules: rr.matchedRules, steps })
+
+        /** remove_tool 不作用于文本，单独针对日志请求体里的工具声明做预览：一条规则汇总为一个步骤 */
+        let matched = rr.matched
+        const matchedRules = [...rr.matchedRules]
+        for (const rule of rules) {
+          const removeActions = rule.actions.filter(a => a.type === "remove_tool")
+          if (!removeActions.length) continue
+          const { beforeNames, afterNames, removedNames } = applyRemoveToolActionsToRaw(log.inputContent, removeActions)
+          if (!removedNames.length) continue
+          matched = true
+          if (!matchedRules.includes(rule.name)) matchedRules.push(rule.name)
+          steps.push({
+            ruleName: rule.name,
+            actionName: `${removedNames.join(", ")}`,
+            before: beforeNames.join("\n"),
+            after: afterNames.join("\n"),
+          })
+        }
+
+        results.push({ logId, model: log.model, path: log.path, original: log.inputContent, rewritten, matched, matchedRules, steps })
       }
       return { results }
     })
@@ -1113,14 +1140,16 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return Math.round(smoothedRate)
   }
 
-  /** 记录当前并发快照到环形缓冲区 */
+
+  /** 当前输出速率，由秒级速率循环维护；快照与并发推送只读该值 */
+  let latestRate = 0
+
   function recordSnapshot() {
     const now = new Date()
     const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
     const providers = fastify.registry.getConcurrencyStatus()
     const gatewayCounts = countActiveByProvider()
     const upstreamCounts = countUpstreamByProvider()
-    const outputRate = calcOutputRate()
     concurrencySnapshots.push({
       time,
       providers: providers.map(p => ({
@@ -1130,10 +1159,29 @@ export async function adminRoutes(fastify: FastifyInstance) {
         gateway: gatewayCounts.get(p.id) ?? 0,
         upstream: upstreamCounts.get(p.id) ?? 0,
       })),
-      outputRate,
+      outputRate: latestRate,
     })
     if (concurrencySnapshots.length > maxSnapshots) concurrencySnapshots.shift()
   }
+
+  /** 秒级输出速率循环：流式输出期间实时计算 EMA 速率推给前端折线；输出停止后衰减归零。不产生新快照、不加柱子 */
+  let lastSentRate = -1
+  const rateTicker = setInterval(() => {
+    if (windowOutputChars > 0) {
+      latestRate = calcOutputRate()
+    } else if (latestRate > 0) {
+      latestRate *= EMA_DECAY
+      if (latestRate < 0.5) latestRate = 0
+    }
+    const rounded = Math.round(latestRate)
+    if (rounded === lastSentRate) return
+    lastSentRate = rounded
+    const data = `data: ${JSON.stringify({ type: "output_rate", rate: rounded })}\n\n`
+    for (const write of concurrencyWriters) {
+      try { write(data) } catch { /* connection already closed */ }
+    }
+  }, 1000)
+  rateTicker.unref()
 
   /** request_stats 推送防抖：避免每个请求结束都触发 4 个聚合查询 */
   let statsTimer: ReturnType<typeof setTimeout> | null = null
@@ -1182,7 +1230,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         upstream: upstreamCounts.get(p.id) ?? 0,
         models: [...(modelMap.get(p.id)?.values() ?? [])],
       })),
-      outputRate: smoothedRate,
+      outputRate: latestRate,
     }
   }
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from "vue"
-import { rewriteApi, logApi, type RewriteRuleInfo, type RewritePreviewItem, type RewritePreviewStep, type LogEntry } from "../api"
+import { rewriteApi, logApi, type RewriteRuleInfo, type RewriteAction, type RewritePreviewItem, type RewritePreviewStep, type LogEntry, type LogToolInfo } from "../api"
 import { t } from "../i18n"
 import { diffWords } from "../utils/diff"
 
@@ -69,6 +69,8 @@ function cancel() {
   creating.value = false
   previewResults.value = []
   showLogSelector.value = false
+  showToolPicker.value = false
+  pickedLogTools.value = []
 }
 
 async function save() {
@@ -164,8 +166,61 @@ function addAction() {
   form.value.actions.push({ type: "regex_replace", replacement: "" })
 }
 
+/** 新建一个 remove_tool 动作 */
+function addRemoveToolAction() {
+  if (!form.value.actions) form.value.actions = []
+  form.value.actions.push({ type: "remove_tool", replacement: "", toolField: "name", toolMatchMode: "exact" })
+}
+
 function removeAction(index: number) {
   form.value.actions?.splice(index, 1)
+}
+
+/** 从日志勾选工具：选中某条日志 → 列出其中的工具声明 → 勾选生成 exact 匹配的 remove_tool 动作 */
+const showToolPicker = ref(false)
+const toolPickerLogs = ref<LogEntry[]>([])
+const toolPickerLoading = ref(false)
+const pickedLogTools = ref<LogToolInfo[]>([])
+const checkedToolNames = ref<Set<string>>(new Set())
+const toolSearch = ref("")
+
+async function openToolPicker() {
+  showToolPicker.value = true
+  try {
+    toolPickerLogs.value = await logApi.list({ limit: 20, sort: "time_desc" })
+  } catch { /* silent */ }
+}
+
+async function loadLogTools(logId: number) {
+  toolPickerLoading.value = true
+  try {
+    const resp = await rewriteApi.logTools(logId)
+    pickedLogTools.value = resp.tools
+    checkedToolNames.value = new Set()
+    toolSearch.value = ""
+    if (!resp.tools.length) error.value = t('rewrites.noToolsInLog')
+  } catch { /* silent */ }
+  toolPickerLoading.value = false
+}
+
+const filteredLogTools = computed(() => {
+  if (!toolSearch.value) return pickedLogTools.value
+  const q = toolSearch.value.toLowerCase()
+  return pickedLogTools.value.filter(t => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q))
+})
+
+function toggleToolChecked(name: string) {
+  if (checkedToolNames.value.has(name)) checkedToolNames.value.delete(name)
+  else checkedToolNames.value.add(name)
+}
+
+function confirmAddRemoveActions() {
+  for (const name of checkedToolNames.value) {
+    form.value.actions.push({ type: "remove_tool", replacement: "", toolField: "name", toolMatchMode: "exact", pattern: name, name })
+  }
+  checkedToolNames.value = new Set()
+  pickedLogTools.value = []
+  showToolPicker.value = false
 }
 
 /** 日志预览 */
@@ -267,8 +322,16 @@ function actionTag(type: string): string {
     text_replace: t('rewrites.actionTagTextReplace'),
     prepend: t('rewrites.actionTagPrepend'),
     append: t('rewrites.actionTagAppend'),
+    remove_tool: t('rewrites.actionTagRemoveTool'),
   }
   return map[type] ?? type
+}
+
+/** remove_tool 动作的规则列表描述文本 */
+function removeToolDetail(act: RewriteAction): string {
+  const fieldMap: Record<string, string> = { name: t('rewrites.toolFieldName'), description: t('rewrites.toolFieldDescription'), input_schema: t('rewrites.toolFieldSchema') }
+  const modeMap: Record<string, string> = { exact: "", contains: `${t('rewrites.modeContains')} · `, regex: `${t('rewrites.modeRegex')} · ` }
+  return `${fieldMap[act.toolField ?? "name"]} · ${modeMap[act.toolMatchMode ?? "exact"]}${act.pattern || ""}`
 }
 
 function formatTime(ts: string): string {
@@ -331,7 +394,8 @@ function formatTime(ts: string): string {
               <div v-for="(act, ai) in rule.actions" :key="ai" class="action-line">
                 <span class="action-tag" :class="'action-' + act.type">{{ actionTag(act.type) }}</span>
                 <span v-if="act.name" class="action-name">{{ act.name }}</span>
-                <span v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="action-detail">
+                <span v-if="act.type === 'remove_tool'" class="action-detail">{{ removeToolDetail(act) }}</span>
+                <span v-else-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="action-detail">
                   "{{ act.pattern || '' }}" → "{{ act.replacement }}"
                 </span>
                 <span v-else class="action-detail">"{{ act.replacement.slice(0, 50) }}{{ act.replacement.length > 50 ? '...' : '' }}"</span>
@@ -459,6 +523,7 @@ function formatTime(ts: string): string {
                   <option value="text_replace">{{ t('rewrites.actionTextReplace') }}</option>
                   <option value="prepend">{{ t('rewrites.actionPrepend') }}</option>
                   <option value="append">{{ t('rewrites.actionAppend') }}</option>
+                  <option value="remove_tool">{{ t('rewrites.actionRemoveTool') }}</option>
                 </select>
               </label>
               <label>
@@ -473,8 +538,42 @@ function formatTime(ts: string): string {
               </label>
             </div>
 
+            <!-- remove_tool：工具匹配配置 -->
+            <template v-if="act.type === 'remove_tool'">
+              <div class="condition-row">
+                <label>
+                  {{ t('rewrites.toolFieldLabel') }}
+                  <select v-model="act.toolField" class="cond-type">
+                    <option value="name">{{ t('rewrites.toolFieldName') }}</option>
+                    <option value="description">{{ t('rewrites.toolFieldDescription') }}</option>
+                    <option value="input_schema">{{ t('rewrites.toolFieldSchema') }}</option>
+                  </select>
+                </label>
+                <label>
+                  {{ t('rewrites.matchModeLabel') }}
+                  <select v-model="act.toolMatchMode" class="cond-type">
+                    <option value="exact">{{ t('rewrites.modeExact') }}</option>
+                    <option value="contains">{{ t('rewrites.modeContains') }}</option>
+                    <option value="regex">{{ t('rewrites.modeRegex') }}</option>
+                  </select>
+                </label>
+              </div>
+              <div class="condition-row" style="align-items: flex-start">
+                <label style="flex: 1">
+                  {{ t('rewrites.toolPatternLabel') }}
+                  <input
+                    v-model="act.pattern"
+                    :placeholder="act.toolMatchMode === 'exact' ? t('rewrites.toolExactPlaceholder') : act.toolMatchMode === 'contains' ? t('rewrites.toolContainsPlaceholder') : t('rewrites.toolRegexPlaceholder')"
+                    class="cond-pattern"
+                  />
+                </label>
+                <button v-if="i === form.actions.length - 1" class="btn-sm" type="button" @click="openToolPicker">{{ t('rewrites.pickFromLog') }}</button>
+              </div>
+              <p class="action-hint">{{ t('rewrites.removeToolHint') }}</p>
+            </template>
+
             <!-- 替换类动作的查找内容 -->
-            <div v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="condition-row" style="align-items: flex-start">
+            <div v-else-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="condition-row" style="align-items: flex-start">
               <label style="flex: 1">
                 {{ act.type === 'text_replace' ? t('rewrites.actionFindText') : t('rewrites.actionFindRegex') }}
                 <textarea v-model="act.pattern" :placeholder="act.type === 'text_replace' ? t('rewrites.actionFindTextPlaceholder') : t('rewrites.actionFindRegexPlaceholder')" class="find-textarea" rows="2"></textarea>
@@ -490,7 +589,7 @@ function formatTime(ts: string): string {
             </div>
 
             <!-- 替换/注入内容 -->
-            <div class="condition-row" style="align-items: flex-start">
+            <div v-if="act.type !== 'remove_tool'" class="condition-row" style="align-items: flex-start">
               <label style="flex: 1">
                 {{ t('rewrites.replacement') }}
                 <textarea v-model="act.replacement" :placeholder="t('rewrites.replacementPlaceholder')" class="replacement-textarea" rows="3"></textarea>
@@ -499,7 +598,49 @@ function formatTime(ts: string): string {
             <p v-if="act.type === 'regex_replace' || act.type === 'text_replace'" class="action-hint">{{ t('rewrites.emptyReplacementHint') }}</p>
           </div>
 
-          <button class="btn-sm" type="button" @click="addAction" style="margin-left: 24px">{{ t('rewrites.addAction') }}</button>
+          <div style="margin-left: 24px; display: flex; gap: 8px">
+            <button class="btn-sm" type="button" @click="addAction">{{ t('rewrites.addAction') }}</button>
+            <button class="btn-sm" type="button" @click="openToolPicker">{{ t('rewrites.pickToolsFromLog') }}</button>
+          </div>
+
+          <!-- 从日志勾选工具弹层 -->
+          <div v-if="showToolPicker" class="log-selector tool-picker">
+            <template v-if="!pickedLogTools.length">
+              <div class="log-selector-header">
+                <strong>{{ t('rewrites.pickToolsFromLog') }}</strong>
+                <span class="selected-count">{{ t('rewrites.chooseLogFirst') }}</span>
+              </div>
+              <div class="log-selector-list">
+                <label v-for="log in toolPickerLogs" :key="log.id" class="log-item" @click.prevent="loadLogTools(log.id)">
+                  <span class="log-model">{{ log.model }}</span>
+                  <span class="log-time">{{ formatTime(log.timestamp) }}</span>
+                  <span class="log-path">{{ log.path }}</span>
+                  <span :class="['log-status', log.statusCode >= 400 ? 'error' : 'ok']">{{ log.statusCode }}</span>
+                </label>
+                <div v-if="!toolPickerLogs.length" class="empty">{{ t('rewrites.noContent') }}</div>
+              </div>
+            </template>
+            <template v-else>
+              <div class="log-selector-header">
+                <input v-model="toolSearch" :placeholder="t('rewrites.toolSearchPlaceholder')" class="cond-pattern tool-search" />
+                <button class="btn-sm" @click="pickedLogTools = []">{{ t('rewrites.backToLogs') }}</button>
+              </div>
+              <div class="log-selector-list">
+                <label v-for="tool in filteredLogTools" :key="tool.name" class="log-item tool-item" :class="{ selected: checkedToolNames.has(tool.name) }">
+                  <input type="checkbox" :checked="checkedToolNames.has(tool.name)" @change="toggleToolChecked(tool.name)" />
+                  <span class="tool-name">{{ tool.name }}</span>
+                  <span class="tool-desc">{{ tool.description.slice(0, 80) }}{{ tool.description.length > 80 ? '...' : '' }}</span>
+                </label>
+                <div v-if="!filteredLogTools.length" class="empty">{{ t('rewrites.noToolsInLog') }}</div>
+              </div>
+              <div class="log-selector-actions">
+                <button class="btn-sm btn-primary-sm" :disabled="!checkedToolNames.size" @click="confirmAddRemoveActions">
+                  {{ t('rewrites.addRemoveActions', { n: checkedToolNames.size }) }}
+                </button>
+                <button class="btn-sm" @click="showToolPicker = false">{{ t('rewrites.cancel') }}</button>
+              </div>
+            </template>
+          </div>
         </div>
 
         <!-- 预览区 -->
@@ -1020,6 +1161,41 @@ tr.disabled {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+/** 从日志勾选工具 */
+.tool-picker {
+  margin-left: 24px;
+  width: calc(100% - 24px);
+}
+
+.tool-search {
+  flex: 1;
+}
+
+.tool-picker .btn-primary-sm {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.tool-name {
+  font-weight: 600;
+  font-family: monospace;
+  font-size: 11px;
+  min-width: 180px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-desc {
+  color: var(--text-dim);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /** 预览结果 */

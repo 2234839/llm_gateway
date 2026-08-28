@@ -514,7 +514,8 @@ function renderConcurrencyChart() {
     borderWidth: 2,
     borderDash: [4, 2],
     yAxisID: "y1",
-    order: 0,
+    /** Chart.js 中 order 越小越后绘制、越在上层；需小于柱状图的 2 才能浮在柱子上方 */
+    order: 1,
   } as never)
 
   chartInstance.data.labels = historyLabels
@@ -599,6 +600,12 @@ function connectSSE() {
     } else if (event.type === "concurrency") {
       providerConcurrency.value = event.providers
       appendChartPoint(event.outputRate)
+    } else if (event.type === "output_rate") {
+      /** 原位更新最后一列的速率值：折线实时移动，但不新增柱子 */
+      if (outputRateHistory.length) {
+        outputRateHistory[outputRateHistory.length - 1] = event.rate
+        renderConcurrencyChart()
+      }
     } else if (event.type === "request_start") {
       liveRequests.value.set(event.requestId, {
         requestId: event.requestId,
