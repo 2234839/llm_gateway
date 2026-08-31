@@ -7,6 +7,7 @@ import RewriteRules from "./components/RewriteRules.vue"
 import SecretVault from "./components/SecretVault.vue"
 import ApiKeyList from "./components/ApiKeyList.vue"
 import RequestLog from "./components/RequestLog.vue"
+import SlowQueries from "./components/SlowQueries.vue"
 import { t, currentLocale, setLocale } from "./i18n"
 import { initApi, configApi, authApi, ApiAuthError, setOnAuthError } from "./api"
 import type { GatewayConfigInfo, CorsConfigInfo } from "./api"
@@ -126,7 +127,7 @@ function toggleLocale() {
   setLocale(currentLocale.value === "zh" ? "en" : "zh")
 }
 
-const tabKeys = ["dashboard", "providers", "routes", "rewrites", "vault", "keys", "logs"]
+const tabKeys = ["dashboard", "providers", "routes", "rewrites", "vault", "keys", "logs", "slowqueries"]
 
 /** 启动时判断状态 */
 onMounted(async () => {
@@ -450,6 +451,7 @@ async function handleChangePassword() {
         <SecretVault v-else-if="activeTab === 'vault'" />
         <ApiKeyList v-else-if="activeTab === 'keys'" />
         <RequestLog v-else-if="activeTab === 'logs'" />
+        <SlowQueries v-else-if="activeTab === 'slowqueries'" />
       </KeepAlive>
     </main>
   </div>

@@ -635,6 +635,16 @@ export interface SseRequestStatsEvent {
   tokensByModel?: { model: string; targetModel: string; total: TokenStats; today: TokenStats }[]
 }
 
+/** 慢 SQL 告警事件 */
+export interface SseSlowQueryEvent {
+  type: "slow_query"
+  id: number
+  at: string
+  sql: string
+  params: string
+  durationMs: number
+}
+
 export type SseEvent =
   | SseConnectedEvent
   | SseConcurrencyHistoryEvent
@@ -646,3 +656,4 @@ export type SseEvent =
   | SseUpstreamEndEvent
   | SseRequestEndEvent
   | SseRequestStatsEvent
+  | SseSlowQueryEvent
