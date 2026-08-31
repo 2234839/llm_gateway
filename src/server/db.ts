@@ -353,6 +353,8 @@ export class GatewayDB {
       )
     `)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_messages_hash ON log_messages(hash)`)
+    /** pruneOldLogs 按 log_id 范围扫描依赖此索引，否则每轮全表扫描数百万行 */
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_log_messages_log_id ON log_messages(log_id)`)
 
     /** 消息块附带图片（内容寻址存储：同内容只存一份，hit_count 记录被多少条日志引用） */
     this.db.run(`
@@ -859,40 +861,54 @@ export class GatewayDB {
     return { mediaType: row.media_type as string, data: row.data as Buffer }
   }
 
-  /** 清理超出保留数量的旧日志 content 字段 */
+  /** 清理超出保留数量的旧日志 content 字段（按上次水位增量执行，避免每轮重复扫描已清理行） */
   private pruneLogContent() {
     const retention = Math.max(1, Math.floor(Number(this.getConfig().logContentRetention ?? 1000)))
     this.tx(() => {
       const row = this.stmt("SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET ?").get(retention - 1) as { id: number } | undefined
-      if (row) {
-        this.stmt("UPDATE request_logs SET input_content = NULL, output_content = NULL WHERE id <= ? AND (input_content IS NOT NULL OR output_content IS NOT NULL)").run(row.id)
+      if (row && row.id > this.contentPruneWatermark) {
+        this.stmt("UPDATE request_logs SET input_content = NULL, output_content = NULL WHERE id > ? AND id <= ? AND (input_content IS NOT NULL OR output_content IS NOT NULL)").run(this.contentPruneWatermark, row.id)
+        this.contentPruneWatermark = row.id
       }
     })
   }
 
-  /** 删除超量旧日志行，保留最近 maxLogRows 条；同时维护消息块引用计数并清理无引用块 */
+  /** content 清理水位：已置空到该 log_id（含），下轮只处理其后新增的行 */
+  private contentPruneWatermark = 0
+
+  /** 日志删除水位：已删除到该 log_id（含），下轮只处理增量，避免全量重算引用计数 */
+  private logPruneWatermark = 0
+
+  /** 删除超量旧日志行，保留最近 maxLogRows 条；按水位增量维护消息块引用计数并清理无引用块 */
   private pruneOldLogs() {
     const maxRows = Math.max(1000, this.getConfig().maxLogRows ?? 100000)
     this.tx(() => {
       const row = this.stmt("SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET ?").get(maxRows - 1) as { id: number } | undefined
-      if (row) {
-        /** 待删日志中各消息块的引用数 */
-        const refs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_messages WHERE log_id <= ? GROUP BY hash").all(row.id)
-        for (const ref of refs as { hash: string; n: number }[]) {
-          this.stmt("UPDATE messages SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
-        }
-        this.stmt("DELETE FROM log_messages WHERE log_id <= ?").run(row.id)
-        this.stmt("DELETE FROM messages WHERE hit_count <= 0").run()
+      /** 无需删除，或水位未推进（retention 配置调大后不回滚已删数据） */
+      if (!row || row.id <= this.logPruneWatermark) return
 
-        /** 图片附件同生命周期：递减引用计数，无引用即删除字节流 */
-        const imgRefs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_message_images WHERE log_id <= ? GROUP BY hash").all(row.id)
-        for (const ref of imgRefs as { hash: string; n: number }[]) {
-          this.stmt("UPDATE message_images SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
-        }
-        this.stmt("DELETE FROM log_message_images WHERE log_id <= ?").run(row.id)
-        this.stmt("DELETE FROM message_images WHERE hit_count <= 0").run()
-        this.stmt("DELETE FROM request_logs WHERE id <= ?").run(row.id)
+      /** 本次增量删除区间：上次水位之后到新边界，索引范围扫描代替全表 GROUP BY */
+      const upto = row.id
+      const since = this.logPruneWatermark
+
+      /** 待删日志中各消息块的引用数（log_id 索引范围扫描） */
+      const refs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_messages WHERE log_id > ? AND log_id <= ? GROUP BY hash").all(since, upto)
+      for (const ref of refs as { hash: string; n: number }[]) {
+        this.stmt("UPDATE messages SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
       }
+      this.stmt("DELETE FROM log_messages WHERE log_id > ? AND log_id <= ?").run(since, upto)
+      this.stmt("DELETE FROM messages WHERE hit_count <= 0").run()
+
+      /** 图片附件同生命周期：递减引用计数，无引用即删除字节流 */
+      const imgRefs = this.stmt("SELECT hash, COUNT(*) AS n FROM log_message_images WHERE log_id > ? AND log_id <= ? GROUP BY hash").all(since, upto)
+      for (const ref of imgRefs as { hash: string; n: number }[]) {
+        this.stmt("UPDATE message_images SET hit_count = hit_count - ? WHERE hash = ?").run(ref.n, ref.hash)
+      }
+      this.stmt("DELETE FROM log_message_images WHERE log_id > ? AND log_id <= ?").run(since, upto)
+      this.stmt("DELETE FROM message_images WHERE hit_count <= 0").run()
+      this.stmt("DELETE FROM request_logs WHERE id > ? AND id <= ?").run(since, upto)
+
+      this.logPruneWatermark = upto
     })
   }
 
