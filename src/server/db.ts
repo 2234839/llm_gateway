@@ -1001,15 +1001,12 @@ export class GatewayDB {
         content: r.content as string,
         hitCount: r.hit_count as number,
       }))
-      /** 多轮对话标记：hash 在更早的日志中已出现过 → 历史上下文（本轮非新增） */
-      const earlierRows = this.stmt(`
-        SELECT lm.hash FROM log_messages lm
-        WHERE lm.log_id < ? AND lm.hash IN (${entry.inputMessages.map(() => "?").join(",")})
-        GROUP BY lm.hash
-      `).all(id, ...entry.inputMessages.map(m => m.hash)) as { hash: string }[]
-      const earlierSet = new Set(earlierRows.map(r => r.hash))
+      /** 多轮对话标记：hash 在更早的日志中已出现过 → 历史上下文（本轮非新增）。
+       *  索引为 (hash, log_id) 复合序：按 hash 定位后 log_id 有序，LIMIT 1 直接命中最早一条，
+       *  代替旧的 hash IN (...) GROUP BY（会把每个 hash 的全部历史行扫出来，热 hash 被数万日志引用，实测 3766ms）*/
+      const seenStmt = this.stmt("SELECT 1 FROM log_messages WHERE hash = ? AND log_id < ? LIMIT 1")
       for (const msg of entry.inputMessages) {
-        if (earlierSet.has(msg.hash)) msg.seenBefore = true
+        if (seenStmt.get(msg.hash, id)) msg.seenBefore = true
       }
       /** 图片附件按 seq 挂回对应消息块 */
       const images = this.getLogImages(id)
