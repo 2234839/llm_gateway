@@ -524,6 +524,8 @@ export interface GatewayConfig {
   logContentRetention: number
   /** 日志行数上限，超出后删除最旧的记录，默认 100000 */
   maxLogRows: number
+  /** 慢 SQL 阈值（ms），超过则记录到 slow_query_log 并告警，默认 100 */
+  slowSqlThresholdMs?: number
   /** 是否要求 API 请求必须携带有效 Key */
   authRequired: boolean
   /** CORS 跨域配置，undefined 时使用默认值（允许所有来源） */

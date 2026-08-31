@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { ProviderConfig, RouteRule, GatewayConfig, RequestLogEntry, TokenStats, KeyGroup, ApiKey, CurlQueryConfig, RewriteRule, RewriteAction, RewriteMatchCondition, LogMessage, LogImage, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "./types.ts"
+import { SlowQueryMonitor } from "./utils/slow-query.ts"
 
 const DEFAULT_CORS: import("./types.ts").CorsConfig = {
   origin: true,
@@ -24,6 +25,8 @@ export class GatewayDB {
   private db: Database
   private stmtCache: Map<string, Statement> = new Map()
   private closed = false
+  /** 慢 SQL 监控：阈值从配置动态读取（track 时刻读，避免配置变更后需同步两份状态） */
+  readonly slowQueryMonitor: SlowQueryMonitor
 
   constructor(dbPath: string) {
     /** 自动创建数据库父目录，避免 release 版本直接运行时因缺少 data/ 目录而崩溃 */
@@ -33,18 +36,63 @@ export class GatewayDB {
     this.db.run("PRAGMA synchronous=NORMAL")
     this.db.run("PRAGMA foreign_keys = ON")
     this.db.run("PRAGMA busy_timeout = 5000")
+    /** 先建表再建 monitor：monitor 持久化依赖 slow_query_log 表 */
     this.initTables()
+    this.slowQueryMonitor = new SlowQueryMonitor(this, () => this.getSlowSqlThreshold())
     this.prepareStatements()
     /** 定时清理日志，避免 addLog 热路径中做概率触发 */
     setInterval(() => {
       this.pruneLogContent()
       this.pruneOldLogs()
+      this.pruneSlowQueryLog()
     }, GatewayDB.PRUNE_INTERVAL_MS).unref()
+  }
+
+  /** 慢 SQL 阈值（ms）：从 gateway 配置读，默认 100，动态生效。
+   *  必须绕开监控包装直读 DB：getConfig 走 stmt 包装会经 track → getSlowSqlThreshold 无限递归 */
+  getSlowSqlThreshold(): number {
+    try {
+      const row = this.db.prepare("SELECT value FROM config WHERE key = 'gateway'").get() as { value: string } | null
+      if (!row) return 100
+      return (JSON.parse(row.value).slowSqlThresholdMs as number | undefined) ?? 100
+    } catch {
+      return 100
+    }
+  }
+
+  /** 持久化一条慢查询记录，返回插入 id */
+  runSlowQueryLog(r: { at: string; sql: string; params: string; durationMs: number }): number {
+    const result = this.db.prepare("INSERT INTO slow_query_log (at, sql, params, duration_ms) VALUES (?, ?, ?, ?)").run(r.at, r.sql, r.params, r.durationMs)
+    return Number(result.lastInsertRowid)
+  }
+
+  /** 查询慢 SQL 日志（最新的在前） */
+  getSlowQueryLog(limit = 100): { id: number; at: string; sql: string; params: string; durationMs: number }[] {
+    const rows = this.db.prepare("SELECT id, at, sql, params, duration_ms FROM slow_query_log ORDER BY id DESC LIMIT ?").all(limit) as Record<string, unknown>[]
+    return rows.map(row => ({
+      id: row.id as number,
+      at: row.at as string,
+      sql: row.sql as string,
+      params: row.params as string,
+      durationMs: row.duration_ms as number,
+    }))
+  }
+
+  /** 慢 SQL 日志保留条数上限，超出删除最旧记录 */
+  private pruneSlowQueryLog() {
+    const retention = 500
+    const row = this.db.prepare("SELECT id FROM slow_query_log ORDER BY id DESC LIMIT 1 OFFSET ?").get(retention - 1) as { id: number } | undefined
+    if (row) this.db.prepare("DELETE FROM slow_query_log WHERE id <= ?").run(row.id)
   }
 
   private static MAX_STMT_CACHE = 100
 
+  /** SQL -> 监控包装语句缓存（与 stmtCache 同生命周期，避免热路径重复分配包装对象） */
+  private wrappedCache: Map<string, { get: (...p: unknown[]) => unknown; all: (...p: unknown[]) => unknown; run: (...p: unknown[]) => unknown }> = new Map()
+
   private stmt(sql: string): Statement {
+    const cachedWrap = this.wrappedCache.get(sql)
+    if (cachedWrap) return cachedWrap as unknown as Statement
     let s = this.stmtCache.get(sql)
     if (!s) {
       if (this.stmtCache.size >= GatewayDB.MAX_STMT_CACHE) {
@@ -58,7 +106,16 @@ export class GatewayDB {
       s = this.db.prepare(sql)
       this.stmtCache.set(sql, s)
     }
-    return s
+    const monitor = this.slowQueryMonitor
+    const stmt = s!
+      /** 监控包装：耗时超阈值的执行被记录 + 告警；阈值内仅多两次 performance.now() 调用 */
+    const wrapped = {
+      get: (...params: unknown[]) => monitor.track(sql, params, () => stmt.get(...(params as never[]))),
+      all: (...params: unknown[]) => monitor.track(sql, params, () => stmt.all(...(params as never[]))),
+      run: (...params: unknown[]) => monitor.track(sql, params, () => stmt.run(...(params as never[]))),
+    }
+    this.wrappedCache.set(sql, wrapped)
+    return wrapped as unknown as Statement
   }
 
   /** 在事务中执行读后写操作，防止并发更新丢失数据 */
@@ -393,6 +450,18 @@ export class GatewayDB {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `)
+
+    /** 慢 SQL 日志表：超过阈值的语句执行记录，供管理面板排查 */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS slow_query_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        sql TEXT NOT NULL,
+        params TEXT NOT NULL,
+        duration_ms REAL NOT NULL
+      )
+    `)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_slow_query_log_at ON slow_query_log(at)`)
   }
 
   private prepareStatements() {

@@ -69,7 +69,17 @@ export interface UpstreamEndEvent {
   providerId: string
 }
 
-export type BusEvent = RequestStartEvent | RequestStreamEvent | RequestEndEvent | RequestStatsEvent | UpstreamStartEvent | UpstreamEndEvent
+/** 慢 SQL 告警事件：超过阈值的 SQL 执行记录 */
+export interface SlowQueryEvent {
+  type: "slow_query"
+  id: number
+  at: string
+  sql: string
+  params: string
+  durationMs: number
+}
+
+export type BusEvent = RequestStartEvent | RequestStreamEvent | RequestEndEvent | RequestStatsEvent | UpstreamStartEvent | UpstreamEndEvent | SlowQueryEvent
 
 type Listener = (event: BusEvent) => void
 

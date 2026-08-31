@@ -826,6 +826,27 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return fastify.db.getTopMessages(limit, by)
   })
 
+  /** 慢 SQL 日志（最新在前） */
+  fastify.get<{ Querystring: { limit?: string } }>("/admin/slow-queries", async (request) => {
+    const limit = Math.max(1, Math.min(500, parseInt(request.query.limit ?? "100", 10) || 100))
+    return {
+      thresholdMs: fastify.db.getSlowSqlThreshold(),
+      records: fastify.db.getSlowQueryLog(limit),
+      /** 本次运行期内按 SQL 聚合的高频慢点 */
+      aggregated: fastify.db.slowQueryMonitor.aggregated(),
+    }
+  })
+
+  /** 更新慢 SQL 阈值（ms），即时生效 */
+  fastify.put<{ Body: { thresholdMs: number } }>("/admin/slow-queries/threshold", async (request, reply) => {
+    const ms = Math.floor(Number(request.body?.thresholdMs))
+    if (!Number.isFinite(ms) || ms < 10 || ms > 60_000) return reply.status(400).send({ error: "thresholdMs must be 10..60000" })
+    const config = fastify.db.getConfig()
+    config.slowSqlThresholdMs = ms
+    fastify.db.saveConfig(config)
+    return { thresholdMs: fastify.db.getSlowSqlThreshold() }
+  })
+
   // ========== Token 统计 ==========
 
   fastify.get("/admin/token-stats", async () => {

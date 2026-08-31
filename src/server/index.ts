@@ -10,6 +10,7 @@ import { adminRoutes } from "./routes/admin.ts"
 import { healthRoutes } from "./routes/health.ts"
 import { embeddedAssets } from "./embed-assets.ts"
 import { ConfigManager } from "./config.ts"
+import { emitEvent } from "./utils/event-bus.ts"
 import { StatsCache } from "./utils/stats-cache.ts"
 import { createApiAuthHook, createAdminAuthHook } from "./auth.ts"
 
@@ -80,6 +81,9 @@ async function main() {
   /** 服务器启动时间戳（秒），用于 /v1/models 的 created 字段 */
   const startedAt = Math.floor(Date.now() / 1000)
   const config = db.getConfig()
+
+  /** 慢 SQL 告警 → SSE 广播到 Dashboard（冷却去重已在 monitor 内完成） */
+  db.slowQueryMonitor.onSlowQuery(r => emitEvent({ type: "slow_query", ...r }))
 
   const fastify = Fastify({
     logger: { stream: prettyStream, level: config.logLevel } as Record<string, unknown>,
