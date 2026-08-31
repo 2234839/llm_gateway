@@ -103,6 +103,23 @@ body {
 .nav-btn:hover { color: var(--text); background: var(--surface); }
 .nav-btn.active { color: var(--primary); background: var(--surface2); }
 
+/** 导航角标：未读慢查询计数 */
+.badge {
+  display: inline-block;
+  min-width: 16px;
+  height: 16px;
+  line-height: 16px;
+  padding: 0 4px;
+  margin-left: 5px;
+  border-radius: 8px;
+  background: var(--danger, #e5484d);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  text-align: center;
+  vertical-align: 1px;
+}
+
 .header-actions {
   margin-left: auto;
   display: flex;

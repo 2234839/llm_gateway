@@ -7,6 +7,7 @@ import RewriteRules from "./components/RewriteRules.vue"
 import SecretVault from "./components/SecretVault.vue"
 import ApiKeyList from "./components/ApiKeyList.vue"
 import RequestLog from "./components/RequestLog.vue"
+import { subscribeSSE } from "./sse-manager"
 import SlowQueries from "./components/SlowQueries.vue"
 import { t, currentLocale, setLocale } from "./i18n"
 import { initApi, configApi, authApi, ApiAuthError, setOnAuthError } from "./api"
@@ -129,6 +130,10 @@ function toggleLocale() {
 
 const tabKeys = ["dashboard", "providers", "routes", "rewrites", "vault", "keys", "logs", "slowqueries"]
 
+/** 未读慢查询数：慢查询事件到达时自增，切到该 tab 时清零 */
+const slowQueryBadge = ref(0)
+let unsubSlowQuerySSE: (() => void) | null = null
+
 /** 启动时判断状态 */
 onMounted(async () => {
   setOnAuthError(() => {
@@ -179,7 +184,15 @@ onBeforeUnmount(() => {
   setOnAuthError(null)
   document.removeEventListener("click", handleDocumentClick)
   document.removeEventListener("keydown", handleDocumentKeydown)
+  unsubSlowQuerySSE?.()
+  unsubSlowQuerySSE = null
 })
+
+/** 切换 tab：进入慢查询页时清零角标 */
+function switchTab(key: string) {
+  activeTab.value = key
+  if (key === "slowqueries") slowQueryBadge.value = 0
+}
 
 /** 点击外部或按 Escape 关闭设置面板 */
 function handleDocumentClick(e: MouseEvent) {
@@ -367,9 +380,9 @@ async function handleChangePassword() {
           v-for="key in tabKeys"
           :key="key"
           :class="['nav-btn', { active: activeTab === key }]"
-          @click="activeTab = key"
-        >
+          @click="switchTab(key)">
           {{ tabLabel(key) }}
+          <span v-if="key === 'slowqueries' && slowQueryBadge > 0" class="badge">{{ slowQueryBadge > 99 ? '99+' : slowQueryBadge }}</span>
         </button>
       </nav>
       <div class="header-actions">
