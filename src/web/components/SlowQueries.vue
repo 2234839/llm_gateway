@@ -131,7 +131,7 @@ onUnmounted(() => {
     <div v-if="loadError" class="error">{{ loadError }}</div>
     <div v-if="loading" class="loading">{{ t('slowQueries.loading') }}</div>
 
-    <template v-else>
+    <template v-if="!loading">
       <div v-if="records.length === 0" class="empty">
         {{ t('slowQueries.empty', { threshold: formatNumber(thresholdMs) }) }}
       </div>

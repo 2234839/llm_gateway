@@ -37,28 +37,6 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>()
 const LOGIN_MAX_ATTEMPTS = 5
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 
-/** Provider 测试限流：每个 IP 最多 10 次 / 60 秒窗口 */
-const testAttempts = new Map<string, { count: number; resetAt: number }>()
-const TEST_MAX_ATTEMPTS = 10
-const TEST_WINDOW_MS = 60_000
-
-function checkTestRate(ip: string): boolean {
-  const now = Date.now()
-  if (Math.random() < 0.01 || testAttempts.size > 500) {
-    for (const [key, val] of testAttempts) {
-      if (val.resetAt < now) testAttempts.delete(key)
-    }
-  }
-  const entry = testAttempts.get(ip)
-  if (!entry || entry.resetAt < now) {
-    testAttempts.set(ip, { count: 1, resetAt: now + TEST_WINDOW_MS })
-    return true
-  }
-  if (entry.count >= TEST_MAX_ATTEMPTS) return false
-  entry.count++
-  return true
-}
-
 function checkLoginRate(ip: string): boolean {
   const now = Date.now()
   /** 惰性清理过期条目：1% 概率或 Map 超过 1000 条时触发 */
@@ -389,13 +367,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   /** 创建前测试（apiKey 由前端传入） */
   fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; model?: string; customHeaders?: Record<string, string> } }>("/admin/providers/test", async (request, reply) => {
-    if (!checkTestRate(request.ip)) return reply.status(429).send({ error: "Too many test requests. Try again later." })
     return doProviderTest(request.body)
   })
 
   /** 按 provider ID 测试（使用数据库中存储的真实 apiKey） */
   fastify.post<{ Params: { id: string } }>("/admin/providers/:id/test", async (request, reply) => {
-    if (!checkTestRate(request.ip)) return reply.status(429).send({ error: "Too many test requests. Try again later." })
     const { id } = request.params
     const provider = fastify.db.getProvider(id)
     if (!provider) {
@@ -406,6 +382,90 @@ export async function adminRoutes(fastify: FastifyInstance) {
       apiKey: provider.apiKey,
       type: provider.type,
       model: provider.models[0] || undefined,
+      customHeaders: provider.customHeaders,
+    })
+  })
+
+  // ========== Model Discovery（模型侦查） ==========
+
+  /** 模型侦查结果 */
+  interface ModelDiscoveryResult {
+    success: boolean
+    /** 侦查到的模型 id 列表（已去重排序） */
+    models?: string[]
+    /** 实际请求的 URL（便于用户诊断） */
+    endpoint?: string
+    error?: string
+  }
+
+  /** 模型侦查核心逻辑：按 provider 类型调用上游模型列表接口 */
+  async function doModelDiscovery(params: { baseUrl: string; apiKey: string; type: string; customHeaders?: Record<string, string> }): Promise<ModelDiscoveryResult> {
+    const { baseUrl, apiKey, type, customHeaders } = params
+    if (!baseUrl || !apiKey || !type) {
+      return { success: false, error: "baseUrl, apiKey, and type are required" }
+    }
+    const url = baseUrl.replace(/\/+$/, "")
+    if (!isSafeUrl(url)) {
+      return { success: false, error: "URL must be a valid public HTTP/HTTPS address" }
+    }
+
+    const headers: Record<string, string> = {
+      ...(customHeaders ?? {}),
+    }
+
+    /** 不同接口类型的模型列表端点与认证方式 */
+    let listUrl: string
+    if (type === "anthropic") {
+      listUrl = `${url}/v1/models`
+      headers["x-api-key"] = apiKey
+      headers["anthropic-version"] = "2023-06-01"
+    } else if (type === "azure-openai") {
+      listUrl = `${url}/openai/deployments?api-version=2024-02-01`
+      headers["api-key"] = apiKey
+    } else {
+      listUrl = `${url}/models`
+      headers["Authorization"] = `Bearer ${apiKey}`
+    }
+
+    try {
+      const resp = await fetch(listUrl, { headers, signal: AbortSignal.timeout(15000) })
+      if (!resp.ok) {
+        const errorBody = await resp.text().catch(() => "")
+        return { success: false, endpoint: listUrl, error: `HTTP ${resp.status}: ${errorBody.slice(0, 500)}` }
+      }
+      const body = await resp.json() as { data?: unknown }
+      if (!Array.isArray(body.data)) {
+        return { success: false, endpoint: listUrl, error: "Unexpected response: missing data array" }
+      }
+      /** OpenAI/Anthropic 条目取 id，Azure deployments 也返回 id 字段；无 id 的条目跳过 */
+      const models = [...new Set(
+        body.data
+          .map((m: unknown) => (m && typeof m === "object" && typeof (m as { id?: unknown }).id === "string") ? (m as { id: string }).id : null)
+          .filter((id): id is string => id !== null)
+      )].sort()
+      return { success: true, models, endpoint: listUrl }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Request failed"
+      return { success: false, endpoint: listUrl, error: message }
+    }
+  }
+
+  /** 侦查（创建前，apiKey 由前端传入） */
+  fastify.post<{ Body: { baseUrl: string; apiKey: string; type: string; customHeaders?: Record<string, string> } }>("/admin/providers/discover-models", async (request, reply) => {
+    return doModelDiscovery(request.body)
+  })
+
+  /** 按 provider ID 侦查（使用数据库中存储的真实 apiKey） */
+  fastify.post<{ Params: { id: string } }>("/admin/providers/:id/discover-models", async (request, reply) => {
+    const { id } = request.params
+    const provider = fastify.db.getProvider(id)
+    if (!provider) {
+      return reply.status(404).send({ error: "Provider not found" })
+    }
+    return doModelDiscovery({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      type: provider.type,
       customHeaders: provider.customHeaders,
     })
   })

@@ -207,6 +207,16 @@ export interface ProviderTestResult {
   error?: string
 }
 
+/** 模型侦查结果 */
+export interface ModelDiscoveryResult {
+  success: boolean
+  /** 侦查到的模型 id 列表（已去重排序） */
+  models?: string[]
+  /** 实际请求的 URL */
+  endpoint?: string
+  error?: string
+}
+
 export interface KeyGroupInfo {
   id: string
   name: string
@@ -355,6 +365,12 @@ export const providerApi = {
   /** 按 provider ID 测试连通性（使用后端存储的真实 apiKey） */
   testById: (id: string) =>
     api<ProviderTestResult>(`/admin/providers/${id}/test`, { method: "POST" }),
+  /** 侦查上游模型列表（创建前，需传入 apiKey） */
+  discoverModels: (data: { baseUrl: string; apiKey: string; type: string; customHeaders?: Record<string, string> }) =>
+    api<ModelDiscoveryResult>("/admin/providers/discover-models", { method: "POST", body: JSON.stringify(data) }),
+  /** 按 provider ID 侦查上游模型列表（使用后端存储的真实 apiKey） */
+  discoverModelsById: (id: string) =>
+    api<ModelDiscoveryResult>(`/admin/providers/${id}/discover-models`, { method: "POST" }),
 }
 
 export const routeApi = {

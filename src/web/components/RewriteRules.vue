@@ -356,7 +356,7 @@ function formatTime(ts: string): string {
 
     <p v-if="error" class="error-text">{{ error }}</p>
 
-    <div v-else>
+    <div v-if="!loading">
       <table class="table" v-if="!creating">
         <thead>
           <tr>

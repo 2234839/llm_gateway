@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue"
-import { providerApi, type ProviderInfo, type ProviderTestResult } from "../api"
+import { providerApi, type ProviderInfo, type ProviderTestResult, type ModelDiscoveryResult } from "../api"
 import { t } from "../i18n"
 import { randomColor } from "../utils/color"
 
@@ -46,6 +46,63 @@ function getHealth(id: string) {
 
 /** 模型输入框临时值 */
 const modelInput = ref("")
+
+/** 模型侦查状态 */
+const scouting = ref(false)
+const scoutResult = ref<ModelDiscoveryResult | null>(null)
+/** 侦查结果过滤关键字 */
+const scoutFilter = ref("")
+
+/** 过滤后的侦查结果（未添加的排前面，已添加的沉底） */
+const filteredScoutModels = computed(() => {
+  const models = scoutResult.value?.models ?? []
+  const kw = scoutFilter.value.trim().toLowerCase()
+  const matched = kw ? models.filter(m => m.toLowerCase().includes(kw)) : models
+  const pending = matched.filter(m => !form.value.models.includes(m))
+  const added = matched.filter(m => form.value.models.includes(m))
+  return [...pending, ...added]
+})
+
+/** 侦查结果中尚未加入模型列表的数量 */
+const scoutNewCount = computed(() => (scoutResult.value?.models ?? []).filter(m => !form.value.models.includes(m)).length)
+
+/** 侦查上游模型列表：编辑已有 provider 时使用后端存储的 key，新建时使用表单中的 key */
+async function scoutModels() {
+  scouting.value = true
+  scoutResult.value = null
+  scoutFilter.value = ""
+  error.value = ""
+  try {
+    if (editing.value && !form.value.apiKey.trim()) {
+      /** 编辑且未改 key：走后端存储的 key */
+      scoutResult.value = await providerApi.discoverModelsById(editing.value.id)
+    } else {
+      scoutResult.value = await providerApi.discoverModels({
+        baseUrl: form.value.baseUrl,
+        apiKey: form.value.apiKey,
+        type: form.value.type,
+        customHeaders: form.value.customHeaders,
+      })
+    }
+  } catch (e: unknown) {
+    /** HTTP 层错误（如 429 限流）也展示在侦查面板内，不污染全局 error 避免影响整个表单 */
+    scoutResult.value = { success: false, error: e instanceof Error ? e.message : "Scout failed" }
+  }
+  scouting.value = false
+}
+
+/** 从侦查结果添加单个模型 */
+function addScoutedModel(m: string) {
+  if (form.value.models.includes(m)) return
+  form.value.models = [...form.value.models, m]
+}
+
+/** 一键添加侦查结果中所有未添加的模型 */
+function addAllScoutedModels() {
+  const pending = (scoutResult.value?.models ?? []).filter(m => !form.value.models.includes(m))
+  if (pending.length === 0) return
+  form.value.models = [...form.value.models, ...pending]
+}
 
 onMounted(async () => {
   await load()
@@ -95,6 +152,8 @@ function startEdit(p: ProviderInfo) {
   creating.value = false
   testResult.value = null
   modelInput.value = ""
+  scoutResult.value = null
+  scoutFilter.value = ""
   syncHeadersFromForm()
 }
 
@@ -104,6 +163,8 @@ function startCreate() {
   form.value = { ...emptyProvider, customHeaders: {}, allowedClientHeaders: [] }
   testResult.value = null
   modelInput.value = ""
+  scoutResult.value = null
+  scoutFilter.value = ""
   headerEntries.value = []
 }
 
@@ -112,6 +173,8 @@ function cancel() {
   creating.value = false
   testResult.value = null
   modelInput.value = ""
+  scoutResult.value = null
+  scoutFilter.value = ""
 }
 
 async function save() {
@@ -255,7 +318,7 @@ function removeHeader(index: number) {
 
     <p v-if="error" class="error-text">{{ error }}</p>
 
-    <div v-else>
+    <div v-if="!loading">
       <table class="table" v-if="!creating && !editing">
         <thead>
           <tr>
@@ -341,6 +404,36 @@ function removeHeader(index: number) {
                   @keydown.enter.prevent="addModel"
                 />
                 <button class="btn-sm" type="button" @click="addModel">+</button>
+                <button class="btn-sm scout-btn" type="button" :disabled="scouting" @click="scoutModels">
+                  {{ scouting ? t('provider.scouting') : t('provider.scout') }}
+                </button>
+              </div>
+              <!-- 侦查结果：只读展示，不自动填充，手动逐个/全部添加 -->
+              <div v-if="scoutResult" class="scout-panel">
+                <template v-if="scoutResult.success">
+                  <div class="scout-toolbar">
+                    <input v-model="scoutFilter" class="scout-filter" :placeholder="t('provider.scoutFilterPlaceholder')" />
+                    <button
+                      v-if="scoutNewCount > 0"
+                      class="btn-sm"
+                      type="button"
+                      @click="addAllScoutedModels"
+                    >{{ t('provider.scoutAddAll', { count: scoutNewCount }) }}</button>
+                  </div>
+                  <div class="scout-list">
+                    <span
+                      v-for="m in filteredScoutModels"
+                      :key="m"
+                      :class="['model-tag', 'scout-tag', { added: form.models.includes(m) }]"
+                      @click="addScoutedModel(m)"
+                    >{{ m }}</span>
+                    <span v-if="filteredScoutModels.length === 0" class="scout-empty">{{ t('provider.scoutNoMatch') }}</span>
+                  </div>
+                </template>
+                <div v-else class="scout-error">
+                  {{ t('provider.scoutFail', { error: scoutResult.error ?? t('provider.unknownError') }) }}
+                  <span v-if="scoutResult.endpoint" class="scout-endpoint mono">{{ scoutResult.endpoint }}</span>
+                </div>
               </div>
             </div>
           </label>
@@ -448,6 +541,67 @@ function removeHeader(index: number) {
 
 .model-add-row input {
   flex: 1;
+}
+
+.scout-btn {
+  white-space: nowrap;
+}
+
+.scout-panel {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scout-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.scout-filter {
+  flex: 1;
+  font-size: 13px;
+}
+
+.scout-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.scout-tag {
+  cursor: pointer;
+}
+
+.scout-tag.added {
+  opacity: 0.45;
+  cursor: default;
+  text-decoration: line-through;
+}
+
+.scout-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.scout-error {
+  color: var(--err);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scout-endpoint {
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
 }
 
 .test-result {

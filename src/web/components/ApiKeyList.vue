@@ -307,7 +307,7 @@ function quotaPercent(used: number, limit: number): number {
     <div v-if="error" class="error-banner">{{ error }}</div>
     <div v-if="loading" class="loading">{{ t("keys.loading") }}</div>
 
-    <template v-else>
+    <template v-if="!loading">
       <!-- ========== Section 1: Key Groups ========== -->
       <section class="section">
         <div class="toolbar">
