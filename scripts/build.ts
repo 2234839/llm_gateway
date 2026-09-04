@@ -93,14 +93,14 @@ console.log("\n[3/3] Compiling executable...")
 /** 从 package.json 读取版本号 */
 const pkg = JSON.parse(require("fs").readFileSync(join(ROOT, "package.json"), "utf-8"))
 const version = pkg.version ?? "dev"
-process.env.GATEWAY_VERSION = version
 
 const targetFlag = target ? ` --target=${target}` : ""
-const buildCmd = `bun build --compile${targetFlag} --asset-naming="[name].[ext]" src/server/index.ts --outfile "${OUTFILE}"`
+/** 版本号编译期注入（--define）：编译后的二进制独立运行时读不到环境变量，必须打进产物 */
+const buildCmd = `bun build --compile${targetFlag} --asset-naming="[name].[ext]" --define __GATEWAY_VERSION__='"${version}"' src/server/index.ts --outfile "${OUTFILE}"`
 console.log(`  Version: ${version}`)
 console.log(`  Command: ${buildCmd}`)
 try {
-  execSync(buildCmd, { cwd: ROOT, stdio: "inherit", env: { ...process.env, GATEWAY_VERSION: version } })
+  execSync(buildCmd, { cwd: ROOT, stdio: "inherit" })
 } catch (e) {
   console.error("Compile failed!")
   throw e

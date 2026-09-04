@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify"
 
+/** 构建时注入的版本号（scripts/build.ts --define）；dev 模式（bun run）无注入，回落到 process.env.GATEWAY_VERSION（scripts/dev.ts 设置为 x.y.z-dev） */
+const VERSION: string = typeof __GATEWAY_VERSION__ !== "undefined" ? __GATEWAY_VERSION__ : (process.env.GATEWAY_VERSION ?? "dev")
+
 export async function healthRoutes(fastify: FastifyInstance) {
   fastify.get("/health", async () => {
     try {
@@ -12,7 +15,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
 
       return {
         status: "ok",
-        version: process.env.GATEWAY_VERSION ?? "dev",
+        version: VERSION,
         uptime: process.uptime(),
         port: config.port,
         providers: { total: providers.length, enabled },
@@ -28,7 +31,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
       /** health 端点自身不应崩溃，返回降级响应 */
       return {
         status: "degraded",
-        version: process.env.GATEWAY_VERSION ?? "dev",
+        version: VERSION,
         uptime: process.uptime(),
         error: (err as Error).message,
       }
