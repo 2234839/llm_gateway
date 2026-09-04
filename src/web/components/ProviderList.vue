@@ -204,10 +204,12 @@ async function save() {
     if (creating.value) {
       await providerApi.create(form.value)
     } else if (editing.value) {
-      /** 编辑时只发送非空字段 */
+      /** 编辑时只发送非空字段；apiKey 空 = 不修改 */
       const data: Partial<typeof form.value> = { ...form.value }
       if (!data.apiKey?.trim()) delete data.apiKey
-      await providerApi.update(editing.value.id, data)
+      /** 清空颜色时发 null 表达清除意图（JSON 会丢弃 undefined，空串会污染 DB；null 由后端归一为 undefined） */
+      const payload = (data.color === "" ? { ...data, color: null } : data) as Parameters<typeof providerApi.update>[1]
+      await providerApi.update(editing.value.id, payload)
     }
     cancel()
     await load()

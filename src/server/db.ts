@@ -581,7 +581,7 @@ export class GatewayDB {
       const existing = this.getProvider(id)
       if (!existing) return
 
-      const updated = { ...existing, ...provider, id }
+      const updated = { ...existing, ...this.nullsToUndefined(provider), id } as ProviderConfig
       this.stmt(
         "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=?, allowed_client_headers=?, protocol_endpoints=? WHERE id=?"
       ).run(
@@ -628,6 +628,17 @@ export class GatewayDB {
 
   // ========== Route Rules ==========
 
+  /**
+   * 更新接口的「清除字段」协议：JSON 序列化会丢弃 undefined 键，前端只能用 null 表达「清除」。
+   * 合并前把所有 null 值归一成 undefined，让展开运算真正覆盖旧值，否则旧值会被静默保留。
+   * 所有 partial-merge 式 update* 都必须经过此归一。
+   */
+  private nullsToUndefined<T extends object>(patch: Partial<T>): Record<string, unknown> {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(patch)) out[k] = v === null ? undefined : v
+    return out
+  }
+
   getRouteRules(): RouteRule[] {
     const rows = this.stmt("SELECT * FROM route_rules ORDER BY priority DESC").all() as Record<string, unknown>[]
     return rows.map(this.rowToRouteRule.bind(this))
@@ -654,9 +665,7 @@ export class GatewayDB {
        * 前端清空可选字段（如删空 matchConditions）时发送 null（JSON 会丢弃 undefined 键，
        * 只能用 null 表达「清除」）。合并前把 null 归一成 undefined，让展开运算真正覆盖旧值。
        */
-      const normalized: Record<string, unknown> = {}
-      for (const [k, v] of Object.entries(rule)) normalized[k] = v === null ? undefined : v
-
+      const normalized = this.nullsToUndefined(rule)
       const updated = { ...existing, ...normalized, id } as RouteRule
       const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
@@ -794,7 +803,7 @@ export class GatewayDB {
     return this.tx(() => {
       const existing = this.getRewriteRule(id)
       if (!existing) return false
-      const updated = { ...existing, ...rule, id }
+      const updated = { ...existing, ...this.nullsToUndefined(rule), id } as RewriteRule
       this.stmt(
         "UPDATE rewrite_rules SET name=?, match_conditions=?, action=?, enabled=?, priority=?, model_pattern=?, path_pattern=? WHERE id=?"
       ).run(updated.name, JSON.stringify(updated.match ?? []), JSON.stringify(updated.actions ?? []), updated.enabled !== false ? 1 : 0, updated.priority, updated.modelPattern ?? null, updated.pathPattern ?? null, id)
@@ -1307,7 +1316,7 @@ export class GatewayDB {
     this.tx(() => {
       const existing = this.getKeyGroup(id)
       if (!existing) return
-      const updated = { ...existing, ...group, id }
+      const updated = { ...existing, ...this.nullsToUndefined(group), id } as KeyGroup
       this.stmt(
         "UPDATE key_groups SET name=?, description=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=? WHERE id=?"
       ).run(updated.name, updated.description, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, id)
@@ -1357,7 +1366,7 @@ export class GatewayDB {
     this.tx(() => {
       const existing = this.getApiKey(id)
       if (!existing) return
-      const updated = { ...existing, ...key, id }
+      const updated = { ...existing, ...this.nullsToUndefined(key), id } as ApiKey
       this.stmt(
         "UPDATE api_keys SET name=?, key_hash=?, key_prefix=?, key_secret=?, group_id=?, enabled=?, daily_token_limit=?, monthly_token_limit=?, rpm_limit=?, description=? WHERE id=?"
       ).run(updated.name, updated.keyHash, updated.keyPrefix, updated.keySecret, updated.groupId, updated.enabled ? 1 : 0, updated.dailyTokenLimit, updated.monthlyTokenLimit, updated.rpmLimit, updated.description, id)
@@ -1510,7 +1519,7 @@ export class GatewayDB {
     this.tx(() => {
       const existing = this.getCurlQuery(id)
       if (!existing) return
-      const updated = { ...existing, ...config, id }
+      const updated = { ...existing, ...this.nullsToUndefined(config), id } as CurlQueryConfig
       this.stmt(
         "UPDATE curl_queries SET name=?, url=?, method=?, headers=?, body=? WHERE id=?"
       ).run(updated.name, updated.url, updated.method, JSON.stringify(updated.headers), updated.body ?? null, id)

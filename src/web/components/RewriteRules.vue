@@ -77,13 +77,17 @@ async function save() {
   const data = { ...form.value }
   if (!data.name) { error.value = t('rewrites.errorNameRequired'); return }
   if (!data.actions?.length) { error.value = t('rewrites.errorActionRequired'); return }
-  if (!data.modelPattern) data.modelPattern = undefined
-  if (!data.pathPattern) data.pathPattern = undefined
+  /** 取消勾选限定条件时用 null 表达清除意图（JSON 会丢弃 undefined 键，发 undefined 后端会保留旧值） */
+  const payload = {
+    ...data,
+    modelPattern: (data.modelPattern || null) as string | null,
+    pathPattern: (data.pathPattern || null) as string | null,
+  } as Parameters<typeof rewriteApi.update>[1]
   error.value = ""
   saving.value = true
   try {
     if (editingId.value) {
-      await rewriteApi.update(editingId.value, data)
+      await rewriteApi.update(editingId.value, payload)
     } else {
       await rewriteApi.create(data)
     }
