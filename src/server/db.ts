@@ -650,7 +650,14 @@ export class GatewayDB {
       const existing = this.getRouteRule(id)
       if (!existing) return false
 
-      const updated = { ...existing, ...rule, id }
+      /**
+       * 前端清空可选字段（如删空 matchConditions）时发送 null（JSON 会丢弃 undefined 键，
+       * 只能用 null 表达「清除」）。合并前把 null 归一成 undefined，让展开运算真正覆盖旧值。
+       */
+      const normalized: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(rule)) normalized[k] = v === null ? undefined : v
+
+      const updated = { ...existing, ...normalized, id } as RouteRule
       const modelPattern = this.extractModelPattern(updated.matchConditions) ?? ""
       this.stmt(
         "UPDATE route_rules SET pattern=?, provider_id=?, model_mapping=?, priority=?, content_match=?, match_conditions=?, target_model=?, enabled=?, exclude_match=?, key_groups=?, fallbacks=?, fallback_on_client_error=?, retry_qpm_limit=?, retry_on_529=?, retry_all_failures=?, thinking_override=? WHERE id=?"

@@ -190,23 +190,27 @@ function cancel() {
 async function save() {
   /** 保存前将 mapping 条目同步到 form */
   syncMappingToForm()
-  const data = { ...form.value }
+  /** 可清除字段用 null 发送（JSON 序列化会丢弃 undefined 键，导致后端合并时保留旧值；null 会被保留，后端归一为 undefined 实现清除） */
+  const data: Record<string, unknown> = { ...form.value }
   if (!data.providerId) { error.value = t('route.errorProviderRequired'); return }
-  if (!data.targetModel) data.targetModel = undefined
-  if (!data.fallbacks?.length) data.fallbacks = undefined
+  if (!data.targetModel) data.targetModel = null
+  if (!data.fallbacks?.length) data.fallbacks = null
   /** 验证 fallback 的 providerId */
   if (data.fallbacks) {
-    for (const fb of data.fallbacks) {
+    for (const fb of data.fallbacks as { providerId?: string }[]) {
       if (!fb.providerId) { error.value = t('route.errorFallbackProviderRequired'); return }
     }
   }
-  if (!data.keyGroups?.length) data.keyGroups = undefined
-  if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = undefined
-  if (!data.retryQpmLimit) data.retryQpmLimit = undefined
-  if (!data.retryOn529) data.retryOn529 = undefined
-  if (!data.retryAllFailures) data.retryAllFailures = undefined
-  /** 思考改写：由 UI 状态组装，未启用或无实质配置时显式置空（编辑场景下清除旧配置） */
-  data.thinkingOverride = buildThinkingOverride()
+  if (!(data.keyGroups as unknown[])?.length) data.keyGroups = null
+  if (!data.modelMapping || !Object.keys(data.modelMapping).length) data.modelMapping = null
+  if (!data.retryQpmLimit) data.retryQpmLimit = null
+  if (!data.retryOn529) data.retryOn529 = null
+  if (!data.retryAllFailures) data.retryAllFailures = null
+  /** 匹配条件 / 排除条件：删空时发 null 清除（这是「删空保存不生效」的修复核心） */
+  if (!data.matchConditions) data.matchConditions = null
+  if (!data.excludeMatch) data.excludeMatch = null
+  /** 思考改写：由 UI 状态组装，未启用或无实质配置时置 null 清除旧配置 */
+  data.thinkingOverride = buildThinkingOverride() ?? null
   error.value = ""
   saving.value = true
   try {
