@@ -17,7 +17,7 @@ import type { GatewayConfigInfo, CorsConfigInfo } from "./api"
 type AppState = "loading" | "init" | "login" | "main"
 const appState = ref<AppState>("loading")
 
-const initForm = reactive({ username: "", password: "", confirmPassword: "" })
+const initForm = reactive({ username: "", password: "", confirmPassword: "", setupToken: "" })
 const initError = ref("")
 
 const loginForm = reactive({ username: "", password: "" })
@@ -220,7 +220,12 @@ async function handleInit() {
   }
   try {
     /** init API 内部已自动创建 session cookie，无需再调 login */
-    await initApi.init({ username: initForm.username, password: initForm.password })
+    await initApi.init({
+      username: initForm.username,
+      password: initForm.password,
+      /** 本机访问时后端不校验，留空即可；远程访问需填控制台打印的安装令牌 */
+      setupToken: initForm.setupToken || undefined,
+    })
     /** init 成功后尝试获取配置，失败则直接进入登录页（session cookie 已设置，刷新即可） */
     try {
       gatewayConfig.value = await configApi.get()
@@ -337,7 +342,12 @@ async function handleChangePassword() {
           <span>{{ t("init.confirmPassword") }}</span>
           <input v-model="initForm.confirmPassword" type="password" :placeholder="t('init.confirmPasswordPlaceholder')" @keyup.enter="handleInit" />
         </label>
+        <label>
+          <span>{{ t("init.setupToken") }}</span>
+          <input v-model="initForm.setupToken" type="text" :placeholder="t('init.setupTokenPlaceholder')" @keyup.enter="handleInit" />
+        </label>
       </div>
+      <p class="init-desc setup-token-hint">{{ t("init.setupTokenHint") }}</p>
       <p v-if="initError" class="error-text">{{ initError }}</p>
       <div class="form-actions">
         <button class="btn btn-primary" @click="handleInit">{{ t("init.createButton") }}</button>
@@ -493,6 +503,11 @@ async function handleChangePassword() {
   color: var(--text-dim);
   font-size: 14px;
   margin-bottom: 20px;
+}
+
+.setup-token-hint {
+  margin: 12px 0 0;
+  font-size: 12px;
 }
 
 .init-form-grid {

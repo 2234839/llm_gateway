@@ -18,6 +18,10 @@ No Node.js, no Docker, no config files. Single binary, SQLite under the hood, ad
 
 **Data storage**: All data (database, config) is stored in the `data/` directory next to the binary. This directory is created automatically on first run.
 
+**First-run security**: Before an admin account exists, `/admin/init` requires a **setup token** for non-localhost requests — it is printed to the console at startup (and stored in `data/.setup-token` until setup completes). Requests from `127.0.0.1` skip the token. Set `ALLOW_REMOTE_INIT=1` to disable this protection if you know what you're doing.
+
+**Bind address**: The server listens on `0.0.0.0` (all interfaces) by default. To bind elsewhere, set the `HOST` environment variable or `"gateway": { "host": "127.0.0.1" }` in `data/config.json`. Port is configurable via `PORT` env or `"gateway": { "port": ... }`.
+
 ## What Makes This Different
 
 Most LLM gateways rotate API keys and tally bills. This one reads your request content and decides where it should go.
@@ -141,7 +145,7 @@ No protocol-specific prefixes needed — the gateway detects the format:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/init-check` | Check if admin is set up |
-| POST | `/admin/init` | Create admin account |
+| POST | `/admin/init` | Create admin account (setup token required from non-localhost before initialization) |
 | GET/PUT | `/admin/config` | Gateway settings |
 | CRUD | `/admin/providers/*` | Provider management |
 | GET/POST | `/admin/providers/test` | Connectivity test |

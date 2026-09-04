@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify"
-import type { KeyGroup, ApiKey, ProviderConfig, RouteRule, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry } from "../types.ts"
+import type { KeyGroup, ApiKey, ProviderConfig, RouteRule, ConditionNode, ConditionLeaf, ConditionGroup, SecretEntry, ProviderType } from "../types.ts"
 import { v4 as uuid } from "uuid"
 import { emitEvent, onEvent, onSerializedEvent, type BusEvent } from "../utils/event-bus.ts"
 import { generateApiKey } from "../utils/api-key-gen.ts"
@@ -19,6 +19,23 @@ function extractModelPatternSimple(node?: ConditionNode): string | undefined {
 import { detectProvider, getProviderDisplayName } from "../utils/provider-detector.ts"
 import { queryProviderBalance, queryZhipuQuota, queryWithCurl, parseCurl } from "../utils/balance-query.ts"
 import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
+
+const VALID_PROTOCOL_ENDPOINT_TYPES: ProviderType[] = ["openai", "anthropic", "azure-openai", "custom", "openai-responses"]
+
+/** 校验 protocolEndpoints：类型合法、URL 非空、不与主 type/baseUrl 冲突 */
+function validateProtocolEndpoints(mainType: ProviderType, endpoints?: Partial<Record<ProviderType, string>>): string | null {
+  if (!endpoints) return null
+  for (const [proto, url] of Object.entries(endpoints)) {
+    if (!url) continue
+    if (!VALID_PROTOCOL_ENDPOINT_TYPES.includes(proto as ProviderType)) {
+      return `protocolEndpoints key must be one of: ${VALID_PROTOCOL_ENDPOINT_TYPES.join(", ")}`
+    }
+    if (proto === mainType) {
+      return `protocolEndpoints.${proto} duplicates the main type; use baseUrl instead`
+    }
+  }
+  return null
+}
 
 /** 设置 session cookie（根据请求协议决定 Secure 标志，HTTP 环境下浏览器会拒绝 Secure cookie） */
 function setSessionCookie(reply: import("fastify").FastifyReply, token: string) {
@@ -75,7 +92,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
     nameCache = null
   }
 
-  // ========== Init & Config ==========
+  /** 判断请求是否来自本机回环地址（含 IPv4-mapped IPv6） */
+function isLoopbackIp(ip: string): boolean {
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1"
+}
+
+// ========== Init & Config ==========
 
   /** 检查管理员是否已初始化 */
   fastify.get("/admin/init-check", async () => {
@@ -83,9 +105,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
   })
 
   /** 初始化管理员帐号，成功后自动创建 session */
-  fastify.post<{ Body: { username: string; password: string } }>("/admin/init", async (request, reply) => {
+  fastify.post<{ Body: { username: string; password: string; setupToken?: string } }>("/admin/init", async (request, reply) => {
     if (fastify.configManager.isAdminInitialized()) {
       return reply.status(400).send({ error: "Admin already initialized" })
+    }
+    /**
+     * 防远程抢占（issue #2）：服务器默认绑定 0.0.0.0，未初始化时任何人都能抢先创建管理员。
+     * 本机回环请求直接放行；远程请求必须提供启动时打印到控制台的 setup token，
+     * 除非显式设置 ALLOW_REMOTE_INIT=1 关闭该保护。
+     */
+    if (!isLoopbackIp(request.ip) && process.env.ALLOW_REMOTE_INIT !== "1") {
+      const headerToken = request.headers["x-setup-token"]
+      const token = typeof headerToken === "string" ? headerToken : request.body?.setupToken
+      if (!token || !fastify.configManager.verifySetupToken(token)) {
+        return reply.status(403).send({ error: "Setup token required. See the token printed in the server console at startup." })
+      }
     }
     const { username, password } = request.body
     if (!username || !password) {
@@ -203,8 +237,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (!body.baseUrl) return reply.status(400).send({ error: "baseUrl is required" })
     if (!body.apiKey) return reply.status(400).send({ error: "apiKey is required" })
     if (!body.type) return reply.status(400).send({ error: "type is required" })
-    const validTypes = ["openai", "anthropic", "azure-openai", "custom"]
+    const validTypes = ["openai", "anthropic", "azure-openai", "custom", "openai-responses"]
     if (!validTypes.includes(body.type)) return reply.status(400).send({ error: `type must be one of: ${validTypes.join(", ")}` })
+    const protocolError = validateProtocolEndpoints(body.type, body.protocolEndpoints)
+    if (protocolError) return reply.status(400).send({ error: protocolError })
     if (!Array.isArray(body.models) || body.models.length === 0) return reply.status(400).send({ error: "models must be a non-empty array" })
     if (body.models.some((m: unknown) => typeof m !== "string" || !m.trim())) return reply.status(400).send({ error: "Each model must be a non-empty string" })
     if (body.enabled !== undefined && typeof body.enabled !== "boolean") return reply.status(400).send({ error: "enabled must be a boolean" })
@@ -229,9 +265,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
     const update = { ...request.body }
     if (update.type) {
-      const validTypes = ["openai", "anthropic", "azure-openai", "custom"]
+      const validTypes = ["openai", "anthropic", "azure-openai", "custom", "openai-responses"]
       if (!validTypes.includes(update.type)) return reply.status(400).send({ error: `type must be one of: ${validTypes.join(", ")}` })
     }
+    const protocolError = validateProtocolEndpoints(update.type ?? existing.type, update.protocolEndpoints ?? existing.protocolEndpoints)
+    if (protocolError) return reply.status(400).send({ error: protocolError })
     if (update.models !== undefined && (!Array.isArray(update.models) || update.models.length === 0)) {
       return reply.status(400).send({ error: "models must be a non-empty array" })
     }
@@ -340,6 +378,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
       headers["anthropic-version"] = "2023-06-01"
       method = "POST"
       reqBody = JSON.stringify({ model: testModel || "claude-sonnet-4-20250514", max_tokens: 1, messages: [{ role: "user", content: "hi" }] })
+    } else if (type === "openai-responses") {
+      testUrl = `${url}/responses`
+      headers["Authorization"] = `Bearer ${apiKey}`
+      method = "POST"
+      reqBody = JSON.stringify({ model: testModel || "gpt-5", input: "hi", max_output_tokens: 16 })
     } else if (type === "azure-openai") {
       testUrl = `${url}/openai/deployments?api-version=2024-02-01`
       headers["api-key"] = apiKey

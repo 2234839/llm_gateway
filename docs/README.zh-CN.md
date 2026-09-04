@@ -18,6 +18,10 @@
 
 **数据存储**：所有数据（数据库、配置）存储在可执行文件旁边的 `data/` 目录中，首次运行时自动创建。
 
+**首启安全**：管理员账号创建之前，非本机请求调用 `/admin/init` 需要提供**安装令牌**——启动时会打印到控制台（并暂存在 `data/.setup-token`，初始化完成后自动删除）。来自 `127.0.0.1` 的请求无需令牌。如确需关闭该保护，可设置 `ALLOW_REMOTE_INIT=1`。
+
+**监听地址**：默认监听 `0.0.0.0`（所有网卡）。可通过 `HOST` 环境变量或 `data/config.json` 中的 `"gateway": { "host": "127.0.0.1" }` 修改；端口同理可用 `PORT` 环境变量或 `"gateway": { "port": ... }` 配置。
+
 ## 跟其他网关有什么不同
 
 大多数 LLM 网关做账号轮转和计费。这个网关会读你的请求内容，然后决定路由到哪里。
@@ -141,7 +145,7 @@ export OPENAI_API_KEY=sk-your-gateway-key
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/admin/init-check` | 检查管理员是否已设置 |
-| POST | `/admin/init` | 创建管理员帐号 |
+| POST | `/admin/init` | 创建管理员帐号（初始化前，非本机请求需提供安装令牌） |
 | GET/PUT | `/admin/config` | 网关设置 |
 | CRUD | `/admin/providers/*` | 服务商管理 |
 | GET/POST | `/admin/providers/test` | 连通性测试 |

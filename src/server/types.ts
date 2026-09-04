@@ -279,6 +279,8 @@ export interface OpenAIUsage {
   cache_creation_input_tokens?: number
   /** Anthropic 扩展：cache 读取 token 数 */
   cache_read_input_tokens?: number
+  /** Responses 扩展：思维链 token 数 */
+  output_tokens_details?: { reasoning_tokens?: number }
 }
 
 // ========== OpenAI SSE 流式事件类型 ==========
@@ -307,9 +309,119 @@ export interface OpenAIStreamChunk {
   usage?: OpenAIUsage
 }
 
+// ========== OpenAI Responses API 类型 ==========
+
+/** OpenAI Responses API 请求体（客户端入口 / provider 出站） */
+export interface OpenAIResponsesRequest {
+  model: string
+  /** 输入：字符串快捷形式或输入 item 列表 */
+  input: string | OpenAIResponseInputItem[]
+  /** 系统指令（作为第一条 system/developer 消息） */
+  instructions?: string
+  stream?: boolean
+  max_output_tokens?: number
+  temperature?: number
+  top_p?: number
+  tools?: OpenAIResponsesTool[]
+  tool_choice?: "auto" | "none" | "required" | { type: "function"; name: string }
+  /** 推理配置：effort 控制 */
+  reasoning?: { effort?: string; summary?: unknown }
+  /** 输出文本格式 */
+  text?: { format?: { type?: string; [key: string]: unknown } }
+  /** 是否存储响应（部分上游不支持，恒为 false） */
+  store?: boolean
+  metadata?: Record<string, unknown>
+  /** 透传的用户标识 */
+  user?: string
+  parallel_tool_calls?: boolean
+  /** 其他未映射字段原样保留 */
+  [key: string]: unknown
+}
+
+/** Responses 输入 item（宽松结构：message / function_call / function_call_output / reasoning / 其他，运行时按 type 判别） */
+export interface OpenAIResponseInputItem {
+  /** item 类型：message（可缺省）/ function_call / function_call_output / reasoning / web_search_call 等 */
+  type?: string
+  /** message item 的角色 */
+  role?: string
+  /** message item 的内容 */
+  content?: string | OpenAIResponseContentBlock[]
+  /** function_call / function_call_output 的配对 id */
+  call_id?: string
+  /** function_call 的工具名 */
+  name?: string
+  /** function_call 的参数 JSON 字符串 */
+  arguments?: string
+  /** function_call_output 的输出 */
+  output?: string | OpenAIResponseContentBlock[]
+  /** reasoning item 的摘要 */
+  summary?: unknown[]
+  [key: string]: unknown
+}
+
+/** Responses 内容块 */
+export interface OpenAIResponseContentBlock {
+  type: string
+  text?: string
+  image_url?: string
+  file_id?: string
+  detail?: string
+  [key: string]: unknown
+}
+
+/** Responses 工具定义 */
+export interface OpenAIResponsesTool {
+  type: "function" | string
+  name?: string
+  description?: string
+  parameters?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+/** Responses 非流式响应体 */
+export interface OpenAIResponsesResponse {
+  id: string
+  object: "response"
+  created_at: number
+  status: "completed" | "in_progress" | "incomplete" | "failed"
+  model: string
+  output: OpenAIResponseOutputItem[]
+  usage: {
+    input_tokens: number
+    output_tokens: number
+    total_tokens?: number
+    input_tokens_details?: { cached_tokens?: number }
+    output_tokens_details?: { reasoning_tokens?: number }
+  }
+  [key: string]: unknown
+}
+
+/** Responses 输出 item（宽松结构：message / reasoning / function_call / 其他，运行时按 type 判别） */
+export interface OpenAIResponseOutputItem {
+  type: string
+  id?: string
+  /** message item 的角色 */
+  role?: string
+  status?: string
+  /** message item 的内容块 */
+  content?: { type: string; text?: string; annotations?: unknown[]; refusal?: string; [key: string]: unknown }[]
+  /** reasoning item 的摘要 */
+  summary?: { type: string; text?: string; [key: string]: unknown }[]
+  /** function_call 的配对 id */
+  call_id?: string
+  /** function_call 的工具名 */
+  name?: string
+  /** function_call 的参数 JSON 字符串 */
+  arguments?: string
+  [key: string]: unknown
+}
+
 // ========== 配置类型 ==========
 
-export type ProviderType = "openai" | "anthropic" | "azure-openai" | "custom"
+export type ProviderType = "openai" | "anthropic" | "azure-openai" | "custom" | "openai-responses"
+
+/** 客户端请求使用的协议（决定同协议端点优先直通） */
+export type ClientProtocol = "anthropic" | "openai" | "openai-responses"
 
 export interface ProviderConfig {
   id: string
@@ -319,6 +431,9 @@ export interface ProviderConfig {
   apiKey: string
   models: string[]
   enabled: boolean
+  /** 额外协议端点：同一服务商支持的其他协议及其 Base URL。
+   *  客户端协议与某端点匹配时直通该端点（零转换开销），否则走主端点 + 协议转换 */
+  protocolEndpoints?: Partial<Record<ProviderType, string>>
   customHeaders?: Record<string, string>
   /** 额外放行透传给该 provider 的客户端请求头列表（大小写不敏感，默认仅 User-Agent） */
   allowedClientHeaders?: string[]
@@ -518,6 +633,8 @@ export interface CorsConfig {  /** 允许的来源：true = 允许所有（反�
 
 export interface GatewayConfig {
   port: number
+  /** 监听地址，默认 0.0.0.0（所有网卡）；纯本机使用可设为 127.0.0.1。也可被 HOST 环境变量覆盖 */
+  host?: string
   logLevel: "debug" | "info" | "warn" | "error"
   enableRequestLog: boolean
   /** 保留带内容的日志条数（提示词+响应），超出后清理旧记录的 content 字段，默认 1000 */

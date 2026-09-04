@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs"
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { join, dirname } from "node:path"
 import type { GatewayConfig } from "./types.ts"
 
@@ -37,6 +38,8 @@ const DEFAULT_APP_CONFIG: AppConfig = {
 
 const CONFIG_DIR = "data"
 const CONFIG_PATH = join(CONFIG_DIR, "config.json")
+/** 首次启动初始化令牌文件名（与 config 同目录），初始化成功后删除 */
+const SETUP_TOKEN_FILENAME = ".setup-token"
 
 export class ConfigManager {
   private config: AppConfig
@@ -98,12 +101,42 @@ export class ConfigManager {
     return !!(this.config.admin?.username && this.config.admin?.passwordHash)
   }
 
+  /**
+   * 首启安装令牌：仅管理员未初始化时存在，用于防止远程抢占 /admin/init（issue #2）。
+   * 令牌持久化到 config 同目录，重启后复用；管理员初始化成功后自动删除。
+   * 仅管理员未初始化时才应调用此方法。
+   */
+  getSetupToken(): string {
+    const tokenPath = join(dirname(this.configPath), SETUP_TOKEN_FILENAME)
+    if (existsSync(tokenPath)) {
+      return readFileSync(tokenPath, "utf-8").trim()
+    }
+    const token = randomBytes(24).toString("base64url")
+    const tmp = tokenPath + ".tmp"
+    writeFileSync(tmp, token)
+    renameSync(tmp, tokenPath)
+    return token
+  }
+
+  /** 校验首启安装令牌（常量时间比较），仅未初始化时有效 */
+  verifySetupToken(token: string): boolean {
+    if (this.isAdminInitialized()) return false
+    return timingSafeEqual(token, this.getSetupToken())
+  }
+
+  /** 删除首启安装令牌文件（初始化成功后调用） */
+  private clearSetupToken() {
+    const tokenPath = join(dirname(this.configPath), SETUP_TOKEN_FILENAME)
+    if (existsSync(tokenPath)) unlinkSync(tokenPath)
+  }
+
   /** 初始化管理员帐号 */
   async initAdmin(username: string, password: string) {
     return this.enqueueWrite(async () => {
       const passwordHash = await this.hashPassword(password)
       this.config.admin = { username, passwordHash }
       this.save()
+      this.clearSetupToken()
     })
   }
 

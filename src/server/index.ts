@@ -6,6 +6,7 @@ import { GatewayDB } from "./db.ts"
 import { ProviderRegistry } from "./providers/registry.ts"
 import { anthropicRoutes } from "./routes/anthropic.ts"
 import { openaiRoutes } from "./routes/openai.ts"
+import { responsesRoutes } from "./routes/responses.ts"
 import { adminRoutes } from "./routes/admin.ts"
 import { healthRoutes } from "./routes/health.ts"
 import { embeddedAssets } from "./embed-assets.ts"
@@ -150,11 +151,12 @@ async function main() {
     instance.register(openaiRoutes)
   }, { prefix: "/openai" })
 
-  /** 自动协议路由 — 根路径同时暴露两种 API，客户端无需指定前缀 */
+  /** 自动协议路由 — 根路径同时暴露三种 API，客户端无需指定前缀 */
   await fastify.register(async (instance) => {
     instance.addHook("onRequest", apiAuthHook)
     instance.register(anthropicRoutes)
     instance.register(openaiRoutes)
+    instance.register(responsesRoutes)
 
     /** GET /v1/models — 统一模型发现，同时兼容 OpenAI 和 Anthropic 响应格式 */
     instance.get("/v1/models", async (request, reply) => {
@@ -241,13 +243,19 @@ async function main() {
   }
 
   const port = parseInt(process.env.PORT ?? "") || config.port || 3827
+  /** 监听地址：HOST 环境变量 > config.json gateway.host > 默认 0.0.0.0 */
+  const host = process.env.HOST || config.host || "0.0.0.0"
   try {
-    await fastify.listen({ port, host: "0.0.0.0" })
-    console.log(`LLM Gateway running on http://localhost:${port}`)
+    await fastify.listen({ port, host })
+    console.log(`LLM Gateway running on http://${host === "0.0.0.0" ? "localhost" : host}:${port} (listening on ${host})`)
     if (configManager.isAdminInitialized()) {
       console.log(`  Admin panel: protected (username: ${configManager.get().admin!.username})`)
     } else {
-      console.log("  Admin panel: open (no admin account configured)")
+      /** 首启安装令牌：远程初始化必须提供（issue #2 防抢占）；ALLOW_REMOTE_INIT=1 可关闭该保护 */
+      const token = configManager.getSetupToken()
+      console.log("  Admin panel: awaiting first-run setup")
+      console.log(`  Setup token (required for remote initialization): ${C.yellow}${C.bold}${token}${C.reset}`)
+      console.log("    Loopback requests don't need it. Set ALLOW_REMOTE_INIT=1 to disable this protection.")
     }
     if (configManager.get().authRequired) {
       console.log("  API auth: required")

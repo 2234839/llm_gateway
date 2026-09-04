@@ -43,6 +43,8 @@ export interface ProviderInfo {
   apiKey: string
   models: string[]
   enabled: boolean
+  /** 额外协议端点：同一服务商支持的其他协议及其 Base URL */
+  protocolEndpoints?: Partial<Record<"openai" | "anthropic" | "azure-openai" | "custom" | "openai-responses", string>>
   customHeaders?: Record<string, string>
   maxConcurrency?: number
   requestTimeout?: number
@@ -545,7 +547,7 @@ export const apiKeyApi = {
 
 export const initApi = {
   check: () => api<InitCheckResult>("/admin/init-check"),
-  init: (data: { username: string; password: string }) => api<{ success: boolean }>("/admin/init", { method: "POST", body: JSON.stringify(data) }),
+  init: (data: { username: string; password: string; setupToken?: string }) => api<{ success: boolean }>("/admin/init", { method: "POST", body: JSON.stringify(data) }),
 }
 
 export const authApi = {
