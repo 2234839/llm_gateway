@@ -244,6 +244,11 @@ export class GatewayDB {
       // 列已存在
     }
     try {
+      this.db.run("ALTER TABLE providers ADD COLUMN protocol_endpoints TEXT DEFAULT NULL")
+    } catch {
+      // 列已存在
+    }
+    try {
       this.db.run("ALTER TABLE providers ADD COLUMN allowed_client_headers TEXT DEFAULT '[]'")
     } catch {
       // 列已存在
@@ -551,7 +556,7 @@ export class GatewayDB {
 
   addProvider(provider: ProviderConfig) {
     this.stmt(
-      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color, flatten_mid_system, allowed_client_headers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO providers (id, name, type, base_url, api_key, models, enabled, custom_headers, sort_order, max_concurrency, request_timeout, color, flatten_mid_system, allowed_client_headers, protocol_endpoints) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(
       provider.id,
       provider.name,
@@ -567,6 +572,7 @@ export class GatewayDB {
       provider.color ?? null,
       provider.flattenMidSystem ? 1 : 0,
       JSON.stringify(provider.allowedClientHeaders ?? []),
+      provider.protocolEndpoints && Object.keys(provider.protocolEndpoints).length > 0 ? JSON.stringify(provider.protocolEndpoints) : null,
     )
   }
 
@@ -577,7 +583,7 @@ export class GatewayDB {
 
       const updated = { ...existing, ...provider, id }
       this.stmt(
-        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=?, allowed_client_headers=? WHERE id=?"
+        "UPDATE providers SET name=?, type=?, base_url=?, api_key=?, models=?, enabled=?, custom_headers=?, max_concurrency=?, request_timeout=?, color=?, flatten_mid_system=?, allowed_client_headers=?, protocol_endpoints=? WHERE id=?"
       ).run(
         updated.name,
         updated.type,
@@ -591,6 +597,7 @@ export class GatewayDB {
         updated.color ?? null,
         updated.flattenMidSystem ? 1 : 0,
         JSON.stringify(updated.allowedClientHeaders ?? []),
+        updated.protocolEndpoints && Object.keys(updated.protocolEndpoints).length > 0 ? JSON.stringify(updated.protocolEndpoints) : null,
         id,
       )
     })
@@ -615,6 +622,7 @@ export class GatewayDB {
       color: (row.color as string) || undefined,
       flattenMidSystem: (row.flatten_mid_system as number) === 1 || undefined,
       allowedClientHeaders: JSON.parse((row.allowed_client_headers as string) || "[]"),
+      protocolEndpoints: row.protocol_endpoints ? JSON.parse(row.protocol_endpoints as string) : undefined,
     }
   }
 

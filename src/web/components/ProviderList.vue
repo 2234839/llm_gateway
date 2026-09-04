@@ -19,6 +19,7 @@ const emptyProvider: Omit<ProviderInfo, "id"> = {
   apiKey: "",
   models: [],
   enabled: true,
+  protocolEndpoints: {},
   maxConcurrency: 0,
   requestTimeout: 0,
   color: "",
@@ -148,24 +149,26 @@ async function checkAllHealth() {
 
 function startEdit(p: ProviderInfo) {
   editing.value = p
-  form.value = { ...p, customHeaders: { ...(p.customHeaders ?? {}) }, allowedClientHeaders: [...(p.allowedClientHeaders ?? [])] }
+  form.value = { ...p, customHeaders: { ...(p.customHeaders ?? {}) }, allowedClientHeaders: [...(p.allowedClientHeaders ?? [])], protocolEndpoints: { ...(p.protocolEndpoints ?? {}) } }
   creating.value = false
   testResult.value = null
   modelInput.value = ""
   scoutResult.value = null
   scoutFilter.value = ""
   syncHeadersFromForm()
+  resetProtocolRows()
 }
 
 function startCreate() {
   editing.value = null
   creating.value = true
-  form.value = { ...emptyProvider, customHeaders: {}, allowedClientHeaders: [] }
+  form.value = { ...emptyProvider, customHeaders: {}, allowedClientHeaders: [], protocolEndpoints: {} }
   testResult.value = null
   modelInput.value = ""
   scoutResult.value = null
   scoutFilter.value = ""
   headerEntries.value = []
+  resetProtocolRows()
 }
 
 function cancel() {
@@ -180,7 +183,16 @@ function cancel() {
 async function save() {
   error.value = ""
   if (!form.value.name.trim()) { error.value = t('provider.errorNameRequired'); return }
+  /** 先把协议行状态同步到 form（URL 可能在行输入框中修改） */
+  syncRowsToForm()
   if (!form.value.baseUrl.trim()) { error.value = t('provider.errorUrlRequired'); return }
+  /** 检查所有已启用的额外协议端点 URL 均已填写 */
+  for (const [proto, url] of Object.entries(form.value.protocolEndpoints ?? {})) {
+    if (url !== undefined && !url.trim()) {
+      error.value = t('provider.errorProtocolUrlRequired', { proto })
+      return
+    }
+  }
   /** 创建时 apiKey 必填，编辑时为空表示不修改 */
   if (creating.value && !form.value.apiKey.trim()) { error.value = t('provider.errorKeyRequired'); return }
   if (form.value.models.length === 0) { error.value = t('provider.errorModelRequired'); return }
@@ -262,6 +274,7 @@ const typeOptions = [
   { value: "anthropic", label: "Anthropic" },
   { value: "azure-openai", label: "Azure OpenAI" },
   { value: "custom", label: "Custom (OpenAI-compatible)" },
+  { value: "openai-responses", label: "OpenAI Responses" },
 ]
 
 const urlPlaceholders: Record<string, string> = {
@@ -269,9 +282,76 @@ const urlPlaceholders: Record<string, string> = {
   anthropic: "https://api.anthropic.com",
   "azure-openai": "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT",
   custom: "https://your-provider.example.com/v1",
+  "openai-responses": "https://api.deepseek.com",
 }
 
-const urlPlaceholder = computed(() => urlPlaceholders[form.value.type] ?? urlPlaceholders.custom)
+/**
+ * 协议行模型：每个协议一行（勾选 + URL + 主端点单选）
+ * 主端点协议 = form.type，主端点 URL = form.baseUrl
+ */
+interface ProtocolRow {
+  value: string
+  label: string
+  enabled: boolean
+  url: string
+  primary: boolean
+}
+
+/** 从 form 状态构建协议行列表（保持 typeOptions 固定顺序） */
+function buildProtocolRows(): ProtocolRow[] {
+  const eps = form.value.protocolEndpoints ?? {}
+  return typeOptions.map(o => ({
+    value: o.value,
+    label: o.label,
+    enabled: form.value.type === o.value || eps[o.value as keyof typeof eps] !== undefined,
+    url: form.value.type === o.value ? form.value.baseUrl : (eps[o.value as keyof typeof eps] ?? ""),
+    primary: form.value.type === o.value,
+  }))
+}
+
+/** 协议行（响应式，供模板渲染） */
+const protocolRows = ref<ProtocolRow[]>(buildProtocolRows())
+
+/** 重建协议行（编辑/新建/取消时调用） */
+function resetProtocolRows() {
+  protocolRows.value = buildProtocolRows()
+}
+
+/** 行勾选状态变化：勾选时初始化 URL，取消时清空 */
+function onRowToggle(row: ProtocolRow, enabled: boolean) {
+  row.enabled = enabled
+  if (!enabled && row.primary) {
+    /** 主端点不可取消——至少保留一个协议 */
+    row.enabled = true
+    return
+  }
+  if (!enabled) row.url = ""
+  syncRowsToForm()
+}
+
+/** 切换主端点协议（radio） */
+function onPrimaryChange(row: ProtocolRow) {
+  for (const r of protocolRows.value) {
+    r.primary = r.value === row.value
+    /** 新主端点必须是启用的 */
+    if (r.primary) r.enabled = true
+  }
+  syncRowsToForm()
+}
+
+/** 协议行状态 → form.type / form.baseUrl / form.protocolEndpoints */
+function syncRowsToForm() {
+  const primaryRow = protocolRows.value.find(r => r.primary) ?? protocolRows.value[0]!
+  form.value.type = primaryRow.value as typeof form.value.type
+  form.value.baseUrl = primaryRow.url
+  const eps: NonNullable<typeof form.value.protocolEndpoints> = {}
+  for (const r of protocolRows.value) {
+    if (r.enabled && !r.primary && r.url.trim()) {
+      eps[r.value as keyof typeof eps] = r.url
+    }
+  }
+  form.value.protocolEndpoints = eps
+}
 
 /** 自定义 Headers 编辑 */
 const headerEntries = ref<{ key: string; value: string }[]>([])
@@ -337,7 +417,10 @@ function removeHeader(index: number) {
               <span v-else-if="!p.enabled" class="health-dot disabled"></span>
               {{ p.name }}
             </td>
-            <td><span class="badge">{{ p.type }}</span></td>
+            <td>
+              <span class="badge">{{ p.type }}</span>
+              <span v-for="proto in Object.keys(p.protocolEndpoints ?? {})" :key="proto" class="badge badge-extra" :title="`${p.protocolEndpoints![proto as keyof NonNullable<typeof p.protocolEndpoints>]}`">+{{ proto }}</span>
+            </td>
             <td class="mono">{{ p.baseUrl }}</td>
             <td>
               <span v-for="m in p.models.slice(0, 3)" :key="m" class="model-tag">{{ m }}</span>
@@ -367,18 +450,41 @@ function removeHeader(index: number) {
             {{ t('provider.nameLabel') }}
             <input v-model="form.name" :placeholder="t('provider.namePlaceholder')" />
           </label>
-          <label>
-            {{ t('provider.typeLabel') }}
-            <select v-model="form.type">
-              <option v-for="opt in typeOptions" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </option>
-            </select>
-          </label>
-          <label class="span-2">
-            {{ t('provider.urlLabel') }}
-            <input v-model="form.baseUrl" :placeholder="urlPlaceholder" class="mono" />
-          </label>
+          <!-- 协议端点配置：每协议一行（勾选 + URL + 主端点单选），主端点协议即服务商类型 -->
+          <div class="span-2 protocol-endpoints">
+            <div class="section-label">{{ t('provider.protocolEndpointsLabel') }}</div>
+            <p class="section-hint">{{ t('provider.protocolEndpointsHint') }}</p>
+            <div class="protocol-table">
+              <div v-for="row in protocolRows" :key="row.value" class="protocol-row">
+                <label class="protocol-check">
+                  <input
+                    type="checkbox"
+                    :checked="row.enabled"
+                    :disabled="row.primary"
+                    @change="onRowToggle(row, ($event.target as HTMLInputElement).checked)"
+                  />
+                </label>
+                <span class="protocol-name">{{ row.label }}</span>
+                <input
+                  v-model="row.url"
+                  :placeholder="urlPlaceholders[row.value] ?? urlPlaceholders.custom"
+                  class="mono protocol-url"
+                  :disabled="!row.enabled"
+                  @input="syncRowsToForm"
+                />
+                <label class="protocol-primary" :title="t('provider.primaryEndpointHint')">
+                  <input
+                    type="radio"
+                    name="primary-protocol"
+                    :checked="row.primary"
+                    :disabled="!row.enabled"
+                    @change="onPrimaryChange(row)"
+                  />
+                  {{ t('provider.primaryEndpoint') }}
+                </label>
+              </div>
+            </div>
+          </div>
           <label class="span-2">
             {{ t('provider.apiKeyLabel') }}
             <div class="apikey-input-row">
@@ -640,6 +746,63 @@ function removeHeader(index: number) {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
+}
+
+.protocol-endpoints {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/** 列表中额外协议的角标（+anthropic 等），比主类型徽标弱化显示 */
+.badge-extra {
+  margin-left: 4px;
+  opacity: 0.75;
+}
+
+/** 协议行表格：每行 = 勾选 + 协议名 + URL + 主端点单选 */
+.protocol-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.protocol-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.protocol-check {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+.protocol-name {
+  flex-shrink: 0;
+  width: 190px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.protocol-url {
+  flex: 1;
+}
+
+.protocol-url:disabled {
+  opacity: 0.45;
+}
+
+.protocol-primary {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 .headers-section {

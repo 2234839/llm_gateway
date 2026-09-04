@@ -100,7 +100,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
     try {
       const messageText = extractAnthropicText(body)
       const contentTypes = extractAnthropicContentTypes(body)
-      const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + body.max_tokens })
+      const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, clientProtocol: "anthropic", tokenCount: estimateTokenCount(messageText) + body.max_tokens })
 
       /** 配额检查 */
       if (auth) {
@@ -162,7 +162,7 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         { provider, providerConfig, targetModel: tm },
       ]
       for (const fb of fallbacks) {
-        const fbProvider = fastify.registry.getProvider(fb.providerId)
+        const fbProvider = fastify.registry.getProvider(fb.providerId, "anthropic")
         const fbConfig = fastify.registry.getProviderConfig(fb.providerId)
         if (fbProvider && fbConfig) {
           candidates.push({ provider: fbProvider, providerConfig: fbConfig, targetModel: fb.targetModel || tm })
@@ -498,6 +498,12 @@ async function handleAnthropicUpstream(
     const oText = extractAnthropicResponseSummary(respBody as import("../types.ts").AnthropicMessagesResponse)
     reply.send(restoreObjectDeep(respBody, secrets))
     return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
+  }
+
+  /** openai-responses 端点：Anthropic 入口 → CC 中间格式 → Responses 发送，响应转回 Anthropic */
+  if (provider.type === "openai-responses") {
+    const { handleResponsesUpstreamFromAnthropic } = await import("./responses-internal.ts")
+    return handleResponsesUpstreamFromAnthropic(provider, targetModel, providerConfig, body, isStream, reply, onText, onToolCall, onStreamError, signal, secrets, thinkingOverride, onThinkingRewrite)
   }
 
   /** 非 Anthropic 提供商 — 转换格式 */

@@ -113,7 +113,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
     try {
       const messageText = extractOpenAIText(body)
       const contentTypes = extractOpenAIContentTypes(body)
-      const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, tokenCount: estimateTokenCount(messageText) + (body.max_tokens ?? body.max_completion_tokens ?? 0) })
+      const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, clientProtocol: "openai", tokenCount: estimateTokenCount(messageText) + (body.max_tokens ?? body.max_completion_tokens ?? 0) })
 
       /** 配额检查 */
       if (auth) {
@@ -177,7 +177,7 @@ export async function openaiRoutes(fastify: FastifyInstance) {
         { provider, providerConfig, targetModel: tm },
       ]
       for (const fb of fallbacks) {
-        const fbProvider = fastify.registry.getProvider(fb.providerId)
+        const fbProvider = fastify.registry.getProvider(fb.providerId, "openai")
         const fbConfig = fastify.registry.getProviderConfig(fb.providerId)
         if (fbProvider && fbConfig) {
           candidates.push({ provider: fbProvider, providerConfig: fbConfig, targetModel: fb.targetModel || tm })
@@ -424,116 +424,121 @@ async function handleOpenAIUpstream(
   streamHijacked?: boolean
 }> {
   try {
-  /** 提取需要透传的客户端 headers（默认仅 User-Agent，可按 provider 配置扩展） */
-  const clientHeaders = extractClientHeaders(reply.request.headers, providerConfig?.allowedClientHeaders)
-  if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
-    /** OpenAI 兼容提供商 — 透传 */
-    /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
-    const thinkingResult = applyThinkingOverride(body as unknown as Record<string, unknown>, thinkingOverride, "openai")
-    if (thinkingResult?.applied) {
-      onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(body as unknown as Record<string, unknown>))
+    /** openai-responses 端点：CC 入口 → Responses 转换发送，响应转回 CC */
+    if (provider.type === "openai-responses") {
+      const { handleResponsesUpstreamFromChat } = await import("./responses-internal.ts")
+      return handleResponsesUpstreamFromChat(provider, providerConfig, targetModel, body, isStream, reply, onText, onToolCall, flushToolCalls, onStreamError, signal, secrets)
     }
-    if (isStream) {
-      const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, clientHeaders, signal)
+    /** 提取需要透传的客户端 headers（默认仅 User-Agent，可按 provider 配置扩展） */
+    const clientHeaders = extractClientHeaders(reply.request.headers, providerConfig?.allowedClientHeaders)
+    if (provider.type === "openai" || provider.type === "azure-openai" || provider.type === "custom") {
+      /** OpenAI 兼容提供商 — 透传 */
+      /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+      const thinkingResult = applyThinkingOverride(body as unknown as Record<string, unknown>, thinkingOverride, "openai")
+      if (thinkingResult?.applied) {
+        onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(body as unknown as Record<string, unknown>))
+      }
+      if (isStream) {
+        const upstream = await provider.sendStreamRequest({ ...body, model: targetModel, stream_options: { include_usage: true } }, clientHeaders, signal)
+        if (!upstream.ok) {
+          const errBody = await upstream.text()
+          return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+        }
+        let iTokens = 0, oTokens = 0, crTokens = 0
+        if (!upstream.body) {
+          return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+        }
+        reply.hijack()
+        await streamPassthroughOpenAI(upstream.body, reply.raw, secrets, onText, onToolCall, flushToolCalls, (i, o, cr) => {
+          iTokens = i
+          oTokens = o
+          crTokens = cr
+        }, onStreamError, estimateOpenAIInputTokens(body))
+        return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
+      }
+
+      const upstream = await provider.sendRequest({ ...body, model: targetModel }, clientHeaders, signal)
       if (!upstream.ok) {
         const errBody = await upstream.text()
         return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
-      let iTokens = 0, oTokens = 0, crTokens = 0
+      const respText = await upstream.text()
+      if (!respText) {
+        return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+      }
+      let resp: Record<string, unknown>
+      try {
+        resp = JSON.parse(respText) as Record<string, unknown>
+      } catch {
+        return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+      }
+      const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } }).usage
+      const iT = respUsage?.prompt_tokens ?? 0
+      const oT = respUsage?.completion_tokens ?? 0
+      /** OpenAI 兼容服务商的 prompt_tokens_details.cached_tokens 对应 cache read */
+      const crT = respUsage?.prompt_tokens_details?.cached_tokens ?? 0
+      const oText = extractOpenAIResponseSummary(resp)
+      reply.send(resp)
+      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: crT, outputText: oText }
+    }
+
+    /** Anthropic 提供商 — 转换格式 */
+    const anthropicBody = convertRequestToAnthropic(body, targetModel)
+    /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
+    const thinkingResult = applyThinkingOverride(anthropicBody as unknown as Record<string, unknown>, thinkingOverride, "anthropic")
+    if (thinkingResult?.applied) {
+      onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(anthropicBody as unknown as Record<string, unknown>))
+    }
+    const upstreamHeaders: Record<string, string> = { "anthropic-version": "2023-06-01" }
+    /** 透传 User-Agent，让上游识别客户端类型 */
+    const reqHeaders = reply.request.headers
+    if (reqHeaders["user-agent"]) upstreamHeaders["User-Agent"] = reqHeaders["user-agent"] as string
+
+    if (isStream) {
+      const upstream = await provider.sendStreamRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
+      if (!upstream.ok) {
+        const errBody = await upstream.text()
+        return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
+      }
+      let iTokens = 0, oTokens = 0, ccTokens = 0, crTokens = 0
       if (!upstream.body) {
         return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
       }
       reply.hijack()
-      await streamPassthroughOpenAI(upstream.body, reply.raw, secrets, onText, onToolCall, flushToolCalls, (i, o, cr) => {
+      await streamAnthropicToOpenAI(upstream.body, reply.raw, body.model, onText, onAnthropicToolCall ?? (() => {}), (i, o, cc, cr) => {
         iTokens = i
         oTokens = o
+        ccTokens = cc
         crTokens = cr
-      }, onStreamError, estimateOpenAIInputTokens(body))
-      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: 0, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
+      }, onStreamError, secrets)
+      return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
     }
 
-    const upstream = await provider.sendRequest({ ...body, model: targetModel }, clientHeaders, signal)
+    const upstream = await provider.sendRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
     if (!upstream.ok) {
       const errBody = await upstream.text()
       return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
+
     const respText = await upstream.text()
     if (!respText) {
       return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
-    let resp: Record<string, unknown>
+    let anthropicResp: Record<string, unknown>
     try {
-      resp = JSON.parse(respText) as Record<string, unknown>
+      anthropicResp = JSON.parse(respText) as Record<string, unknown>
     } catch {
       return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
     }
-    const respUsage = (resp as { usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } }).usage
-    const iT = respUsage?.prompt_tokens ?? 0
-    const oT = respUsage?.completion_tokens ?? 0
-    /** OpenAI 兼容服务商的 prompt_tokens_details.cached_tokens 对应 cache read */
-    const crT = respUsage?.prompt_tokens_details?.cached_tokens ?? 0
-    const oText = extractOpenAIResponseSummary(resp)
-    reply.send(resp)
-    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: 0, cacheReadTokens: crT, outputText: oText }
-  }
-
-  /** Anthropic 提供商 — 转换格式 */
-  const anthropicBody = convertRequestToAnthropic(body, targetModel)
-  /** 思考选项改写：协议转换后的出站体统一覆盖/移除思考参数 */
-  const thinkingResult = applyThinkingOverride(anthropicBody as unknown as Record<string, unknown>, thinkingOverride, "anthropic")
-  if (thinkingResult?.applied) {
-    onThinkingRewrite?.(thinkingResult.summary, extractThinkingSnapshot(anthropicBody as unknown as Record<string, unknown>))
-  }
-  const upstreamHeaders: Record<string, string> = { "anthropic-version": "2023-06-01" }
-  /** 透传 User-Agent，让上游识别客户端类型 */
-  const reqHeaders = reply.request.headers
-  if (reqHeaders["user-agent"]) upstreamHeaders["User-Agent"] = reqHeaders["user-agent"] as string
-
-  if (isStream) {
-    const upstream = await provider.sendStreamRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
-    if (!upstream.ok) {
-      const errBody = await upstream.text()
-      return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
-    }
-    let iTokens = 0, oTokens = 0, ccTokens = 0, crTokens = 0
-    if (!upstream.body) {
-      return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
-    }
-    reply.hijack()
-    await streamAnthropicToOpenAI(upstream.body, reply.raw, body.model, onText, onAnthropicToolCall ?? (() => {}), (i, o, cc, cr) => {
-      iTokens = i
-      oTokens = o
-      ccTokens = cc
-      crTokens = cr
-    }, onStreamError, secrets)
-    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iTokens, outputTokens: oTokens, cacheCreationTokens: ccTokens, cacheReadTokens: crTokens, outputText: null, streamHijacked: true }
-  }
-
-  const upstream = await provider.sendRequest(anthropicBody as unknown as Record<string, unknown>, upstreamHeaders, signal)
-  if (!upstream.ok) {
-    const errBody = await upstream.text()
-    return { ok: false, statusCode: upstream.status, errorMsg: errBody, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
-  }
-
-  const respText = await upstream.text()
-  if (!respText) {
-    return { ok: false, statusCode: 502, errorMsg: "Empty response body from upstream", inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
-  }
-  let anthropicResp: Record<string, unknown>
-  try {
-    anthropicResp = JSON.parse(respText) as Record<string, unknown>
-  } catch {
-    return { ok: false, statusCode: 502, errorMsg: `Invalid JSON response from upstream: ${respText.slice(0, 200)}`, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputText: null }
-  }
-  const anthroUsage = (anthropicResp as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
-  const iT = anthroUsage?.input_tokens ?? 0
-  const oT = anthroUsage?.output_tokens ?? 0
-  const ccT = anthroUsage?.cache_creation_input_tokens ?? 0
-  const crT = anthroUsage?.cache_read_input_tokens ?? 0
-  const converted = convertResponseToOpenAI(restoreObjectDeep(anthropicResp, secrets) as unknown as import("../types.ts").AnthropicMessagesResponse)
-  const oText = converted.choices?.[0]?.message?.content ?? ""
-  reply.send(converted)
-  return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
+    const anthroUsage = (anthropicResp as { usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage
+    const iT = anthroUsage?.input_tokens ?? 0
+    const oT = anthroUsage?.output_tokens ?? 0
+    const ccT = anthroUsage?.cache_creation_input_tokens ?? 0
+    const crT = anthroUsage?.cache_read_input_tokens ?? 0
+    const converted = convertResponseToOpenAI(restoreObjectDeep(anthropicResp, secrets) as unknown as import("../types.ts").AnthropicMessagesResponse)
+    const oText = converted.choices?.[0]?.message?.content ?? ""
+    reply.send(converted)
+    return { ok: true, statusCode: 200, errorMsg: null, inputTokens: iT, outputTokens: oT, cacheCreationTokens: ccT, cacheReadTokens: crT, outputText: oText }
   } catch (err) {
     /** 上游响应解析失败（如非 JSON 响应体），返回 502 */
     const msg = (err as Error).message ?? "Failed to parse upstream response"

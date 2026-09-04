@@ -1,4 +1,4 @@
-import type { Provider, ProviderConfig, RouteResult, ConditionNode, ConditionLeaf, ConditionGroup } from "../types.ts"
+import type { Provider, ProviderConfig, RouteResult, ConditionNode, ConditionLeaf, ConditionGroup, ClientProtocol } from "../types.ts"
 import picomatch from "picomatch"
 import { OpenAIProvider } from "./openai.ts"
 import { AnthropicProvider } from "./anthropic.ts"
@@ -12,6 +12,8 @@ export interface ResolveContext {
   contentTypes: Set<string>
   /** 请求来源的密钥分组 ID */
   groupId?: string
+  /** 客户端请求使用的协议，用于多协议 provider 的同协议端点直通选择 */
+  clientProtocol?: ClientProtocol
   /**
    * 请求的预估总 token 预算 = 预估 input token + max_tokens(completion)。
    * 按字符类别加权估算 input（无需分词器），加上客户端指定的 completion 上限，
@@ -21,7 +23,10 @@ export interface ResolveContext {
 }
 
 export class ProviderRegistry {
+  /** 主实例：providerId -> 默认端点的 Provider */
   private providers: Map<string, Provider> = new Map()
+  /** 多协议实例：providerId:protocol -> 该协议端点的 Provider（仅配置了 protocolEndpoints 的 provider 存在） */
+  private protocolProviders: Map<string, Provider> = new Map()
   private semaphores: Map<string, Semaphore> = new Map()
   private db: GatewayDB
   /** 缓存的路由规则 */
@@ -41,6 +46,7 @@ export class ProviderRegistry {
   /** 从数据库重新加载所有提供商配置（原子替换，避免并发请求看到空状态） */
   reload() {
     const newProviders = new Map<string, Provider>()
+    const newProtocolProviders = new Map<string, Provider>()
     const newSemaphores = new Map<string, Semaphore>()
     const newConfigs = new Map<string, ProviderConfig>()
     const configs = this.db.getProviders()
@@ -48,6 +54,11 @@ export class ProviderRegistry {
       newConfigs.set(config.id, config)
       if (!config.enabled) continue
       newProviders.set(config.id, this.createProvider(config))
+      /** 为每个额外协议端点创建独立实例 */
+      for (const [proto, url] of Object.entries(config.protocolEndpoints ?? {})) {
+        if (!url) continue
+        newProtocolProviders.set(`${config.id}:${proto}`, this.createProvider(config, proto as ProviderConfig["type"], url))
+      }
       if (config.maxConcurrency && config.maxConcurrency > 0) {
         newSemaphores.set(config.id, new Semaphore(config.maxConcurrency))
       }
@@ -60,6 +71,7 @@ export class ProviderRegistry {
       }
     }
     this.providers = newProviders
+    this.protocolProviders = newProtocolProviders
     this.semaphores = newSemaphores
     this.cachedRules = null
     this.providerConfigs = newConfigs
@@ -83,16 +95,20 @@ export class ProviderRegistry {
     return this.cachedRules
   }
 
-  private createProvider(config: ProviderConfig): Provider {
-    switch (config.type) {
+  /** 创建 Provider 实例；overrideType/overrideUrl 用于多协议端点（同一服务商的不同协议端点） */
+  private createProvider(config: ProviderConfig, overrideType?: ProviderConfig["type"], overrideUrl?: string): Provider {
+    const type = overrideType ?? config.type
+    const baseUrl = overrideUrl ?? config.baseUrl
+    switch (type) {
       case "anthropic":
-        return new AnthropicProvider(config.id, config.baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
+        return new AnthropicProvider(config.id, baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
       case "openai":
       case "azure-openai":
       case "custom":
-        return new OpenAIProvider(config.id, config.type, config.baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
+      case "openai-responses":
+        return new OpenAIProvider(config.id, type, baseUrl, config.apiKey, config.customHeaders, config.requestTimeout)
       default:
-        throw new Error(`Unknown provider type: ${config.type}`)
+        throw new Error(`Unknown provider type: ${type}`)
     }
   }
 
@@ -126,6 +142,11 @@ export class ProviderRegistry {
       const provider = this.providers.get(rule.providerId)
       if (!provider) continue
 
+      /** 多协议端点选择：客户端协议有专用端点时用该协议实例（直通零转换），否则用主实例（必要时协议转换） */
+      const effectiveProvider = context?.clientProtocol
+        ? this.protocolProviders.get(`${rule.providerId}:${context.clientProtocol}`) ?? provider
+        : provider
+
       const targetModel = rule.targetModel || rule.modelMapping?.[model] || model
       const providerConfig = this.providerConfigs.get(rule.providerId)
       if (!providerConfig) continue
@@ -137,7 +158,7 @@ export class ProviderRegistry {
       const modelPattern = extractModelPatternFromTree(rule.matchConditions)
 
       return {
-        provider,
+        provider: effectiveProvider,
         targetModel,
         providerConfig,
         rulePattern: modelPattern,
@@ -163,7 +184,12 @@ export class ProviderRegistry {
     throw new Error(hints.join(". "))
   }
 
-  getProvider(id: string): Provider | undefined {
+  getProvider(id: string, clientProtocol?: ClientProtocol): Provider | undefined {
+    /** 多协议端点：客户端协议有专用端点时优先返回该实例 */
+    if (clientProtocol) {
+      const protoProvider = this.protocolProviders.get(`${id}:${clientProtocol}`)
+      if (protoProvider) return protoProvider
+    }
     return this.providers.get(id)
   }
 
