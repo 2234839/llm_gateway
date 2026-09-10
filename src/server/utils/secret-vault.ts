@@ -157,6 +157,39 @@ function replaceInString(s: string, secrets: SecretEntry[]): string {
 }
 
 /**
+ * 出站脱敏 — 通用深遍历兜底：递归替换请求体中所有字符串字段的真实密钥。
+ * 结构化脱敏（maskAnthropicBody / maskOpenAIBody）负责已知字段，本函数作为最后防线，
+ * 覆盖任意未映射字段（tool_use.input、function_call_output、metadata 等），
+ * 保证密钥真值不可能经请求体出站。
+ * 就地修改，返回替换是否发生。
+ */
+export function maskDeep(obj: unknown, secrets: SecretEntry[]): boolean {
+  const active = secrets.filter(s => s.value && s.enabled)
+  if (active.length === 0) return false
+  let changed = false
+  const walk = (node: unknown): unknown => {
+    if (typeof node === "string") {
+      const out = maskText(node, active)
+      if (out !== node) changed = true
+      return out
+    }
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) node[i] = walk(node[i])
+      return node
+    }
+    if (node && typeof node === "object") {
+      for (const [k, v] of Object.entries(node)) {
+        ;(node as Record<string, unknown>)[k] = walk(v)
+      }
+      return node
+    }
+    return node
+  }
+  walk(obj)
+  return changed
+}
+
+/**
  * 出站脱敏 — Anthropic Messages 请求体：
  * 遍历 system / messages[].content（string 与 blocks[].text）/ tools[].description，把真实密钥替换为占位符。
  * 就地修改 body，返回替换是否发生。

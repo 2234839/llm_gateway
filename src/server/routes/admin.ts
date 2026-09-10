@@ -743,17 +743,15 @@ function isLoopbackIp(ip: string): boolean {
     return fastify.db.getSecrets()
   })
 
-  fastify.post<{ Body: { name: string; placeholder?: string; value: string; enabled?: boolean } }>("/admin/secrets", async (request, reply) => {
-    const { name, placeholder, value, enabled } = request.body
+  fastify.post<{ Body: { name: string; value: string; enabled?: boolean } }>("/admin/secrets", async (request, reply) => {
+    const { name, value, enabled } = request.body
     if (!name) return reply.status(400).send({ error: "name is required" })
     if (!value) return reply.status(400).send({ error: "value is required" })
-    /** 占位符未指定时自动生成；指定时校验格式与唯一性 */
-    const { generatePlaceholder, isValidPlaceholder } = await import("../utils/secret-vault.ts")
-    const ph = placeholder?.trim() || generatePlaceholder()
-    if (!isValidPlaceholder(ph)) return reply.status(400).send({ error: `placeholder must match ${ph.length > 0 ? "GWKEY_ + 6-16 lowercase alphanumeric" : ""} (e.g. GWKEY_x7k2m9a2)` })
-    if (fastify.db.getSecrets().some(s => s.placeholder === ph)) return reply.status(400).send({ error: `placeholder "${ph}" already exists` })
-    /** 不允许真实值与占位符相同 */
-    if (value === ph) return reply.status(400).send({ error: "value must differ from placeholder" })
+    /** 占位符一律由网关自动生成：统一 GWKEY_ 前缀是流式还原状态机的锚点，
+     *  不开放自定义以防用户设置的占位符与真实密钥形态冲突或破坏前缀匹配 */
+    const { generatePlaceholder } = await import("../utils/secret-vault.ts")
+    const ph = generatePlaceholder()
+    if (fastify.db.getSecrets().some(s => s.placeholder === ph)) return reply.status(400).send({ error: "placeholder collision, please retry" })
     const secret: SecretEntry = {
       id: uuid(),
       name,
@@ -772,11 +770,8 @@ function isLoopbackIp(ip: string): boolean {
     if (!existing) return reply.status(404).send({ error: "Secret not found" })
     const body = request.body
     if (body.name !== undefined && !body.name) return reply.status(400).send({ error: "name must not be empty" })
-    if (body.placeholder !== undefined) {
-      const { isValidPlaceholder } = await import("../utils/secret-vault.ts")
-      if (!isValidPlaceholder(body.placeholder)) return reply.status(400).send({ error: "placeholder must match GWKEY_ + 6-16 lowercase alphanumeric" })
-      if (fastify.db.getSecrets().some(s => s.id !== id && s.placeholder === body.placeholder)) return reply.status(400).send({ error: `placeholder "${body.placeholder}" already exists` })
-    }
+    /** 占位符不支持修改（保持 GWKEY_ 前缀由网关管控） */
+    delete body.placeholder
     if (body.value !== undefined && !body.value) return reply.status(400).send({ error: "value must not be empty" })
     fastify.db.updateSecret(id, body)
     return fastify.db.getSecret(id)

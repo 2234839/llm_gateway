@@ -10,7 +10,7 @@ import { emitEvent } from "../utils/event-bus.ts"
 import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
-import { maskAnthropicBody, restoreObjectDeep, StreamRestorer, maskText } from "../utils/secret-vault.ts"
+import { maskAnthropicBody, restoreObjectDeep, StreamRestorer, maskText, maskDeep } from "../utils/secret-vault.ts"
 import { persistLogImages } from "../utils/log-images.ts"
 import { applyThinkingOverride, extractThinkingSnapshot } from "../utils/thinking-override.ts"
 import type { SecretEntry, ThinkingOverride, ThinkingLogEntry } from "../types.ts"
@@ -151,10 +151,12 @@ export async function anthropicRoutes(fastify: FastifyInstance) {
         }
       }
 
-      /** 密钥保护出站脱敏：真实密钥替换为占位符后再发给上游（日志记录的同样是脱敏后的 body） */
+      /** 密钥保护出站脱敏：真实密钥替换为占位符后再发给上游（日志记录的同样是脱敏后的 body）
+       *  maskAnthropicBody 覆盖已知字段，maskDeep 全量深遍历兑底任意未映射字段 */
       secretEntries = fastify.db.getSecrets()
       if (secretEntries.some(sc => sc.enabled && sc.value)) {
         maskAnthropicBody(body, secretEntries)
+        maskDeep(body, secretEntries)
       }
 
       /** 构建尝试列表：主 provider + fallbacks */

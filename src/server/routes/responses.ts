@@ -7,7 +7,7 @@ import { emitEvent } from "../utils/event-bus.ts"
 import { acquireRpmSlot, checkQuota, recordRpmRequest, recordUsage } from "../quota.ts"
 import { createDisconnectSignal } from "../utils/disconnect.ts"
 import { withUpstreamRetry } from "../utils/retry.ts"
-import { restoreObjectDeep, maskText } from "../utils/secret-vault.ts"
+import { restoreObjectDeep, maskText, maskDeep } from "../utils/secret-vault.ts"
 
 /**
  * POST /v1/responses — OpenAI Responses API 入口
@@ -82,7 +82,7 @@ export async function responsesRoutes(fastify: FastifyInstance) {
     try {
       const messageText = extractResponsesText(body)
       const contentTypes = extractResponsesContentTypes(body)
-      /** 密钥保护条目：还原入站占位符 → 真实密钥 */
+      /** 密钥保护条目：还原入站占位符 → 真实密钥；出站前 maskDeep 全量深遍历脱敏兑底 */
       secretEntries = fastify.db.getSecrets()
       const routeResult = fastify.registry.resolve(model, { messageText, contentTypes, groupId: auth?.groupId, clientProtocol: "openai-responses", tokenCount: estimateTokenCount(messageText) + (body.max_output_tokens ?? 0) })
 
@@ -280,8 +280,9 @@ async function handleResponsesUpstream(
   streamHijacked?: boolean
 }> {
   try {
-    /** openai-responses 端点直通（同协议零转换） */
+    /** openai-responses 端点直通（同协议零转换）——出站前全量脱敏兜底 */
     if (provider.type === "openai-responses") {
+      if (secrets.some(sc => sc.enabled && sc.value)) maskDeep(body, secrets)
       if (isStream) {
         const upstream = await provider.sendStreamRequest({ ...body, model: targetModel }, {}, signal)
         if (!upstream.ok) {
@@ -317,6 +318,10 @@ async function handleResponsesUpstream(
     }
 
     /** 其他协议端点：Responses → Chat Completions → 现有链路（openai 直通 / anthropic 转换）→ 转回 Responses */
+    /** 出站前全量脱敏：真值 → 占位符（覆盖 input/instructions/function_call_output 等任意字段） */
+    if (secrets.some(sc => sc.enabled && sc.value)) {
+      maskDeep(body, secrets)
+    }
     const chatBody = convertResponsesToChat({ ...body, model: targetModel })
     const { handleOpenAIUpstreamForResponses } = await import("./openai-internal.ts")
     return handleOpenAIUpstreamForResponses(provider, providerConfig, targetModel, chatBody, body, isStream, reply, onText, onStreamError, signal, secrets)
