@@ -14,6 +14,7 @@ const info = ref<HealthInfo | null>(null)
 const loadError = ref("")
 const loading = ref(true)
 const concurrencyCanvas = ref<HTMLCanvasElement | null>(null)
+const ganttCanvas = ref<HTMLCanvasElement | null>(null)
 const liveLogsRef = ref<HTMLElement | null>(null)
 const tokenTrendCanvas = ref<HTMLCanvasElement | null>(null)
 
@@ -65,17 +66,13 @@ const providerConcurrency = ref<{ id: string; name: string; color?: string; gate
 
 let sseUnsubscribe: (() => void) | null = null
 let chartInstance: Chart | null = null
+let ganttInstance: Chart | null = null
 let tokenChartInstance: Chart | null = null
 let cleanupTimer: ReturnType<typeof setInterval> | null = null
 /** 每秒更新的时钟，用于运行中请求的耗时显示 */
 const now = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
 let themeObserver: MutationObserver | null = null
-
-/** 并发历史数据（两层：upstream + gateway） */
-const concurrencyHistory = new Map<string, { name: string; color?: string; upstreamPoints: number[]; gatewayPoints: number[] }>()
-let historyLabels: string[] = []
-const maxHistoryPoints = 300
 
 /** Token 趋势图刷新防抖 */
 let tokenTrendTimer: ReturnType<typeof setTimeout> | null = null
@@ -104,8 +101,38 @@ const tokenTrendOptions = [
   { label: "7d", value: 168 },
 ]
 
-/** 输出速率历史（chars/s），与并发共享时间轴，值由服务端推送 */
-const outputRateHistory: number[] = []
+/** 输出速率采样：{ ts: 采样时刻时间戳, rate: chars/s }，服务端每秒推一次 */
+const outputRateHistory: { ts: number; rate: number }[] = []
+/** 速率历史最大点数（与甘特图窗口匹配：5 分钟 = 300 个秒级采样） */
+const maxRatePoints = 300
+
+/** 甘特图请求追踪：所有请求（running + completed），用于渲染时间线 */
+interface GanttRequest {
+  requestId: string
+  /** 客户端请求的模型名 */
+  model: string
+  /** 路由命中的目标模型（实际发往上游的模型名） */
+  targetModel: string
+  provider: string
+  providerId: string
+  startedAt: number
+  endedAt: number | null  /** null = running */
+  status: "running" | "done" | "error"
+  statusCode: number
+  error: string | null
+  durationMs: number
+  tokenUsage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number } | null
+}
+/**
+ * 甘特图请求追踪：requestId -> 请求信息。
+ * 必须用 Map：SSE 重连时服务端会重放活跃请求的 request_start，数组 push 会产生重复条目，
+ * 导致同一请求在泳道分配时因时间自冲突被分到多条泳道。
+ */
+const ganttRequests = ref<Map<string, GanttRequest>>(new Map())
+/** 甘特图时间窗口（毫秒）：只显示最近 N 秒内的请求 */
+const GANTT_WINDOW_MS = 5 * 60_000 // 5 分钟
+/** 甘特图最大追踪请求数 */
+const GANTT_MAX_REQUESTS = 80
 
 /** 分组 Token 用量 */
 const groupTokenStats = ref<{ groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
@@ -246,6 +273,9 @@ function applyCardOrder() {
   }
 }
 
+/** 甘特图刷新定时器：每秒刷新一次让 running 请求的横线延伸到当前时刻 */
+let ganttTimer: ReturnType<typeof setInterval> | null = null
+
 onMounted(async () => {
   try {
     info.value = await healthApi.get()
@@ -256,7 +286,7 @@ onMounted(async () => {
   }
   loading.value = false
   await nextTick()
-  initConcurrencyChart()
+  initGanttChart()
   loadTokenTrend()
   loadGroupTokenStats()
   loadCollapsedState()
@@ -265,14 +295,16 @@ onMounted(async () => {
   connectSSE()
   cleanupTimer = setInterval(cleanupCompleted, 30000)
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
+  ganttTimer = setInterval(renderGanttChart, 1000)
 
   themeObserver = new MutationObserver(() => {
     chartInstance?.destroy()
     chartInstance = null
+    ganttInstance?.destroy()
+    ganttInstance = null
     tokenChartInstance?.destroy()
     tokenChartInstance = null
-    initConcurrencyChart()
-    renderConcurrencyChart()
+    initGanttChart()
     loadTokenTrend()
   })
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] })
@@ -282,10 +314,12 @@ onUnmounted(() => {
   disconnectSSE()
   if (tokenTrendTimer) clearTimeout(tokenTrendTimer)
   chartInstance?.destroy()
+  ganttInstance?.destroy()
   tokenChartInstance?.destroy()
   themeObserver?.disconnect()
   if (cleanupTimer) clearInterval(cleanupTimer)
   if (clockTimer) clearInterval(clockTimer)
+  if (ganttTimer) clearInterval(ganttTimer)
 })
 
 /** KeepAlive deactivate：暂停 SSE、定时器以节省资源 */
@@ -294,17 +328,16 @@ onDeactivated(() => {
   if (tokenTrendTimer) { clearTimeout(tokenTrendTimer); tokenTrendTimer = null }
   if (cleanupTimer) { clearInterval(cleanupTimer); cleanupTimer = null }
   if (clockTimer) { clearInterval(clockTimer); clockTimer = null }
+  if (ganttTimer) { clearInterval(ganttTimer); ganttTimer = null }
 })
 
-/** KeepAlive activate：恢复 SSE 和定时器 */
+/** KeepAlive activate：恢复 SSE 和定时器（保留已有数据，不清空图表） */
 onActivated(() => {
   if (!info.value) return
-  /** 清除离线期间的过期请求，避免显示陈旧数据 */
-  liveRequests.value.clear()
-  completedRequests.value = []
   connectSSE()
   cleanupTimer = setInterval(cleanupCompleted, 30000)
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
+  ganttTimer = setInterval(renderGanttChart, 1000)
   loadTokenTrend()
 })
 
@@ -330,41 +363,178 @@ async function refresh() {
   loadGroupTokenStats()
 }
 
-/** ========== 并发 + 输出速率双 Y 轴图表 ========== */
-
-function initConcurrencyChart() {
-  if (!concurrencyCanvas.value) return
-  const ctx = concurrencyCanvas.value.getContext("2d")
+/** 甘特图初始化：浮动柱状图实现请求时间线 */
+function initGanttChart() {
+  if (!ganttCanvas.value) return
+  const ctx = ganttCanvas.value.getContext("2d")
   if (!ctx) return
   const style = getComputedStyle(document.documentElement)
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
-  chartInstance = new Chart(ctx, {
+
+  /** 自定义插件：在甘特条上方叠加状态色条（上细条 = 状态色） */
+  const statusBarPlugin = {
+    id: "statusBar",
+    afterDatasetsDraw(chart: Chart) {
+      const ctx = chart.ctx
+      ctx.save()
+      /** 每个请求一个 dataset，dataset 0 是速率折线（跳过），从 1 开始 */
+      for (let d = 1; d < chart.data.datasets.length; d++) {
+        const meta = chart.getDatasetMeta(d)
+        const statusColor = (chart.data.datasets[d] as Record<string, unknown>)._statusColor as string | undefined
+        if (!meta.data.length || !statusColor) continue
+        /** 数据行是 null 占位到泳道行的，必须按实际数据的索引取柱子，不能取 data[0] */
+        const dsData = chart.data.datasets[d]!.data as unknown[]
+        const idx = dsData.findIndex(v => v !== null && v !== undefined)
+        if (idx === -1) continue
+        const bar = meta.data[idx] as unknown as { x: number; base: number; y: number; width: number; height: number } | undefined
+        if (!bar) continue
+        /** 在柱状条上方画一条 2px 的状态色条；bar.x 是柱子中心点，左端基线是 bar.base */
+        const left = Math.min(bar.x, bar.base)
+        ctx.fillStyle = statusColor
+        ctx.fillRect(left, bar.y - bar.height / 2, bar.width, 2)
+      }
+      ctx.restore()
+    },
+  }
+
+  /**
+   * 自定义插件：在甘特条内部按 token 构成分段填充（内嵌收窄条，避免被误读为时间轴）。
+   * 颜色与 Token 趋势图一致：输入=琥珀 输出=红 缓存读=绿 缓存写=蓝。
+   */
+  const tokenBarPlugin = {
+    id: "tokenBar",
+    afterDatasetsDraw(chart: Chart) {
+      const ctx = chart.ctx
+      ctx.save()
+      /** dataset 0 是速率折线（跳过），从 1 开始是请求甘特条 */
+      for (let d = 1; d < chart.data.datasets.length; d++) {
+        const meta = chart.getDatasetMeta(d)
+        const req = (chart.data.datasets[d] as Record<string, unknown>)._request as GanttRequest | undefined
+        if (!meta.data.length || !req?.tokenUsage) continue
+        const u = req.tokenUsage
+        const total = u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens
+        if (total <= 0) continue
+        /** 找到实际数据索引（数据行是 null 占位到泳道行的） */
+        const dsData = chart.data.datasets[d]!.data as unknown[]
+        const idx = dsData.findIndex(v => v !== null && v !== undefined)
+        if (idx === -1) continue
+        const bar = meta.data[idx] as unknown as { x: number; base: number; y: number; width: number; height: number } | undefined
+        if (!bar) continue
+        const left = Math.min(bar.x, bar.base)
+        /** 内嵌收窄：高度只占甘特条中间 ~45%，上下留出提供商底色边 */
+        const stripH = bar.height * 0.45
+        const stripY = bar.y - stripH / 2
+        /** 四段按占比从左到右填充 */
+        const segments: [number, string][] = [
+          [u.inputTokens, "rgba(245, 158, 11, 0.9)"],
+          [u.outputTokens, "rgba(239, 68, 68, 0.9)"],
+          [u.cacheReadTokens, "rgba(34, 197, 94, 0.9)"],
+          [u.cacheCreationTokens, "rgba(59, 130, 246, 0.9)"],
+        ]
+        let cursor = left
+        for (const [count, color] of segments) {
+          if (count <= 0) continue
+          const w = (count / total) * bar.width
+          ctx.fillStyle = color
+          ctx.fillRect(cursor, stripY, w, stripH)
+          cursor += w
+        }
+      }
+      ctx.restore()
+    },
+  }
+
+  ganttInstance = new Chart(ctx, {
     type: "bar",
     data: { labels: [], datasets: [] },
+    plugins: [statusBarPlugin, tokenBarPlugin],
     options: {
+      indexAxis: "y" as const,
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 200 },
+      animation: false,
+      /** 空白区域的事件不拦截，泳道行少时柱子不会挤在半张图里 */
+      spanGaps: true,
       plugins: {
-        legend: { display: true, labels: { color: textDim, font: { size: 11 }, filter: (item: { text: string }) => !item.text.includes(t("dashboard.queuedConcurrency")) }, onClick: () => {} },
-        tooltip: { mode: "index", intersect: false },
+        legend: { display: false },
+        tooltip: {
+          filter: (item: { datasetIndex: number }) => item.datasetIndex > 0,
+          callbacks: {
+            /** 标题：请求模型 → 实际模型 */
+            title: (items: { dataset: Record<string, unknown> }[]) => {
+              const req = items[0]?.dataset._request as GanttRequest | undefined
+              if (!req) return ""
+              return `${req.model} → ${req.targetModel}`
+            },
+            label: (item: { dataset: Record<string, unknown>; raw: unknown }) => {
+              const req = item.dataset._request as GanttRequest | undefined
+              if (!req) return ""
+              const lines: string[] = []
+              const timeRange = item.raw as [number, number]
+              const nowMs = Date.now()
+              const isRunning = req.endedAt === null
+              const dur = isRunning ? nowMs - req.startedAt : (req.durationMs || timeRange[1] - timeRange[0])
+
+              /** 状态行 */
+              const statusText = isRunning ? t("dashboard.running") : req.status === "error" ? `${t("dashboard.filterError")} ${req.statusCode}` : `${t("dashboard.filterDone")} ${req.statusCode}`
+              lines.push(`${t("dashboard.ganttProvider")}: ${req.provider}  |  ${statusText}`)
+              /** 耗时 */
+              lines.push(`${t("dashboard.duration")}: ${formatDuration(dur)}${isRunning ? " ⏳" : ""}`)
+              /** 时间区间 */
+              lines.push(`${t("dashboard.startedAt")}: ${new Date(req.startedAt).toLocaleTimeString()} → ${isRunning ? t("dashboard.running") : new Date(req.endedAt!).toLocaleTimeString()}`)
+              /** Token 消耗（request_end 后才有），带构成占比 */
+              if (req.tokenUsage) {
+                const u = req.tokenUsage
+                const total = u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens
+                const pct = (n: number) => total > 0 ? ` (${Math.round(n / total * 100)}%)` : ""
+                const parts = [
+                  `in ${formatNumber(u.inputTokens)}${pct(u.inputTokens)}`,
+                  `out ${formatNumber(u.outputTokens)}${pct(u.outputTokens)}`,
+                ]
+                if (u.cacheReadTokens > 0) parts.push(`cache-r ${formatNumber(u.cacheReadTokens)}${pct(u.cacheReadTokens)}`)
+                if (u.cacheCreationTokens > 0) parts.push(`cache-w ${formatNumber(u.cacheCreationTokens)}${pct(u.cacheCreationTokens)}`)
+                lines.push(`Token: ${parts.join(" / ")}`)
+              }
+              /** 错误信息 */
+              if (req.error) {
+                lines.push(`${t("dashboard.filterError")}: ${truncate(req.error, 120)}`)
+              }
+              return lines
+            },
+          },
+        },
       },
       scales: {
-        x: { stacked: true, ticks: { color: textDim, maxTicksLimit: 10, font: { size: 10 } }, grid: { color: border } },
+        x: {
+          type: "linear",
+          position: "bottom",
+          /** 数值 min/max：每秒渲染时由 renderGanttChart 更新，实现窗口右移 */
+          min: 0,
+          max: 1,
+          ticks: {
+            color: textDim,
+            font: { size: 10 },
+            maxTicksLimit: 8,
+            callback: (v: number) => {
+              const d = new Date(v)
+              return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
+            },
+          },
+          grid: { color: border },
+          title: { display: true, text: t("dashboard.ganttTimeAxis"), color: textDim, font: { size: 11 } },
+        },
         y: {
-          stacked: true,
-          position: "left",
-          beginAtZero: true,
-          title: { display: true, text: t("dashboard.concurrency"), color: textDim, font: { size: 11 } },
-          ticks: { color: textDim, stepSize: 1 },
+          type: "category",
+          ticks: { display: false },
           grid: { color: border },
         },
         y1: {
+          type: "linear",
           position: "right",
           beginAtZero: true,
-          title: { display: true, text: t('dashboard.tokensPerSec'), color: textDim, font: { size: 11 } },
-          ticks: { color: textDim },
+          title: { display: true, text: t("dashboard.outputRateLabel"), color: textDim, font: { size: 10 } },
+          ticks: { color: textDim, font: { size: 10 }, maxTicksLimit: 5 },
           grid: { drawOnChartArea: false },
         },
       },
@@ -372,140 +542,102 @@ function initConcurrencyChart() {
   })
 }
 
-/** 从后端历史快照恢复图表数据（重连时先清空旧数据避免重复） */
+/** 从后端历史快照恢复速率数据（SSE 重连时回放，快照间隔 1s） */
 function restoreHistory(snapshots: { time: string; providers: { id: string; name: string; color?: string; gateway: number; upstream: number }[]; outputRate: number }[]) {
-  historyLabels.length = 0
   outputRateHistory.length = 0
-  concurrencyHistory.clear()
-  for (const snap of snapshots) {
-    historyLabels.push(snap.time)
-    for (const p of snap.providers) {
-      let entry = concurrencyHistory.get(p.id)
-      if (!entry) {
-        entry = { name: p.name, color: p.color, upstreamPoints: [], gatewayPoints: [] }
-        concurrencyHistory.set(p.id, entry)
-      }
-      entry.name = p.name
-      entry.color = p.color
-      entry.upstreamPoints.push(p.upstream)
-      entry.gatewayPoints.push(p.gateway)
-    }
-    outputRateHistory.push(snap.outputRate)
+  const nowTs = Date.now()
+  /** 快照是秒级等间隔的，从最新一个往前推时间戳 */
+  for (let i = 0; i < snapshots.length; i++) {
+    const snap = snapshots[snapshots.length - 1 - i]!
+    outputRateHistory.unshift({ ts: nowTs - i * 1000, rate: snap.outputRate })
   }
-  while (historyLabels.length > maxHistoryPoints) historyLabels.shift()
-  for (const entry of concurrencyHistory.values()) {
-    while (entry.upstreamPoints.length > maxHistoryPoints) entry.upstreamPoints.shift()
-    while (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
-  }
-  while (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
-  renderConcurrencyChart()
+  while (outputRateHistory.length > maxRatePoints) outputRateHistory.shift()
+  renderGanttChart()
 }
 
-/** 追加单个实时并发数据点并刷新图表 */
+/** 追加单个实时输出速率采样 */
 function appendChartPoint(outputRate: number) {
-  if (!chartInstance) return
-  const now = new Date()
-  const label = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
-  historyLabels.push(label)
-  if (historyLabels.length > maxHistoryPoints) historyLabels.shift()
-
-  /** 清理已移除 provider 的历史数据 */
-  const activeIds = new Set(providerConcurrency.value.map(p => p.id))
-  for (const [id] of concurrencyHistory) {
-    if (!activeIds.has(id)) concurrencyHistory.delete(id)
-  }
-
-  for (const p of providerConcurrency.value) {
-    let entry = concurrencyHistory.get(p.id)
-    if (!entry) {
-      entry = { name: p.name, color: p.color, upstreamPoints: [], gatewayPoints: [] }
-      concurrencyHistory.set(p.id, entry)
-    }
-    entry.name = p.name
-    entry.color = p.color
-    entry.upstreamPoints.push(p.upstream)
-    entry.gatewayPoints.push(p.gateway)
-    if (entry.upstreamPoints.length > maxHistoryPoints) entry.upstreamPoints.shift()
-    if (entry.gatewayPoints.length > maxHistoryPoints) entry.gatewayPoints.shift()
-  }
-
-  /** 输出速率由服务端 EMA 计算，前端仅记录 */
-  outputRateHistory.push(outputRate)
-  if (outputRateHistory.length > maxHistoryPoints) outputRateHistory.shift()
-
-  renderConcurrencyChart()
+  outputRateHistory.push({ ts: Date.now(), rate: outputRate })
+  if (outputRateHistory.length > maxRatePoints) outputRateHistory.shift()
+  renderGanttChart()
 }
 
-function renderConcurrencyChart() {
-  if (!chartInstance) return
-  // 使用 provider 自带的 color 或 getStableColor 分配颜色，不再使用硬编码 colors 数组
-  const style = getComputedStyle(document.documentElement)
-  const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
-  const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
+/** 渲染甘特图：泳道式布局——时间不重叠的请求放同一行，重叠的分配新行 */
+function renderGanttChart() {
+  if (!ganttInstance) return
+  const nowMs = Date.now()
+  const cutoff = nowMs - GANTT_WINDOW_MS
 
-  const entries = [...concurrencyHistory.entries()]
+  /** 过滤时间窗口内的请求，按开始时间排序 */
+  const visible = [...ganttRequests.value.values()]
+    .filter(r => r.startedAt >= cutoff || r.endedAt === null)
+    .sort((a, b) => a.startedAt - b.startedAt)
 
-  /** 过滤掉全部为 0 的 provider，避免空柱子占据宽度 */
-  const activeEntries = entries.filter(([_, e]) => e.gatewayPoints.some(v => v > 0))
+  /** 泳道分配：每行记录已占用的 [start, end] 区间，新请求找到第一个不冲突的行 */
+  interface Lane { ranges: [number, number][] }
+  const lanes: Lane[] = []
+  /** 请求 ID -> 泳道索引 */
+  const laneAssignment = new Map<string, number>()
 
-  /** 构建 datasets：所有 provider 的 upstream 在底层堆叠，queued 在上层堆叠，形成一根柱子 */
-  const barDatasets: Record<string, unknown>[] = []
-
-  /** 先放所有 upstream（底层，实色） */
-  for (const [providerId, entry] of activeEntries) {
-    const color = entry.color || getStableColor(providerId)
-    barDatasets.push({
-      label: entry.name,
-      data: [...entry.upstreamPoints],
-      backgroundColor: color,
-      borderColor: color,
-      borderWidth: 0,
-      yAxisID: "y",
-      stack: "concurrency",
-      order: 2,
-    })
+  for (const req of visible) {
+    const end = req.endedAt ?? nowMs
+    const range: [number, number] = [req.startedAt, end]
+    let assigned = false
+    for (let i = 0; i < lanes.length; i++) {
+      const lane = lanes[i]!
+      /** 检查是否与该行已有请求时间冲突 */
+      const conflicts = lane.ranges.some(([s, e]) => range[0] < e && range[1] > s)
+      if (!conflicts) {
+        lane.ranges.push(range)
+        laneAssignment.set(req.requestId, i)
+        assigned = true
+        break
+      }
+    }
+    if (!assigned) {
+      lanes.push({ ranges: [range] })
+      laneAssignment.set(req.requestId, lanes.length - 1)
+    }
   }
-  /** 再放所有 queued（上层，半透明） */
-  for (const [providerId, entry] of activeEntries) {
-    const color = entry.color || getStableColor(providerId)
-    barDatasets.push({
-      label: `${entry.name} (${t("dashboard.queuedConcurrency")})`,
-      data: entry.gatewayPoints.map((g, idx) => Math.max(0, g - (entry.upstreamPoints[idx] ?? 0))),
-      backgroundColor: color + "40",
-      borderColor: color + "80",
+
+  /** 按泳道索引构建 Y 轴标签（泳道 0 在顶部） */
+  const laneLabels: string[] = []
+  for (let i = 0; i < lanes.length; i++) laneLabels.push(String(i))
+
+  /**
+   * 每个请求一个 dataset：柱子的行位置由"数据索引 ↔ 标签索引"决定，
+   * 每行数据里放 null 占位到自己的泳道行，配合 grouped:false 让不同 dataset 的柱子叠绘在同一行内。
+   */
+  const datasets: Record<string, unknown>[] = []
+  for (const r of visible) {
+    const laneIdx = laneAssignment.get(r.requestId)!
+    const end = r.endedAt ?? nowMs
+    /** null 占位到目标行，柱子只出现在自己的泳道 */
+    const row: ([number, number] | null)[] = new Array(lanes.length).fill(null)
+    row[laneIdx] = [r.startedAt, Math.max(end, r.startedAt + 100)]
+    const pc = getStableColor(r.providerId)
+    datasets.push({
+      data: row,
+      backgroundColor: pc + "50",
+      borderColor: pc,
       borderWidth: 1,
+      borderSkipped: false,
+      grouped: false,
+      barPercentage: 0.7,
+      categoryPercentage: 0.8,
       yAxisID: "y",
-      stack: "concurrency",
-      order: 2,
-    })
-  }
+      stack: `req-${r.requestId}`,
+      /** 传递状态色给插件 */
+      _statusColor: r.status === "error" ? "#ef4444" : r.status === "running" ? "#3b82f6" : "#22c55e",
+      /** 携带请求引用供 tooltip 展示完整信息 */
+      _request: r,
+    })  }
 
-  /** 总并发折线 */
-  const totalLength = entries.length > 0 ? Math.max(...entries.map(([_, e]) => e.gatewayPoints.length)) : 0
-  const totalPoints: number[] = []
-  for (let i = 0; i < totalLength; i++) {
-    let sum = 0
-    for (const [_, e] of entries) sum += e.gatewayPoints[i] ?? 0
-    totalPoints.push(sum)
-  }
-  barDatasets.push({
-    label: t("dashboard.totalConcurrency"),
-    data: totalPoints,
-    borderColor: "#e2e8f0",
-    backgroundColor: "transparent",
-    type: "line",
-    tension: 0.3,
-    pointRadius: 0,
-    borderWidth: 2,
-    borderDash: [6, 3],
-    yAxisID: "y",
-    order: 0,
-  } as never)
-
-  /** 输出速率折线 */
-  barDatasets.push({
+  /** 输出速率折线：真实采样时间戳作 x 值，叠加在整个图表区域 */
+  const rateData = outputRateHistory.map(s => ({ x: s.ts, y: s.rate }))
+  datasets.push({
     label: t("dashboard.outputRateLabel"),
-    data: [...outputRateHistory],
+    data: rateData,
     borderColor: "#f472b6",
     backgroundColor: "transparent",
     type: "line",
@@ -514,19 +646,17 @@ function renderConcurrencyChart() {
     borderWidth: 2,
     borderDash: [4, 2],
     yAxisID: "y1",
-    /** Chart.js 中 order 越小越后绘制、越在上层；需小于柱状图的 2 才能浮在柱子上方 */
-    order: 1,
+    order: 0,
   } as never)
 
-  chartInstance.data.labels = historyLabels
-  chartInstance.data.datasets = barDatasets as never
-  chartInstance.options.plugins!.legend!.labels!.color = textDim
-  chartInstance.options.scales!.x!.ticks!.color = textDim
-  chartInstance.options.scales!.x!.grid!.color = border
-  chartInstance.options.scales!.y!.ticks!.color = textDim
-  chartInstance.options.scales!.y!.grid!.color = border
-  chartInstance.options.scales!.y1!.ticks!.color = textDim
-  chartInstance.update("none")
+  /** 时间窗口右移：每秒刷新时 x 轴跟着当前时刻滑动 */
+  const xScale = ganttInstance.options.scales!.x as { min: number; max: number }
+  xScale.min = nowMs - GANTT_WINDOW_MS
+  xScale.max = nowMs
+
+  ganttInstance.data.labels = laneLabels
+  ganttInstance.data.datasets = datasets as never
+  ganttInstance.update("none")
 }
 
 /** ========== Token 趋势图 ========== */
@@ -601,12 +731,13 @@ function connectSSE() {
       providerConcurrency.value = event.providers
       appendChartPoint(event.outputRate)
     } else if (event.type === "output_rate") {
-      /** 原位更新最后一列的速率值：折线实时移动，但不新增柱子 */
+      /** 原位更新最新采样的速率值：折线实时平滑移动 */
       if (outputRateHistory.length) {
-        outputRateHistory[outputRateHistory.length - 1] = event.rate
-        renderConcurrencyChart()
+        outputRateHistory[outputRateHistory.length - 1]!.rate = event.rate
+        renderGanttChart()
       }
     } else if (event.type === "request_start") {
+      const nowMs = Date.now()
       liveRequests.value.set(event.requestId, {
         requestId: event.requestId,
         model: event.model,
@@ -620,13 +751,38 @@ function connectSSE() {
         durationMs: 0,
         statusCode: 0,
         error: null,
-        startedAt: event.startedAt ?? Date.now(),
+        startedAt: event.startedAt ?? nowMs,
         rulePattern: event.rulePattern ?? null,
         keyName: event.keyName ?? null,
         groupName: event.groupName ?? null,
         tokenUsage: null,
         _scrollTimer: null,
       })
+      /** 甘特图：新增请求（Map 天然去重，SSE 重连重放不会产生重复条目） */
+      ganttRequests.value.set(event.requestId, {
+        requestId: event.requestId,
+        model: event.model,
+        targetModel: event.targetModel,
+        provider: event.provider,
+        providerId: event.providerId ?? "",
+        startedAt: event.startedAt ?? nowMs,
+        endedAt: null,
+        status: "running",
+        statusCode: 0,
+        error: null,
+        durationMs: 0,
+        tokenUsage: null,
+      })
+      if (ganttRequests.value.size > GANTT_MAX_REQUESTS) {
+        /** 淘汰最早开始的请求 */
+        let oldestId: string | null = null
+        let oldestTs = Infinity
+        for (const [id, r] of ganttRequests.value) {
+          if (r.startedAt < oldestTs) { oldestTs = r.startedAt; oldestId = id }
+        }
+        if (oldestId) ganttRequests.value.delete(oldestId)
+      }
+      renderGanttChart()
     } else if (event.type === "request_stream") {
       const req = liveRequests.value.get(event.requestId)
       if (req) {
@@ -649,6 +805,13 @@ function connectSSE() {
         req.fallbackProvider = event.providerName ?? event.providerId
         req.providerId = event.providerId
       }
+      /** 甘特图同步：fallback 切换后横线颜色跟随实际服务的提供商 */
+      const gReq = ganttRequests.value.get(event.requestId)
+      if (gReq && event.providerId && event.providerId !== gReq.providerId) {
+        gReq.providerId = event.providerId
+        if (event.providerName) gReq.provider = event.providerName
+        renderGanttChart()
+      }
     } else if (event.type === "request_end") {
       const req = liveRequests.value.get(event.requestId)
       if (req) {
@@ -665,6 +828,19 @@ function connectSSE() {
         /** 新完成的请求插入顶部后，滚动到顶部以显示最新条目 */
         nextTick(() => { if (liveLogsRef.value) liveLogsRef.value.scrollTop = 0 })
       }
+      /** 甘特图：更新请求结束时间和状态 */
+      const gReq = ganttRequests.value.get(event.requestId)
+      if (gReq) {
+        gReq.endedAt = Date.now()
+        gReq.status = event.error ? "error" : "done"
+        gReq.statusCode = event.statusCode
+        gReq.error = event.error
+        gReq.durationMs = event.durationMs
+        if (event.tokenUsage) {
+          gReq.tokenUsage = { inputTokens: event.tokenUsage.inputTokens ?? 0, outputTokens: event.tokenUsage.outputTokens ?? 0, cacheCreationTokens: event.tokenUsage.cacheCreationTokens ?? 0, cacheReadTokens: event.tokenUsage.cacheReadTokens ?? 0 }
+        }
+      }
+      renderGanttChart()
       /** 输出字符速率已通过 request_stream 实时累加 */
       scheduleTokenTrendRefresh()
     } else if (event.type === "request_stats") {
@@ -696,8 +872,21 @@ function cleanupCompleted() {
       req.error = "Timed out"
       liveRequests.value.delete(id)
       completedRequests.value.unshift(req)
+      /** 甘特图同步标记超时 */
+      const gReq = ganttRequests.value.get(id)
+      if (gReq) {
+        gReq.endedAt = cutoff
+        gReq.status = "error"
+        gReq.error = "Timed out"
+      }
     }
   }
+  /** 甘特图：清理超出时间窗口的旧请求（保留 running，它们仍要延伸显示） */
+  const ganttCutoff = cutoff - GANTT_WINDOW_MS
+  for (const [id, r] of ganttRequests.value) {
+    if (r.startedAt < ganttCutoff && r.endedAt !== null) ganttRequests.value.delete(id)
+  }
+  renderGanttChart()
 }
 
 function truncate(s: string, len: number): string {
@@ -743,7 +932,7 @@ function truncate(s: string, len: number): string {
         </div>
         <div v-show="!isCollapsed('concurrency')">
           <div class="chart-container">
-            <canvas ref="concurrencyCanvas"></canvas>
+            <canvas ref="ganttCanvas"></canvas>
           </div>
           <div v-if="providerConcurrency.length" class="concurrency-grid">
             <div v-for="p in providerConcurrency" :key="p.id" class="concurrency-block">
