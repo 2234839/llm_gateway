@@ -138,7 +138,7 @@ async function main() {
   })
 
   /** Admin 认证钩子 */
-  fastify.addHook("onRequest", createAdminAuthHook(configManager))
+  fastify.addHook("onRequest", createAdminAuthHook(db, configManager))
 
   /** API 路由带认证 */
   const apiAuthHook = createApiAuthHook(db, configManager)

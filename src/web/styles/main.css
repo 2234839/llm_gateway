@@ -104,7 +104,7 @@ body {
 .nav-btn.active { color: var(--primary); background: var(--surface2); }
 
 /** 导航角标：未读慢查询计数 */
-.badge {
+.nav-badge {
   display: inline-block;
   min-width: 16px;
   height: 16px;
@@ -221,10 +221,11 @@ body {
 .table tr:hover td { background: var(--surface); }
 
 /* Tags */
-.badge {
+.tag {
   display: inline-block;
   padding: 2px 8px;
   background: var(--surface2);
+  color: var(--text);
   border-radius: 4px;
   font-size: 11px;
   font-family: var(--mono);

@@ -551,7 +551,7 @@ export const initApi = {
 }
 
 export const authApi = {
-  login: (data: { username: string; password: string }) => api<{ success: boolean }>("/admin/login", { method: "POST", body: JSON.stringify(data) }),
+  login: (data: { username: string; password: string; trustDevice?: boolean }) => api<{ success: boolean }>("/admin/login", { method: "POST", body: JSON.stringify(data) }),
   logout: () => api<{ success: boolean }>("/admin/logout", { method: "POST" }),
 }
 
@@ -653,6 +653,25 @@ export interface SseRequestStatsEvent {
   tokensByModel?: { model: string; targetModel: string; total: TokenStats; today: TokenStats }[]
 }
 
+/** 甘特图请求历史回放：前端刷新后恢复时间线数据 */
+export interface SseGanttHistoryEvent {
+  type: "gantt_history"
+  requests: {
+    requestId: string
+    model: string
+    targetModel: string
+    provider: string
+    providerId: string
+    startedAt: number
+    endedAt: number | null
+    status: "running" | "done" | "error"
+    statusCode: number
+    error: string | null
+    durationMs: number
+    tokenUsage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number } | null
+  }[]
+}
+
 /** 慢 SQL 告警事件 */
 export interface SseSlowQueryEvent {
   type: "slow_query"
@@ -674,4 +693,5 @@ export type SseEvent =
   | SseUpstreamEndEvent
   | SseRequestEndEvent
   | SseRequestStatsEvent
+  | SseGanttHistoryEvent
   | SseSlowQueryEvent

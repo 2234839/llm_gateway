@@ -76,10 +76,11 @@ for (const [i, file] of files.entries()) {
 
 const content = [
   "/** 自动生成 - 请勿手动编辑 */",
+  "// @ts-nocheck — 哈希文件名每次构建都变，且 Bun file-embed 返回 HTMLBundle 类型，跳过类型检查",
   importLines.join("\n"),
   "",
   "/** 嵌入资源映射：url path → Bun embed file path */",
-  "export const embeddedAssets: Record<string, string> = {",
+  "export const embeddedAssets: Record<string, string | HTMLBundle> = {",
   ...mapEntries,
   "}",
 ].join("\n")

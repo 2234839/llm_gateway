@@ -18,7 +18,7 @@ function extractModelPatternSimple(node?: ConditionNode): string | undefined {
 }
 import { detectProvider, getProviderDisplayName } from "../utils/provider-detector.ts"
 import { queryProviderBalance, queryZhipuQuota, queryWithCurl, parseCurl } from "../utils/balance-query.ts"
-import { createSession, destroySession, destroyAllSessions, extractSessionToken, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
+import { createSession, destroySession, destroyAllSessions, extractSessionToken, extractCookie, sha256, TRUSTED_DEVICE_COOKIE, TRUSTED_DEVICE_TTL_MS, verifyTrustedDevice, invalidateKeyCache, invalidateAllKeyCache } from "../auth.ts"
 
 const VALID_PROTOCOL_ENDPOINT_TYPES: ProviderType[] = ["openai", "anthropic", "azure-openai", "custom", "openai-responses"]
 
@@ -47,6 +47,31 @@ function setSessionCookie(reply: import("fastify").FastifyReply, token: string) 
 function clearSessionCookie(reply: import("fastify").FastifyReply) {
   const secure = reply.request?.protocol === "https" ? "; Secure" : ""
   reply.header("Set-Cookie", `admin_token=; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=0`)
+}
+
+/** 设置信任设备持久 cookie（30 天，勾选"信任当前设备"时下发） */
+function setTrustedDeviceCookie(reply: import("fastify").FastifyReply, token: string) {
+  const secure = reply.request?.protocol === "https" ? "; Secure" : ""
+  reply.header("Set-Cookie", `${TRUSTED_DEVICE_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=${TRUSTED_DEVICE_TTL_MS / 1000}`)
+}
+
+/** 清除信任设备 cookie */
+function clearTrustedDeviceCookie(reply: import("fastify").FastifyReply) {
+  const secure = reply.request?.protocol === "https" ? "; Secure" : ""
+  reply.header("Set-Cookie", `${TRUSTED_DEVICE_COOKIE}=; Path=/; HttpOnly; SameSite=Strict${secure}; Max-Age=0`)
+}
+
+/** 生成信任设备随机 token（64 hex 字符） */
+function generateDeviceToken(): string {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("")
+}
+
+/** 信任设备标签：User-Agent 截断存储，便于用户辨识 */
+function deviceLabelFromUA(ua: string | undefined): string {
+  if (!ua) return ""
+  return ua.slice(0, 100)
 }
 
 /** 登录速率限制：每个 IP 最多 5 次失败 / 15 分钟窗口 */
@@ -104,7 +129,7 @@ function isLoopbackIp(ip: string): boolean {
     return { initialized: fastify.configManager.isAdminInitialized() }
   })
 
-  /** 初始化管理员帐号，成功后自动创建 session */
+  /** 初始化管理员帐号，成功后自动创建 session（并信任当前设备，避免引导完就要求重新登录） */
   fastify.post<{ Body: { username: string; password: string; setupToken?: string } }>("/admin/init", async (request, reply) => {
     if (fastify.configManager.isAdminInitialized()) {
       return reply.status(400).send({ error: "Admin already initialized" })
@@ -129,16 +154,20 @@ function isLoopbackIp(ip: string): boolean {
     /** 初始化成功，直接创建 session 登录 */
     const token = createSession(username)
     setSessionCookie(reply, token)
+    /** 初始化即信任当前设备 */
+    const deviceToken = generateDeviceToken()
+    fastify.db.addTrustedDevice(sha256(deviceToken), username, deviceLabelFromUA(request.headers["user-agent"]), Date.now() + TRUSTED_DEVICE_TTL_MS)
+    setTrustedDeviceCookie(reply, deviceToken)
     return { success: true }
   })
 
-  /** 管理员登录 */
-  fastify.post<{ Body: { username: string; password: string } }>("/admin/login", async (request, reply) => {
+  /** 管理员登录（trustDevice=true 时下发 30 天信任设备 cookie） */
+  fastify.post<{ Body: { username: string; password: string; trustDevice?: boolean } }>("/admin/login", async (request, reply) => {
     const ip = request.ip
     if (!checkLoginRate(ip)) {
       return reply.status(429).send({ error: "Too many login attempts. Try again later." })
     }
-    const { username, password } = request.body
+    const { username, password, trustDevice } = request.body
     if (!username || !password) {
       return reply.status(400).send({ error: "Username and password are required" })
     }
@@ -150,14 +179,23 @@ function isLoopbackIp(ip: string): boolean {
     loginAttempts.delete(ip)
     const token = createSession(username)
     setSessionCookie(reply, token)
+    /** 勾选"信任当前设备"：生成持久 token 存哈希入 DB，cookie 下发浏览器 */
+    if (trustDevice) {
+      const deviceToken = generateDeviceToken()
+      fastify.db.addTrustedDevice(sha256(deviceToken), username, deviceLabelFromUA(request.headers["user-agent"]), Date.now() + TRUSTED_DEVICE_TTL_MS)
+      setTrustedDeviceCookie(reply, deviceToken)
+    }
     return { success: true }
   })
 
-  /** 管理员登出 */
+  /** 管理员登出：撤销当前设备的信任（勾选过信任设备的话）并销毁 session */
   fastify.post("/admin/logout", async (request, reply) => {
     const token = extractSessionToken(request.headers)
     if (token) destroySession(token)
+    const deviceToken = extractCookie(request.headers, TRUSTED_DEVICE_COOKIE)
+    if (deviceToken) fastify.db.deleteTrustedDevice(sha256(deviceToken))
     clearSessionCookie(reply)
+    clearTrustedDeviceCookie(reply)
     return { success: true }
   })
 
@@ -219,8 +257,10 @@ function isLoopbackIp(ip: string): boolean {
     }
     if (newPassword) {
       await fastify.configManager.changePassword(newPassword)
-      /** 修改密码后销毁所有现有 session，强制重新登录 */
+      /** 修改密码后销毁所有现有 session 和信任设备，强制全部重新登录 */
       destroyAllSessions()
+      const adminUsername = fastify.configManager.get().admin?.username
+      if (adminUsername) fastify.db.deleteTrustedDevicesByUsername(adminUsername)
     }
     return { success: true }
   })
@@ -1192,6 +1232,48 @@ function isLoopbackIp(ip: string): boolean {
 
   // ========== SSE 实时事件流 ==========
 
+  /**
+   * 甘特图请求历史环形缓冲区：所有请求（running + completed）的轻量记录。
+   * 服务端持有，前端刷新后通过 SSE gantt_history 回放恢复，避免图表数据丢失。
+   * 只存甘特图渲染必需字段，不含 input/output 文本，内存可控。
+   */
+  interface GanttEntry {
+    requestId: string
+    model: string
+    targetModel: string
+    provider: string
+    providerId: string
+    startedAt: number
+    /** null = 仍在运行 */
+    endedAt: number | null
+    status: "running" | "done" | "error"
+    statusCode: number
+    error: string | null
+    durationMs: number
+    tokenUsage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number } | null
+  }
+  const GANTT_MAX_ENTRIES = 200
+  const GANTT_WINDOW_MS = 5 * 60_000
+  const ganttEntries = new Map<string, GanttEntry>()
+
+  /** 甘特缓冲区修剪：超限淘汰最早结束的条目，超窗口淘汰旧请求（running 保留） */
+  function pruneGanttEntries() {
+    const cutoff = Date.now() - GANTT_WINDOW_MS
+    for (const [id, r] of ganttEntries) {
+      if (r.startedAt < cutoff && r.endedAt !== null) ganttEntries.delete(id)
+    }
+    while (ganttEntries.size > GANTT_MAX_ENTRIES) {
+      let oldestId: string | null = null
+      let oldestTs = Infinity
+      for (const [id, r] of ganttEntries) {
+        const ts = r.endedAt ?? r.startedAt
+        if (ts < oldestTs) { oldestTs = ts; oldestId = id }
+      }
+      if (!oldestId) break
+      ganttEntries.delete(oldestId)
+    }
+  }
+
   /** 活跃请求追踪：存储完整信息用于 SSE 重连回放 */
   interface ActiveRequest {
     providerId: string
@@ -1373,6 +1455,22 @@ function isLoopbackIp(ip: string): boolean {
         startedAt: Date.now(),
         output: "",
       })
+      /** 甘特缓冲区：SSE 重连重放事件时 Map 天然按 requestId 去重 */
+      ganttEntries.set(event.requestId, {
+        requestId: event.requestId,
+        model: event.model,
+        targetModel: event.targetModel,
+        provider: event.provider,
+        providerId: event.providerId ?? "",
+        startedAt: event.startedAt ?? Date.now(),
+        endedAt: null,
+        status: "running",
+        statusCode: 0,
+        error: null,
+        durationMs: 0,
+        tokenUsage: null,
+      })
+      pruneGanttEntries()
       recordSnapshot()
       pushConcurrency()
     } else if (event.type === "request_end") {
@@ -1381,6 +1479,24 @@ function isLoopbackIp(ip: string): boolean {
       fastify.statsCache.recordRequest()
       /** 使统计缓存失效 */
       fastify.statsCache.onRequestEnd()
+      /** 甘特缓冲区：补全结束信息 */
+      const g = ganttEntries.get(event.requestId)
+      if (g) {
+        g.endedAt = Date.now()
+        g.status = event.error ? "error" : "done"
+        g.statusCode = event.statusCode
+        g.error = event.error
+        g.durationMs = event.durationMs
+        if (event.tokenUsage) {
+          g.tokenUsage = {
+            inputTokens: event.tokenUsage.inputTokens ?? 0,
+            outputTokens: event.tokenUsage.outputTokens ?? 0,
+            cacheCreationTokens: event.tokenUsage.cacheCreationTokens ?? 0,
+            cacheReadTokens: event.tokenUsage.cacheReadTokens ?? 0,
+          }
+        }
+      }
+      pruneGanttEntries()
       recordSnapshot()
       pushConcurrency()
       /** 防抖推送统计数据 */
@@ -1398,6 +1514,12 @@ function isLoopbackIp(ip: string): boolean {
       if (req) {
         req.providerId = event.providerId
         if (event.providerName) req.providerName = event.providerName
+      }
+      /** 甘特缓冲区同步：fallback 切换后泳道颜色跟随实际服务商 */
+      const g = ganttEntries.get(event.requestId)
+      if (g && event.providerId && event.providerId !== g.providerId) {
+        g.providerId = event.providerId
+        if (event.providerName) g.provider = event.providerName
       }
       recordSnapshot()
       pushConcurrency()
@@ -1512,6 +1634,11 @@ function isLoopbackIp(ip: string): boolean {
         startedAt: req.startedAt,
         output: req.output || undefined,
       })}\n\n`)
+    }
+
+    /** 回放甘特图请求历史，前端刷新后时间线图表数据不丢 */
+    if (ganttEntries.size > 0) {
+      safeWrite(`data: ${JSON.stringify({ type: "gantt_history", requests: [...ganttEntries.values()] })}\n\n`)
     }
 
     /** 注册并发推送：并发变化时主动推送，不再定时轮询 */

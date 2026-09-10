@@ -45,6 +45,7 @@ export class GatewayDB {
       this.pruneLogContent()
       this.pruneOldLogs()
       this.pruneSlowQueryLog()
+      this.pruneExpiredTrustedDevices()
     }, GatewayDB.PRUNE_INTERVAL_MS).unref()
   }
 
@@ -467,6 +468,19 @@ export class GatewayDB {
       )
     `)
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_slow_query_log_at ON slow_query_log(at)`)
+
+    /** 受信任设备表：勾选"信任当前设备"后持久化登录，服务重启也不失效 */
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS trusted_devices (
+        token_hash TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        device_label TEXT DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at INTEGER NOT NULL
+      )
+    `)
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_trusted_devices_expires ON trusted_devices(expires_at)`)
   }
 
   private prepareStatements() {
@@ -524,6 +538,41 @@ export class GatewayDB {
 
   deleteSecret(id: string) {
     this.stmt("DELETE FROM secrets WHERE id = ?").run(id)
+  }
+
+  // ========== Trusted Devices ==========
+
+  /** 添加受信任设备（token 存哈希，过期时间戳 ms） */
+  addTrustedDevice(tokenHash: string, username: string, deviceLabel: string, expiresAt: number) {
+    this.stmt("INSERT OR REPLACE INTO trusted_devices (token_hash, username, device_label, expires_at) VALUES (?, ?, ?, ?)").run(
+      tokenHash, username, deviceLabel, expiresAt,
+    )
+  }
+
+  /** 查询受信任设备（不存在或已过期返回 null，过期记录顺带删除） */
+  getTrustedDevice(tokenHash: string): { username: string; deviceLabel: string } | null {
+    const row = this.stmt("SELECT username, device_label, expires_at FROM trusted_devices WHERE token_hash = ?").get(tokenHash) as { username: string; device_label: string; expires_at: number } | undefined
+    if (!row) return null
+    if (row.expires_at < Date.now()) {
+      this.stmt("DELETE FROM trusted_devices WHERE token_hash = ?").run(tokenHash)
+      return null
+    }
+    return { username: row.username, deviceLabel: row.device_label }
+  }
+
+  /** 撤销受信任设备（登出勾选时 / 修改密码时按用户清理） */
+  deleteTrustedDevice(tokenHash: string) {
+    this.stmt("DELETE FROM trusted_devices WHERE token_hash = ?").run(tokenHash)
+  }
+
+  /** 删除指定用户的所有受信任设备（修改密码后调用） */
+  deleteTrustedDevicesByUsername(username: string) {
+    this.stmt("DELETE FROM trusted_devices WHERE username = ?").run(username)
+  }
+
+  /** 定期清理过期受信任设备 */
+  pruneExpiredTrustedDevices() {
+    this.stmt("DELETE FROM trusted_devices WHERE expires_at < ?").run(Date.now())
   }
 
   // ========== Config ==========

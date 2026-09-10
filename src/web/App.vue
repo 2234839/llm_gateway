@@ -52,6 +52,9 @@ const showSettings = ref(false)
 
 const LS_KEY_LOGGED_IN = "admin_logged_in"
 const LS_KEY_CREDENTIALS = "admin_credentials"
+/** 信任当前设备：勾选后 30 天内免密自动登录（服务重启也有效） */
+const trustDevice = ref(true)
+/** 仅记住用户名（历史保留，不再单独展示勾选框） */
 const rememberMe = ref(false)
 
 /** 进入登录页时恢复记住的凭据 */
@@ -248,10 +251,10 @@ async function handleLogin() {
     return
   }
   try {
-    await authApi.login({ username: loginForm.username, password: loginForm.password })
+    await authApi.login({ username: loginForm.username, password: loginForm.password, trustDevice: trustDevice.value })
     gatewayConfig.value = await configApi.get()
     /** 记住帐号 */
-    if (rememberMe.value) {
+    if (trustDevice.value || rememberMe.value) {
       localStorage.setItem(LS_KEY_CREDENTIALS, JSON.stringify({ username: loginForm.username }))
     } else {
       localStorage.removeItem(LS_KEY_CREDENTIALS)
@@ -371,8 +374,8 @@ async function handleChangePassword() {
         </label>
       </div>
       <label class="remember-row">
-        <input type="checkbox" v-model="rememberMe" />
-        <span>{{ t("login.rememberMe") }}</span>
+        <input type="checkbox" v-model="trustDevice" />
+        <span>{{ t("login.trustDevice") }}</span>
       </label>
       <p v-if="loginError" class="error-text">{{ loginError }}</p>
       <div class="form-actions">
@@ -392,7 +395,7 @@ async function handleChangePassword() {
           :class="['nav-btn', { active: activeTab === key }]"
           @click="switchTab(key)">
           {{ tabLabel(key) }}
-          <span v-if="key === 'slowqueries' && slowQueryBadge > 0" class="badge">{{ slowQueryBadge > 99 ? '99+' : slowQueryBadge }}</span>
+          <span v-if="key === 'slowqueries' && slowQueryBadge > 0" class="nav-badge">{{ slowQueryBadge > 99 ? '99+' : slowQueryBadge }}</span>
         </button>
       </nav>
       <div class="header-actions">

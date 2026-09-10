@@ -20,7 +20,7 @@ function extractApiKey(headers: Record<string, string | string[] | undefined>): 
 }
 
 /** SHA-256 哈希 */
-function sha256(input: string): string {
+export function sha256(input: string): string {
   return new Bun.CryptoHasher("sha256").update(input).digest("hex")
 }
 
@@ -80,17 +80,44 @@ export function destroyAllSessions(): void {
   sessions.clear()
 }
 
-/** 从 cookie 中提取 admin_token */
-export function extractSessionToken(headers: Record<string, string | string[] | undefined>): string | null {
+/** 信任设备 token 有效期：30 天 */
+export const TRUSTED_DEVICE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+/** 信任设备 cookie 名 */
+export const TRUSTED_DEVICE_COOKIE = "trusted_device"
+
+/**
+ * 验证信任设备 token：有效则自动重建 session（无感登录），返回 username 或 null。
+ * 命中时滑动续期：重写 last_used_at，并把过期时间延长到完整的 30 天。
+ */
+export function verifyTrustedDevice(db: GatewayDB, token: string): string | null {
+  if (!token) return null
+  const hash = sha256(token)
+  const record = db.getTrustedDevice(hash)
+  if (!record) return null
+  /** 有效信任设备 → 重建内存 session（服务重启后 session 丢失，靠它恢复登录态） */
+  const username = record.username
+  createSession(username)
+  /** 滑动续期：每次验证成功都顺延 30 天 */
+  db.addTrustedDevice(hash, username, record.deviceLabel, Date.now() + TRUSTED_DEVICE_TTL_MS)
+  return username
+}
+
+/** 从 cookie 中提取指定名称的值 */
+export function extractCookie(headers: Record<string, string | string[] | undefined>, name: string): string | null {
   const cookie = headers["cookie"]
   if (typeof cookie !== "string") return null
   for (const part of cookie.split(";")) {
     const trimmed = part.trim()
-    if (trimmed.startsWith("admin_token=")) {
-      return trimmed.slice("admin_token=".length)
+    if (trimmed.startsWith(`${name}=`)) {
+      return trimmed.slice(name.length + 1)
     }
   }
   return null
+}
+
+/** 从 cookie 中提取 admin_token */
+export function extractSessionToken(headers: Record<string, string | string[] | undefined>): string | null {
+  return extractCookie(headers, "admin_token")
 }
 
 /** API Key 内存缓存：hash -> { context, expiresAt } */
@@ -190,7 +217,7 @@ export function createApiAuthHook(db: GatewayDB, configManager: ConfigManager) {
 }
 
 /** Admin 路由认证钩子工厂 */
-export function createAdminAuthHook(configManager: ConfigManager) {
+export function createAdminAuthHook(db: GatewayDB, configManager: ConfigManager) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     /** 只对 /admin/ 路径生效（忽略查询参数） */
     const path = request.url.split("?")[0]!
@@ -208,6 +235,13 @@ export function createAdminAuthHook(configManager: ConfigManager) {
       const username = verifySession(token)
       if (username) return
     }
+
+    /**
+     * 信任设备兜底：session 失效（服务重启 / 7 天过期）时，
+     * 持久 cookie trusted_device 仍有效 → 自动重建 session，无感续登。
+     */
+    const deviceToken = extractCookie(request.headers, TRUSTED_DEVICE_COOKIE)
+    if (deviceToken && verifyTrustedDevice(db, deviceToken)) return
 
     /** 未认证 */
     return reply.status(401).send({ error: "Authentication required" })

@@ -420,6 +420,7 @@ export default {
     errorInvalidCredentials: "用户名或密码错误",
     errorFailed: "登录失败",
     rememberMe: "记住帐号",
+    trustDevice: "信任当前设备，30 天内自动登录",
   },
   settings: {
     requireAuth: "要求 API Key 认证",

@@ -129,10 +129,77 @@ interface GanttRequest {
  * 导致同一请求在泳道分配时因时间自冲突被分到多条泳道。
  */
 const ganttRequests = ref<Map<string, GanttRequest>>(new Map())
-/** 甘特图时间窗口（毫秒）：只显示最近 N 秒内的请求 */
-const GANTT_WINDOW_MS = 5 * 60_000 // 5 分钟
+/** 甘特图数据保留窗口（毫秒）：显示最近 30 分钟内的请求；配合空闲压缩，轴长不会随窗口变大 */
+const GANTT_WINDOW_MS = 30 * 60_000
 /** 甘特图最大追踪请求数 */
 const GANTT_MAX_REQUESTS = 80
+/** 空闲压缩阈值：相邻请求间隔超过 1 分钟才压缩 */
+const IDLE_COMPRESS_THRESHOLD_MS = 60_000
+/** 空闲压缩后的固定格子宽度：>1 分钟的空闲在轴上只占 1 分钟 */
+const IDLE_COMPRESSED_WIDTH_MS = 60_000
+
+/** 空闲压缩映射段：realStart~realEnd 的间隙在压缩轴上只占 IDLE_COMPRESSED_WIDTH_MS 宽 */
+interface GanttIdleGap {
+  realStart: number
+  realEnd: number
+  /** 该间隙之前累计压缩掉的时间量 */
+  shiftBefore: number
+}
+
+/** 当前帧的压缩映射段（每次渲染重建，tick 逆映射共用） */
+let ganttIdleGaps: GanttIdleGap[] = []
+
+/**
+ * 从可见请求构建空闲压缩映射：相邻请求间隔 > 阈值时记为一段压缩间隙。
+ * 尾部空闲（无 running 请求时）同样压缩——轴在空闲期冻结，不再匀速前推。
+ */
+function buildGanttIdleGaps(visible: GanttRequest[], nowMs: number) {
+  const gaps: GanttIdleGap[] = []
+  let prevEnd = visible.length ? visible[0]!.startedAt : nowMs
+  let shift = 0
+  for (const r of visible) {
+    const end = r.endedAt ?? nowMs
+    if (r.startedAt - prevEnd > IDLE_COMPRESS_THRESHOLD_MS) {
+      gaps.push({ realStart: prevEnd, realEnd: r.startedAt, shiftBefore: shift })
+      shift += (r.startedAt - prevEnd) - IDLE_COMPRESSED_WIDTH_MS
+    }
+    prevEnd = Math.max(prevEnd, end)
+  }
+  if (!visible.some(r => r.endedAt === null) && nowMs - prevEnd > IDLE_COMPRESS_THRESHOLD_MS) {
+    gaps.push({ realStart: prevEnd, realEnd: nowMs, shiftBefore: shift })
+  }
+  ganttIdleGaps = gaps
+}
+
+/** 真实时间戳 → 压缩轴坐标：空闲段内部线性扫过格子后钳在格子末端 */
+function ganttCompressTime(t: number): number {
+  let shift = 0
+  for (const g of ganttIdleGaps) {
+    if (t <= g.realStart) break
+    if (t < g.realEnd) {
+      const into = Math.min(t - g.realStart, IDLE_COMPRESSED_WIDTH_MS)
+      return g.realStart + shift + into
+    }
+    shift += (g.realEnd - g.realStart) - IDLE_COMPRESSED_WIDTH_MS
+  }
+  return t - shift
+}
+
+/** 压缩轴坐标 → 真实时间戳（tick 标签逆映射；格子内部取前 1 分钟线性区还原） */
+function ganttRealTime(tc: number): number {
+  let shift = 0
+  for (const g of ganttIdleGaps) {
+    const delta = (g.realEnd - g.realStart) - IDLE_COMPRESSED_WIDTH_MS
+    const boxStart = g.realStart + shift
+    if (tc < boxStart) return tc + shift
+    if (tc <= boxStart + IDLE_COMPRESSED_WIDTH_MS) {
+      const into = Math.min(tc - boxStart, IDLE_COMPRESSED_WIDTH_MS)
+      return g.realStart + into
+    }
+    shift += delta
+  }
+  return tc + shift
+}
 
 /** 分组 Token 用量 */
 const groupTokenStats = ref<{ groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
@@ -372,35 +439,57 @@ function initGanttChart() {
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
 
-  /** 自定义插件：在甘特条上方叠加状态色条（上细条 = 状态色） */
-  const statusBarPlugin = {
-    id: "statusBar",
+  /**
+   * 自定义插件：失败请求整块警告样式。
+   * 成功请求不做任何状态标识（内部 token 堆叠即全部信息）；
+   * 失败请求用红色半透明底 + 红色边框 + 斜纹覆盖，强警示。
+   */
+  const errorBarPlugin = {
+    id: "errorBar",
     afterDatasetsDraw(chart: Chart) {
       const ctx = chart.ctx
       ctx.save()
       /** 每个请求一个 dataset，dataset 0 是速率折线（跳过），从 1 开始 */
       for (let d = 1; d < chart.data.datasets.length; d++) {
         const meta = chart.getDatasetMeta(d)
-        const statusColor = (chart.data.datasets[d] as Record<string, unknown>)._statusColor as string | undefined
-        if (!meta.data.length || !statusColor) continue
+        const req = (chart.data.datasets[d] as Record<string, unknown>)._request as GanttRequest | undefined
+        if (!meta.data.length || req?.status !== "error") continue
         /** 数据行是 null 占位到泳道行的，必须按实际数据的索引取柱子，不能取 data[0] */
         const dsData = chart.data.datasets[d]!.data as unknown[]
         const idx = dsData.findIndex(v => v !== null && v !== undefined)
         if (idx === -1) continue
         const bar = meta.data[idx] as unknown as { x: number; base: number; y: number; width: number; height: number } | undefined
         if (!bar) continue
-        /** 在柱状条上方画一条 2px 的状态色条；bar.x 是柱子中心点，左端基线是 bar.base */
         const left = Math.min(bar.x, bar.base)
-        ctx.fillStyle = statusColor
-        ctx.fillRect(left, bar.y - bar.height / 2, bar.width, 2)
+        const top = bar.y - bar.height / 2
+        /** 红色斜纹填充：45° 条纹铺满整个甘特条 */
+        ctx.beginPath()
+        ctx.rect(left, top, bar.width, bar.height)
+        ctx.clip()
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.75)"
+        ctx.lineWidth = 2
+        const step = 6
+        for (let x = left - bar.height; x < left + bar.width; x += step) {
+          ctx.beginPath()
+          ctx.moveTo(x, top + bar.height)
+          ctx.lineTo(x + bar.height, top)
+          ctx.stroke()
+        }
+        ctx.restore()
+        ctx.save()
+        /** 红色边框包住整块 */
+        ctx.strokeStyle = "#ef4444"
+        ctx.lineWidth = 1.5
+        ctx.strokeRect(left, top, bar.width, bar.height)
       }
       ctx.restore()
     },
   }
 
   /**
-   * 自定义插件：在甘特条内部按 token 构成分段填充（内嵌收窄条，避免被误读为时间轴）。
-   * 颜色与 Token 趋势图一致：输入=琥珀 输出=红 缓存读=绿 缓存写=蓝。
+   * 自定义插件：甘特条内部按 token 构成以"小方格"填充（华夫图式）。
+   * 格子按条块像素尺寸自适应：每格目标 ~4×4px，条块越长格子越多、不设上限，
+   * 格数 = 占比 × 总格数 —— 离散格子可直接数"输出占了几格"。
    */
   const tokenBarPlugin = {
     id: "tokenBar",
@@ -422,23 +511,44 @@ function initGanttChart() {
         const bar = meta.data[idx] as unknown as { x: number; base: number; y: number; width: number; height: number } | undefined
         if (!bar) continue
         const left = Math.min(bar.x, bar.base)
-        /** 内嵌收窄：高度只占甘特条中间 ~45%，上下留出提供商底色边 */
-        const stripH = bar.height * 0.45
-        const stripY = bar.y - stripH / 2
-        /** 四段按占比从左到右填充 */
+        const top = bar.y - bar.height / 2
+        /** 网格规模：每格目标 ~4px，纯面积驱动——条越长格越多，无上限 */
+        const rows = Math.max(1, Math.floor(bar.height / 4))
+        const cols = Math.max(1, Math.floor(bar.width / 4))
+        const nCells = rows * cols
+        if (nCells <= 0) continue
+        /** 段顺序与趋势图配色一致：输入=琥珀 输出=红 缓存读=绿 缓存写=蓝 */
         const segments: [number, string][] = [
           [u.inputTokens, "rgba(245, 158, 11, 0.9)"],
           [u.outputTokens, "rgba(239, 68, 68, 0.9)"],
           [u.cacheReadTokens, "rgba(34, 197, 94, 0.9)"],
           [u.cacheCreationTokens, "rgba(59, 130, 246, 0.9)"],
         ]
-        let cursor = left
+        /** 累计占比切格：保证各段格数之和恰好 = 总格数；非零段至少 1 格 */
+        let cum = 0
+        let prevBound = 0
+        const segRanges: { start: number; end: number; color: string }[] = []
         for (const [count, color] of segments) {
           if (count <= 0) continue
-          const w = (count / total) * bar.width
-          ctx.fillStyle = color
-          ctx.fillRect(cursor, stripY, w, stripH)
-          cursor += w
+          cum += count
+          let bound = Math.round((cum / total) * nCells)
+          if (bound <= prevBound) bound = prevBound + 1
+          segRanges.push({ start: prevBound, end: Math.min(bound, nCells), color })
+          prevBound = Math.min(bound, nCells)
+          if (prevBound >= nCells) break
+        }
+        /** 逐格填充：格序号 row-major，自下而上逐行、行内从左到右；同块内铺满不留缝 */
+        const cw = bar.width / cols
+        const ch = bar.height / rows
+        for (const seg of segRanges) {
+          ctx.fillStyle = seg.color
+          for (let i = seg.start; i < seg.end; i++) {
+            const row = Math.floor(i / cols)
+            const col = i % cols
+            const x = left + col * cw
+            const y = top + bar.height - (row + 1) * ch
+            ctx.fillRect(x, y, cw + 0.5, ch + 0.5)
+          }
         }
       }
       ctx.restore()
@@ -448,7 +558,7 @@ function initGanttChart() {
   ganttInstance = new Chart(ctx, {
     type: "bar",
     data: { labels: [], datasets: [] },
-    plugins: [statusBarPlugin, tokenBarPlugin],
+    plugins: [errorBarPlugin, tokenBarPlugin],
     options: {
       indexAxis: "y" as const,
       responsive: true,
@@ -509,7 +619,7 @@ function initGanttChart() {
         x: {
           type: "linear",
           position: "bottom",
-          /** 数值 min/max：每秒渲染时由 renderGanttChart 更新，实现窗口右移 */
+          /** 数值 min/max：每秒渲染时由 renderGanttChart 更新（空闲压缩后的虚拟坐标） */
           min: 0,
           max: 1,
           ticks: {
@@ -517,8 +627,15 @@ function initGanttChart() {
             font: { size: 10 },
             maxTicksLimit: 8,
             callback: (v: number) => {
-              const d = new Date(v)
-              return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
+              /** 压缩轴坐标逆映射回真实时间再格式化；压缩格子内标 "≫" 提示被折叠 */
+              const real = ganttRealTime(v)
+              const inGap = ganttIdleGaps.some(g => {
+                const boxStart = g.realStart + (g.shiftBefore ?? 0)
+                return v > boxStart + IDLE_COMPRESSED_WIDTH_MS / 2 && v < boxStart + IDLE_COMPRESSED_WIDTH_MS
+              })
+              const d = new Date(real)
+              const hhmmss = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
+              return inGap ? `${hhmmss}≫` : hhmmss
             },
           },
           grid: { color: border },
@@ -573,6 +690,10 @@ function renderGanttChart() {
     .filter(r => r.startedAt >= cutoff || r.endedAt === null)
     .sort((a, b) => a.startedAt - b.startedAt)
 
+  /** 先构建空闲压缩映射，后续所有 x 坐标都走压缩轴 */
+  buildGanttIdleGaps(visible, nowMs)
+  const cx = (t: number) => ganttCompressTime(t)
+
   /** 泳道分配：每行记录已占用的 [start, end] 区间，新请求找到第一个不冲突的行 */
   interface Lane { ranges: [number, number][] }
   const lanes: Lane[] = []
@@ -612,9 +733,9 @@ function renderGanttChart() {
   for (const r of visible) {
     const laneIdx = laneAssignment.get(r.requestId)!
     const end = r.endedAt ?? nowMs
-    /** null 占位到目标行，柱子只出现在自己的泳道 */
+    /** null 占位到目标行，柱子只出现在自己的泳道；坐标压缩后写入 */
     const row: ([number, number] | null)[] = new Array(lanes.length).fill(null)
-    row[laneIdx] = [r.startedAt, Math.max(end, r.startedAt + 100)]
+    row[laneIdx] = [cx(r.startedAt), Math.max(cx(end), cx(r.startedAt) + 100)]
     const pc = getStableColor(r.providerId)
     datasets.push({
       data: row,
@@ -627,14 +748,12 @@ function renderGanttChart() {
       categoryPercentage: 0.8,
       yAxisID: "y",
       stack: `req-${r.requestId}`,
-      /** 传递状态色给插件 */
-      _statusColor: r.status === "error" ? "#ef4444" : r.status === "running" ? "#3b82f6" : "#22c55e",
-      /** 携带请求引用供 tooltip 展示完整信息 */
+      /** 携带请求引用供 tooltip 与失败样式插件使用 */
       _request: r,
     })  }
 
-  /** 输出速率折线：真实采样时间戳作 x 值，叠加在整个图表区域 */
-  const rateData = outputRateHistory.map(s => ({ x: s.ts, y: s.rate }))
+  /** 输出速率折线：采样时间戳压缩后叠加在整个图表区域，实线提高辨识度 */
+  const rateData = outputRateHistory.map(s => ({ x: cx(s.ts), y: s.rate }))
   datasets.push({
     label: t("dashboard.outputRateLabel"),
     data: rateData,
@@ -644,15 +763,15 @@ function renderGanttChart() {
     tension: 0.3,
     pointRadius: 0,
     borderWidth: 2,
-    borderDash: [4, 2],
     yAxisID: "y1",
     order: 0,
   } as never)
 
-  /** 时间窗口右移：每秒刷新时 x 轴跟着当前时刻滑动 */
+  /** 压缩轴窗口：左端 = 最早可见请求（或当前时刻回退一个窗口），右端 = 当前时刻压缩坐标 */
   const xScale = ganttInstance.options.scales!.x as { min: number; max: number }
-  xScale.min = nowMs - GANTT_WINDOW_MS
-  xScale.max = nowMs
+  const dataStart = visible.length ? cx(visible[0]!.startedAt) : cx(nowMs - GANTT_WINDOW_MS)
+  xScale.min = Math.min(dataStart, cx(nowMs) - GANTT_WINDOW_MS)
+  xScale.max = cx(nowMs)
 
   ganttInstance.data.labels = laneLabels
   ganttInstance.data.datasets = datasets as never
@@ -727,6 +846,25 @@ function connectSSE() {
   sseUnsubscribe = subscribeSSE((event) => {
     if (event.type === "concurrency_history") {
       restoreHistory(event.snapshots)
+    } else if (event.type === "gantt_history") {
+      /** 服务端甘特缓冲区回放：刷新后恢复时间线，Map 按 requestId 去重 */
+      for (const r of event.requests) {
+        ganttRequests.value.set(r.requestId, {
+          requestId: r.requestId,
+          model: r.model,
+          targetModel: r.targetModel,
+          provider: r.provider,
+          providerId: r.providerId,
+          startedAt: r.startedAt,
+          endedAt: r.endedAt,
+          status: r.status,
+          statusCode: r.statusCode,
+          error: r.error,
+          durationMs: r.durationMs,
+          tokenUsage: r.tokenUsage,
+        })
+      }
+      renderGanttChart()
     } else if (event.type === "concurrency") {
       providerConcurrency.value = event.providers
       appendChartPoint(event.outputRate)

@@ -420,6 +420,7 @@ export default {
     errorInvalidCredentials: "Invalid username or password",
     errorFailed: "Login failed",
     rememberMe: "Remember me",
+    trustDevice: "Trust this device for 30-day auto login",
   },
   settings: {
     requireAuth: "Require API Key Authentication",

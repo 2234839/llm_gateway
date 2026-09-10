@@ -420,8 +420,8 @@ function removeHeader(index: number) {
               {{ p.name }}
             </td>
             <td>
-              <span class="badge">{{ p.type }}</span>
-              <span v-for="proto in Object.keys(p.protocolEndpoints ?? {})" :key="proto" class="badge badge-extra" :title="`${p.protocolEndpoints![proto as keyof NonNullable<typeof p.protocolEndpoints>]}`">+{{ proto }}</span>
+              <span class="tag">{{ p.type }}</span>
+              <span v-for="proto in Object.keys(p.protocolEndpoints ?? {})" :key="proto" class="tag badge-extra" :title="`${p.protocolEndpoints![proto as keyof NonNullable<typeof p.protocolEndpoints>]}`">+{{ proto }}</span>
             </td>
             <td class="mono">{{ p.baseUrl }}</td>
             <td>
