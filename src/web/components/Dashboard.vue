@@ -129,77 +129,24 @@ interface GanttRequest {
  * 导致同一请求在泳道分配时因时间自冲突被分到多条泳道。
  */
 const ganttRequests = ref<Map<string, GanttRequest>>(new Map())
-/** 甘特图数据保留窗口（毫秒）：显示最近 30 分钟内的请求；配合空闲压缩，轴长不会随窗口变大 */
+/** 甘特图显示窗口（毫秒）：横轴为纯真实时间，恒定 [now-30min, now] 平滑左移 */
 const GANTT_WINDOW_MS = 30 * 60_000
-/** 甘特图最大追踪请求数 */
-const GANTT_MAX_REQUESTS = 80
-/** 空闲压缩阈值：相邻请求间隔超过 1 分钟才压缩 */
-const IDLE_COMPRESS_THRESHOLD_MS = 60_000
-/** 空闲压缩后的固定格子宽度：>1 分钟的空闲在轴上只占 1 分钟 */
-const IDLE_COMPRESSED_WIDTH_MS = 60_000
+/** 甘特图最大追踪请求数（与后端 GANTT_MAX_ENTRIES 对齐） */
+const GANTT_MAX_REQUESTS = 200
 
-/** 空闲压缩映射段：realStart~realEnd 的间隙在压缩轴上只占 IDLE_COMPRESSED_WIDTH_MS 宽 */
-interface GanttIdleGap {
-  realStart: number
-  realEnd: number
-  /** 该间隙之前累计压缩掉的时间量 */
-  shiftBefore: number
+/** 持久化泳道的单条区间记录 */
+interface GanttLaneEntry {
+  /** 请求 ID，用于同步存活状态 */
+  id: string
+  start: number
+  end: number
 }
-
-/** 当前帧的压缩映射段（每次渲染重建，tick 逆映射共用） */
-let ganttIdleGaps: GanttIdleGap[] = []
-
-/**
- * 从可见请求构建空闲压缩映射：相邻请求间隔 > 阈值时记为一段压缩间隙。
- * 尾部空闲（无 running 请求时）同样压缩——轴在空闲期冻结，不再匀速前推。
- */
-function buildGanttIdleGaps(visible: GanttRequest[], nowMs: number) {
-  const gaps: GanttIdleGap[] = []
-  let prevEnd = visible.length ? visible[0]!.startedAt : nowMs
-  let shift = 0
-  for (const r of visible) {
-    const end = r.endedAt ?? nowMs
-    if (r.startedAt - prevEnd > IDLE_COMPRESS_THRESHOLD_MS) {
-      gaps.push({ realStart: prevEnd, realEnd: r.startedAt, shiftBefore: shift })
-      shift += (r.startedAt - prevEnd) - IDLE_COMPRESSED_WIDTH_MS
-    }
-    prevEnd = Math.max(prevEnd, end)
-  }
-  if (!visible.some(r => r.endedAt === null) && nowMs - prevEnd > IDLE_COMPRESS_THRESHOLD_MS) {
-    gaps.push({ realStart: prevEnd, realEnd: nowMs, shiftBefore: shift })
-  }
-  ganttIdleGaps = gaps
-}
-
-/** 真实时间戳 → 压缩轴坐标：空闲段内部线性扫过格子后钳在格子末端 */
-function ganttCompressTime(t: number): number {
-  let shift = 0
-  for (const g of ganttIdleGaps) {
-    if (t <= g.realStart) break
-    if (t < g.realEnd) {
-      const into = Math.min(t - g.realStart, IDLE_COMPRESSED_WIDTH_MS)
-      return g.realStart + shift + into
-    }
-    shift += (g.realEnd - g.realStart) - IDLE_COMPRESSED_WIDTH_MS
-  }
-  return t - shift
-}
-
-/** 压缩轴坐标 → 真实时间戳（tick 标签逆映射；格子内部取前 1 分钟线性区还原） */
-function ganttRealTime(tc: number): number {
-  let shift = 0
-  for (const g of ganttIdleGaps) {
-    const delta = (g.realEnd - g.realStart) - IDLE_COMPRESSED_WIDTH_MS
-    const boxStart = g.realStart + shift
-    if (tc < boxStart) return tc + shift
-    if (tc <= boxStart + IDLE_COMPRESSED_WIDTH_MS) {
-      const into = Math.min(tc - boxStart, IDLE_COMPRESSED_WIDTH_MS)
-      return g.realStart + into
-    }
-    shift += delta
-  }
-  return tc + shift
-}
+/** 持久化泳道：行号一经分配不再变化，旧请求滑出后其余柱子绝不换行 */
+const ganttLanes: GanttLaneEntry[][] = []
+/** 请求 ID -> 泳道行号 */
+const ganttLaneOf = new Map<string, number>()
+/** 当前鼠标悬停的请求 ID：由 onHover 回调维护，hoverHighlightPlugin 据此绘制高亮 */
+let ganttHoverId: string | null = null
 
 /** 分组 Token 用量 */
 const groupTokenStats = ref<{ groupId: string; groupName: string; total: TokenStats; today: TokenStats }[]>([])
@@ -438,6 +385,8 @@ function initGanttChart() {
   const style = getComputedStyle(document.documentElement)
   const textDim = style.getPropertyValue("--text-dim").trim() || "#888"
   const border = style.getPropertyValue("--border").trim() || "#2a2a2a"
+  /** 主文本色：悬停描边用它，深浅主题下都有足够对比度 */
+  const textMain = style.getPropertyValue("--text").trim() || "#1a1a1a"
 
   /**
    * 自定义插件：失败请求整块警告样式。
@@ -555,10 +504,43 @@ function initGanttChart() {
     },
   }
 
+  /**
+   * 自定义插件：悬停高亮。
+   * 鼠标所在请求的甘特条外围绘制高对比描边 + 同色罩层——
+   * token 方格填充会盖住柱子本身的 hover 配色，罩层+描边保证任何柱子都有明确反馈。
+   */
+  const hoverHighlightPlugin = {
+    id: "hoverHighlight",
+    afterDatasetsDraw(chart: Chart) {
+      if (!ganttHoverId) return
+      const ctx = chart.ctx
+      ctx.save()
+      for (let d = 1; d < chart.data.datasets.length; d++) {
+        const req = (chart.data.datasets[d] as Record<string, unknown>)._request as GanttRequest | undefined
+        if (req?.requestId !== ganttHoverId) continue
+        const meta = chart.getDatasetMeta(d)
+        const dsData = chart.data.datasets[d]!.data as unknown[]
+        const idx = dsData.findIndex(v => v !== null && v !== undefined)
+        if (idx === -1) continue
+        const bar = meta.data[idx] as unknown as { x: number; base: number; y: number; width: number; height: number } | undefined
+        if (!bar) continue
+        const left = Math.min(bar.x, bar.base)
+        const top = bar.y - bar.height / 2
+        ctx.fillStyle = getStableColor(req.providerId) + "40"
+        ctx.fillRect(left, top, bar.width, bar.height)
+        ctx.strokeStyle = textMain
+        ctx.lineWidth = 2
+        ctx.strokeRect(left - 1.5, top - 1.5, bar.width + 3, bar.height + 3)
+        break
+      }
+      ctx.restore()
+    },
+  }
+
   ganttInstance = new Chart(ctx, {
     type: "bar",
     data: { labels: [], datasets: [] },
-    plugins: [errorBarPlugin, tokenBarPlugin],
+    plugins: [errorBarPlugin, tokenBarPlugin, hoverHighlightPlugin],
     options: {
       indexAxis: "y" as const,
       responsive: true,
@@ -566,6 +548,17 @@ function initGanttChart() {
       animation: false,
       /** 空白区域的事件不拦截，泳道行少时柱子不会挤在半张图里 */
       spanGaps: true,
+      /** 悬停追踪：记录所在请求 ID 供高亮插件使用，并切换指针样式 */
+      onHover: (event: unknown, elements: { datasetIndex: number }[]) => {
+        const el = elements[0]
+        const ds = el && el.datasetIndex > 0
+          ? ganttInstance?.data.datasets[el.datasetIndex] as Record<string, unknown> | undefined
+          : undefined
+        const next = (ds?._request as GanttRequest | undefined)?.requestId ?? null
+        if (next !== ganttHoverId) ganttHoverId = next
+        const native = (event as { native?: { target?: { style?: CSSStyleDeclaration } } }).native
+        if (native?.target?.style) native.target.style.cursor = next ? "pointer" : "default"
+      },
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -619,7 +612,7 @@ function initGanttChart() {
         x: {
           type: "linear",
           position: "bottom",
-          /** 数值 min/max：每秒渲染时由 renderGanttChart 更新（空闲压缩后的虚拟坐标） */
+          /** 数值 min/max：每秒渲染时由 renderGanttChart 更新（真实时间窗口） */
           min: 0,
           max: 1,
           ticks: {
@@ -627,15 +620,8 @@ function initGanttChart() {
             font: { size: 10 },
             maxTicksLimit: 8,
             callback: (v: number) => {
-              /** 压缩轴坐标逆映射回真实时间再格式化；压缩格子内标 "≫" 提示被折叠 */
-              const real = ganttRealTime(v)
-              const inGap = ganttIdleGaps.some(g => {
-                const boxStart = g.realStart + (g.shiftBefore ?? 0)
-                return v > boxStart + IDLE_COMPRESSED_WIDTH_MS / 2 && v < boxStart + IDLE_COMPRESSED_WIDTH_MS
-              })
-              const d = new Date(real)
-              const hhmmss = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
-              return inGap ? `${hhmmss}≫` : hhmmss
+              const d = new Date(v)
+              return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`
             },
           },
           grid: { color: border },
@@ -685,45 +671,61 @@ function renderGanttChart() {
   const nowMs = Date.now()
   const cutoff = nowMs - GANTT_WINDOW_MS
 
-  /** 过滤时间窗口内的请求，按开始时间排序 */
+  /** 纯真实时间轴：起点在窗口内的请求可见（running 请求始终可见） */
   const visible = [...ganttRequests.value.values()]
     .filter(r => r.startedAt >= cutoff || r.endedAt === null)
     .sort((a, b) => a.startedAt - b.startedAt)
 
-  /** 先构建空闲压缩映射，后续所有 x 坐标都走压缩轴 */
-  buildGanttIdleGaps(visible, nowMs)
-  const cx = (t: number) => ganttCompressTime(t)
+  /** 泳道同步：持久化分配。只移除已不在追踪表里的条目，既有请求的行号永不重排 */
+  for (const lane of ganttLanes) {
+    for (let i = lane.length - 1; i >= 0; i--) {
+      if (!ganttRequests.value.has(lane[i]!.id)) lane.splice(i, 1)
+    }
+  }
+  for (const [id, li] of ganttLaneOf) {
+    if (!ganttRequests.value.has(id)) ganttLaneOf.delete(id)
+  }
+  /** 尾部空泳道才裁剪：不影响任何既有行号 */
+  while (ganttLanes.length > 0 && ganttLanes[ganttLanes.length - 1]!.length === 0) ganttLanes.pop()
 
-  /** 泳道分配：每行记录已占用的 [start, end] 区间，新请求找到第一个不冲突的行 */
-  interface Lane { ranges: [number, number][] }
-  const lanes: Lane[] = []
-  /** 请求 ID -> 泳道索引 */
-  const laneAssignment = new Map<string, number>()
-
-  for (const req of visible) {
-    const end = req.endedAt ?? nowMs
-    const range: [number, number] = [req.startedAt, end]
-    let assigned = false
-    for (let i = 0; i < lanes.length; i++) {
-      const lane = lanes[i]!
-      /** 检查是否与该行已有请求时间冲突 */
-      const conflicts = lane.ranges.some(([s, e]) => range[0] < e && range[1] > s)
-      if (!conflicts) {
-        lane.ranges.push(range)
-        laneAssignment.set(req.requestId, i)
-        assigned = true
-        break
+  for (const r of visible) {
+    const end = r.endedAt ?? nowMs
+    const li = ganttLaneOf.get(r.requestId)
+    if (li !== undefined) {
+      const entry = ganttLanes[li]?.find(e => e.id === r.requestId)
+      if (entry) {
+        /** 已有分配：只延长/修正区间，绝不换行 */
+        entry.start = r.startedAt
+        entry.end = Math.max(entry.end, end)
+        continue
       }
+      ganttLaneOf.delete(r.requestId)
     }
-    if (!assigned) {
-      lanes.push({ ranges: [range] })
-      laneAssignment.set(req.requestId, lanes.length - 1)
+    /** 新请求：找第一条无时间冲突的泳道，全满则追加新行 */
+    let assigned = -1
+    for (let i = 0; i < ganttLanes.length; i++) {
+      const conflicts = ganttLanes[i]!.some(e => {
+        /** running 请求的甘特条持续向右延伸，冲突判定时视作开放区间（Infinity）：
+         *  否则"上一帧的 now"与"本帧新请求的 startedAt"比较会误判为不冲突，
+         *  并发请求被塞进同一行，两根同时延伸的柱子完全重叠 */
+        const er = ganttRequests.value.get(e.id)
+        const eEnd = er && er.endedAt === null ? Infinity : e.end
+        const rEnd = r.endedAt === null ? Infinity : end
+        return r.startedAt < eEnd && rEnd > e.start
+      })
+      if (!conflicts) { assigned = i; break }
     }
+    if (assigned === -1) {
+      ganttLanes.push([])
+      assigned = ganttLanes.length - 1
+    }
+    ganttLanes[assigned]!.push({ id: r.requestId, start: r.startedAt, end })
+    ganttLaneOf.set(r.requestId, assigned)
   }
 
   /** 按泳道索引构建 Y 轴标签（泳道 0 在顶部） */
   const laneLabels: string[] = []
-  for (let i = 0; i < lanes.length; i++) laneLabels.push(String(i))
+  for (let i = 0; i < ganttLanes.length; i++) laneLabels.push(String(i))
 
   /**
    * 每个请求一个 dataset：柱子的行位置由"数据索引 ↔ 标签索引"决定，
@@ -731,11 +733,11 @@ function renderGanttChart() {
    */
   const datasets: Record<string, unknown>[] = []
   for (const r of visible) {
-    const laneIdx = laneAssignment.get(r.requestId)!
+    const laneIdx = ganttLaneOf.get(r.requestId) ?? 0
     const end = r.endedAt ?? nowMs
-    /** null 占位到目标行，柱子只出现在自己的泳道；坐标压缩后写入 */
-    const row: ([number, number] | null)[] = new Array(lanes.length).fill(null)
-    row[laneIdx] = [cx(r.startedAt), Math.max(cx(end), cx(r.startedAt) + 100)]
+    /** null 占位到目标行，柱子只出现在自己的泳道；直接用真实时间戳 */
+    const row: ([number, number] | null)[] = new Array(ganttLanes.length).fill(null)
+    row[laneIdx] = [r.startedAt, Math.max(end, r.startedAt + 100)]
     const pc = getStableColor(r.providerId)
     datasets.push({
       data: row,
@@ -752,8 +754,8 @@ function renderGanttChart() {
       _request: r,
     })  }
 
-  /** 输出速率折线：采样时间戳压缩后叠加在整个图表区域，实线提高辨识度 */
-  const rateData = outputRateHistory.map(s => ({ x: cx(s.ts), y: s.rate }))
+  /** 输出速率折线：采样时间戳直接落在真实时间轴上 */
+  const rateData = outputRateHistory.map(s => ({ x: s.ts, y: s.rate }))
   datasets.push({
     label: t("dashboard.outputRateLabel"),
     data: rateData,
@@ -767,11 +769,10 @@ function renderGanttChart() {
     order: 0,
   } as never)
 
-  /** 压缩轴窗口：左端 = 最早可见请求（或当前时刻回退一个窗口），右端 = 当前时刻压缩坐标 */
+  /** 真实时间窗口：恒定 [now-30min, now]，每秒平滑左移，历史柱子零跳动 */
   const xScale = ganttInstance.options.scales!.x as { min: number; max: number }
-  const dataStart = visible.length ? cx(visible[0]!.startedAt) : cx(nowMs - GANTT_WINDOW_MS)
-  xScale.min = Math.min(dataStart, cx(nowMs) - GANTT_WINDOW_MS)
-  xScale.max = cx(nowMs)
+  xScale.min = cutoff
+  xScale.max = nowMs
 
   ganttInstance.data.labels = laneLabels
   ganttInstance.data.datasets = datasets as never

@@ -1248,7 +1248,9 @@ function isLoopbackIp(ip: string): boolean {
     tokenUsage: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number } | null
   }
   const GANTT_MAX_ENTRIES = 200
-  const GANTT_WINDOW_MS = 5 * 60_000
+  /** 必须与前端 Dashboard.vue 的 GANTT_WINDOW_MS 对齐（30min）：
+   *  刷新后靠这里回放恢复柱图，窗口过短会导致刷新后柱图大面积丢失 */
+  const GANTT_WINDOW_MS = 30 * 60_000
   const ganttEntries = new Map<string, GanttEntry>()
 
   /** 甘特缓冲区修剪：超限淘汰最早结束的条目，超窗口淘汰旧请求（running 保留） */
